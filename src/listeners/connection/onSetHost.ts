@@ -110,7 +110,8 @@ export class OnSetHostListener {
 		Object.defineProperty(entity, 'currentState', {
 			get() { return protectedState; },
 			// Engine cleanup assigns currentState = null; guard so that doesn't throw.
-			set(data) { if (data && data.protected) { protectedState = data.protected; } },
+			set(data) { if (data && data.protected) { protectedState = data.protected; } else if (typeof data === 'string') { protectedState = data; } },
+			configurable: true,
 		});
 	}
 }

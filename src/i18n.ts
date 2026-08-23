@@ -142,6 +142,18 @@ const enDict: { [key: string]: string } = {
     deathSoon: 'Respawning soon…',
     // Round 23: save-success toast (shown when the server confirms an upload).
     toastSaveDone: 'Save uploaded',
+    // Save-integrity guard: upload rejected (the server kept the previous save).
+    toastSaveFailed: 'Save upload failed',
+    saveTooSmall: 'Save rejected - looks incomplete, keeping your previous save',
+    saveInvalid: 'Save rejected - invalid data, keeping your previous save',
+    // 1.73.0 — server admin debug commands
+    adminGiveExp: 'Admin granted {n} EXP',
+    adminGiveCredits: 'Admin granted {n} credits',
+    adminGiveItem: 'Admin granted item #{id} ×{n}',
+    adminTeleport: 'Admin teleported you',
+    adminRenamed: 'An admin renamed you to {name} — please log in again',
+    adminGodOn: 'Admin enabled GOD MODE — you take no damage',
+    adminGodOff: 'Admin disabled god mode',
 
     // round 23 wave 3 — social overhaul (add-friend search flow)
     searchTitle: 'Search Players',
@@ -476,6 +488,18 @@ const zhDict: { [key: string]: string } = {
     deathSoon: '即将复活…',
     // Round 23: save-success toast (shown when the server confirms an upload).
     toastSaveDone: '存档已保存并上传',
+    // Save-integrity guard: 上传被拒（服务器保留原存档）。
+    toastSaveFailed: '存档上传失败',
+    saveTooSmall: '存档被拒绝：疑似不完整，已保留原存档',
+    saveInvalid: '存档被拒绝：数据异常，已保留原存档',
+    // 1.73.0 — 服务器管理调试命令
+    adminGiveExp: '管理员给予你 {n} 点经验值',
+    adminGiveCredits: '管理员给予你 {n} 信用点',
+    adminGiveItem: '管理员给予你物品 #{id} ×{n}',
+    adminTeleport: '管理员将你传送',
+    adminRenamed: '管理员已将你的名字改为 {name}，请重新登录',
+    adminGodOn: '管理员开启了无敌模式 — 你不再受到伤害',
+    adminGodOff: '管理员关闭了无敌模式',
 
     // round 23 wave 3 — social overhaul (add-friend search flow)
     searchTitle: '搜索玩家',

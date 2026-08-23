@@ -397,13 +397,15 @@ export class SocketIoConnector implements IConnection {
                 focusScale?: number,
                 resistFlat?: number,
                 resistPercent?: number,
+                breakScale?: number,
+                playerCollision?: boolean,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, playerCollision: data.playerCollision, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -934,7 +936,7 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
-	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number }): void {
+	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[] }): void {
 		this.syncEmit('enemyDamage', hit);
 	}
 
@@ -1024,6 +1026,34 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('skillSound', s);
 	}
 
+	// 1.72.0 (combat-art name banner): any client -> its instance — the local player
+	// fired a combat art; teammates raise the name banner over our mirror.
+	public combatArtName(label: any): void {
+		this.syncEmit('combatArtName', { label });
+	}
+
+	// 1.73.0 (admin UI): outcome of one adminCommand back to the server.
+	// Plain socket.emit like pingReport — syncEmit's solo-instance skip would drop
+	// these SERVER-directed packets whenever the target player is alone in their
+	// instance (which is exactly when an admin usually pokes them).
+	public adminAck(cmdId: number, ok: boolean, msg?: string): void {
+		if (!this.socket || !this.isOpen()) return;
+		this.socket.emit('adminAck', { cmdId, ok: ok === true, msg: (msg || '').slice(0, 200) });
+	}
+
+	// 1.73.0 (admin UI): item-catalog status / upload for the server's itemdb.
+	// Same solo-skip fix: the catalog feed is server communication, not an
+	// instance broadcast — a solo first player is precisely the one who must
+	// seed data/itemdb.json.
+	public itemdbHello(count: number): void {
+		if (!this.socket || !this.isOpen()) return;
+		this.socket.emit('itemdbHello', { count });
+	}
+	public itemdbUpload(items: any[]): void {
+		if (!this.socket || !this.isOpen()) return;
+		this.socket.emit('itemdbUpload', { items });
+	}
+
 	// ROUND 39 (item 1): any client -> its instance — the local player released a sustained
 	// (looped) sound (the skill charge-up); every other client cuts its handle.
 	public emitSoundStop(): void {
@@ -1060,6 +1090,91 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
+	/** 1.73.x: the host's enemy counter reached 0 (battle done). Members set the
+	 * counter vars locally + zero the visible counter so the relayed battle-done
+	 * cutscene completes (its WAIT_UNTIL_TRUE waits on the post variable). */
+	public enemyCounterDone(pkt: { group: string, preVar: string, postVar: string }): void {
+		this.syncEmit('enemyCounterDone', pkt);
+	}
+	public onEnemyCounterDone(callback: (data: { group: string, preVar: string, postVar: string }) => void): void {
+		this.socket.on('enemyCounterDone', (data: any) => {
+			if (!data || typeof data.group !== 'string' || typeof data.preVar !== 'string' || typeof data.postVar !== 'string') return;
+			callback({ group: data.group, preVar: data.preVar, postVar: data.postVar });
+		});
+	}
+
+	/** 1.73.x: the host's counter marble (the red orb flying into the enemy
+	 * counter after a kill) — members spawn a copy targeting their local counter. */
+	public counterMarble(pkt: { group: string, x: number, y: number, z: number }): void {
+		this.syncEmit('counterMarble', pkt);
+	}
+	public onCounterMarble(callback: (data: { group: string, x: number, y: number, z: number }) => void): void {
+		this.socket.on('counterMarble', (data: any) => {
+			if (!data || typeof data.group !== 'string' || typeof data.x !== 'number' || typeof data.y !== 'number' || typeof data.z !== 'number') return;
+			callback({ group: data.group, x: data.x, y: data.y, z: data.z });
+		});
+	}
+
+	/** 1.73.x: a player pressed a dungeon elevator — peers run the same native
+	 * move on their local elevator so platform riders are carried floor to floor. */
+	public elevatorSync(pkt: { map: string, mi: number, dest: number }): void {
+		this.syncEmit('elevatorSync', pkt);
+	}
+	public onElevatorSync(callback: (data: { map: string, mi: number, dest: number }) => void): void {
+		this.socket.on('elevatorSync', (data: any) => {
+			if (!data || typeof data.mi !== 'number' || typeof data.dest !== 'number') return;
+			callback({ map: typeof data.map === 'string' ? data.map : '', mi: data.mi, dest: data.dest });
+		});
+	}
+
+	/** 1.73.x: the bomb-launching client streams its live bomb positions so peers
+	 * render a flying bomb copy (the bomb entity runs where it was triggered). */
+	public bombState(map: string, entries: any[]): void {
+		this.syncEmit('bombState', { map, entries });
+	}
+	public onBombState(callback: (map: string, list: any[]) => void): void {
+		this.socket.on('bombState', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
+			callback(data.map, data.entries);
+		});
+	}
+	/** 1.73.x: the triggering client's bomb exploded — peers play the boom and reset
+	 * their local bomb panel (blink + respawn timer). */
+	public bombExplode(pkt: { map: string, i: number, pmi: number, x: number, y: number, z: number }): void {
+		this.syncEmit('bombExplode', pkt);
+	}
+	public onBombExplode(callback: (data: { map: string, i: number, pmi: number, x: number, y: number, z: number }) => void): void {
+		this.socket.on('bombExplode', (data: any) => {
+			if (!data || typeof data.i !== 'number') return;
+			callback({
+				map: typeof data.map === 'string' ? data.map : '',
+				i: data.i,
+				pmi: typeof data.pmi === 'number' ? data.pmi : 0,
+				x: typeof data.x === 'number' ? data.x : 0,
+				y: typeof data.y === 'number' ? data.y : 0,
+				z: typeof data.z === 'number' ? data.z : 0,
+			});
+		});
+	}
+
+	/** 1.73.x: a LOCAL attack hit our bomb copy — relay the interaction to the bomb's
+	 * owner so the real bomb detonates early / heat-converts. */
+	public bombInteract(pkt: { map: string, i: number, kind: string, dirx: number, diry: number }): void {
+		this.syncEmit('bombInteract', pkt);
+	}
+	public onBombInteract(callback: (data: { map: string, i: number, kind: string, dirx: number, diry: number }) => void): void {
+		this.socket.on('bombInteract', (data: any) => {
+			if (!data || typeof data.i !== 'number' || (data.kind !== 'hit' && data.kind !== 'heat')) return;
+			callback({
+				map: typeof data.map === 'string' ? data.map : '',
+				i: data.i,
+				kind: data.kind,
+				dirx: typeof data.dirx === 'number' ? data.dirx : 0,
+				diry: typeof data.diry === 'number' ? data.diry : 1,
+			});
+		});
+	}
+
 	// ROUND 132: player thrown-ball position stream (bounce-puzzle visibility).
 	public playerBall(map: string, entries: any[]): void {
 		this.syncEmit('playerBall', { map, entries });
@@ -1068,6 +1183,28 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('playerBall', (data: any) => {
 			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
 			callback({ from: (typeof data.from === 'string' ? data.from : ''), map: data.map, entries: data.entries });
+		});
+	}
+
+	// 1.74.0: member forwards a sliding-block push direction to the instance host.
+	public slidingPush(map: string, mi: number, dx: number, dy: number): void {
+		this.syncEmit('slidingPush', { map, mi, dx, dy });
+	}
+	public onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number }) => void): void {
+		this.socket.on('slidingPush', (data: any) => {
+			if (!data || typeof data.map !== 'string' || typeof data.mi !== 'number') return;
+			callback({ map: data.map, mi: data.mi, dx: (typeof data.dx === 'number' ? data.dx : 0), dy: (typeof data.dy === 'number' ? data.dy : 0) });
+		});
+	}
+
+	// ROUND 133: quest-world spawn-driving var relay (chest spawnCondition visibility).
+	public spawnVar(map: string, list: any[]): void {
+		this.syncEmit('spawnVar', { map, list });
+	}
+	public onSpawnVar(callback: (data: { from: string, map: string, list: any[] }) => void): void {
+		this.socket.on('spawnVar', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.list)) return;
+			callback({ from: (typeof data.from === 'string' ? data.from : ''), map: data.map, list: data.list });
 		});
 	}
 
@@ -1329,6 +1466,30 @@ export class SocketIoConnector implements IConnection {
 			if (data && typeof data.player === 'string' && typeof data.path === 'string') {
 				callback(data);
 			}
+		});
+	}
+	/** 1.72.0: a same-instance player fired a combat art — banner label for their mirror. */
+	public onCombatArtName(callback: (data: { player: string, label: any }) => void): void {
+		this.socket.on('combatArtName', (data: any) => {
+			if (data && typeof data.player === 'string' && data.label !== undefined && data.label !== null) {
+				callback({ player: data.player, label: data.label });
+			}
+		});
+	}
+	/** 1.73.0 (admin UI): a server admin command for THIS player. */
+	public onAdminCommand(callback: (cmd: any) => void): void {
+		this.socket.on('adminCommand', (data: any) => {
+			if (data && typeof data.cmdId === 'number' && typeof data.kind === 'string') callback(data);
+		});
+	}
+	/** 1.73.0 (admin UI): the server wants our item catalog. */
+	public onItemdbWant(callback: () => void): void {
+		this.socket.on('itemdbWant', () => { callback(); });
+	}
+	/** 1.73.0 (admin UI): an admin renamed our account — disconnect imminent. */
+	public onAdminRenamed(callback: (name: string) => void): void {
+		this.socket.on('adminRenamed', (data: any) => {
+			callback(data && typeof data.name === 'string' ? data.name : '');
 		});
 	}
 	/** ROUND 43 (skill-release sound): a same-instance player fired a skill's launch sound —

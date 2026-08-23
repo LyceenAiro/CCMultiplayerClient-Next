@@ -19,7 +19,7 @@ import { Multiplayer } from '../multiplayer';
  * scans the live puzzle entities on dungeon maps and relays their compact state:
  *   - push/pull boxes, wave boxes, sliding blocks (position + anim + phased),
  *   - water blocks / ice pillars (state + remaining hits),
- *   - OL/dynamic/extract platforms (position),
+ *   - auto-circling dynamic platforms (position; var-driven OL/extract are per-player and NOT synced),
  *   - one-time / multi-hit / floor / bounce / group switches (on/off + hits),
  *   - bounce blocks and blockers (state/active).
  *
@@ -42,6 +42,7 @@ import { Multiplayer } from '../multiplayer';
 
 const PUZZLE_SCAN_INTERVAL = 0.1;   // seconds — change scan
 const PUZZLE_FULL_INTERVAL = 1000;  // ms — host full snapshot
+const PUZZLE_FAST_INTERVAL = 1 / 30; // seconds — moving pushable pillars/boxes at 30Hz
 const PUZZLE_OWN_TTL = 700;         // ms without an owner heartbeat -> release
 const PUZZLE_OWN_HEARTBEAT = 400;   // ms — owner re-asserts even when stationary
 const PUZZLE_LERP_RATE = 16;        // ~16% of the remaining distance per frame
@@ -94,6 +95,7 @@ export function installPuzzleSync(getMain: () => Multiplayer | undefined): IPuzz
 
 class PuzzleSync implements IPuzzleSync {
 	private scanTimer = 0;
+	private fastTimer = 0;
 	private lastFullAt = 0;
 	private lastMap = '';
 	private seen = new Set<number>();
@@ -112,6 +114,7 @@ class PuzzleSync implements IPuzzleSync {
 	 * neither send nor receive network position (a solved player's lowered
 	 * plate/box must never overwrite an unsolved player's still-raised puzzle). */
 	private placedBoxIds = new Set<number>();
+	private _varLogSeen = new Set<string>();
 
 	constructor(private getMain: () => Multiplayer | undefined) {
 		(window as any).__mppuzzle = () => this.dump();
@@ -121,6 +124,7 @@ class PuzzleSync implements IPuzzleSync {
 		const m = this.getMain();
 		if (!m || !m.connection) return;
 		try { m.connection.onPuzzleState((data) => this.apply(data)); } catch (_) { /* ignore */ }
+		try { if (typeof (m.connection as any).onSlidingPush === 'function') (m.connection as any).onSlidingPush((data: any) => this.applySlidingPush(data)); } catch (_) { /* ignore */ }
 		if (!updateRegistered) {
 			updateRegistered = true;
 			simplify.registerUpdate(() => {
@@ -166,6 +170,13 @@ class PuzzleSync implements IPuzzleSync {
 			this.followers.clear();
 		}
 		this.expireRemoteOwners((g.entities as any[]) || []);
+		// Fast 30Hz stream for MOVING pushable pillars/boxes (idle ones stay at the
+		// 1Hz full snapshot). Runs on its own timer, independent of the 10Hz scan.
+		this.fastTimer -= ig.system.tick;
+		if (this.fastTimer <= 0) {
+			this.fastTimer = PUZZLE_FAST_INTERVAL;
+			this.scanFast();
+		}
 		this.scanTimer -= ig.system.tick;
 		const hostFull = m.host && Date.now() - this.lastFullAt >= PUZZLE_FULL_INTERVAL;
 		if (hostFull) this.lastFullAt = Date.now();
@@ -182,6 +193,11 @@ class PuzzleSync implements IPuzzleSync {
 			if (!this.isPuzzleEntity(e)) continue;
 			nowSeen.add(mi);
 			const push = this.isPushPull(e);
+			// Moving pushable pillars/boxes ride the 30Hz fast stream (scanFast); the
+			// 10Hz scan only handles them while idle (1Hz full snapshot). The one-shot
+			// release (own:'') still fires here so the host takes over authority at once.
+			if ((push || this.isSlidingBlock(e)) && this.isPushableMoving(e)
+				&& !(push && !this.isLocalGripping(e) && !!this.ownedLast.get(mi))) continue;
 			// 1.71.3 (pillar/OL-platform echo loop): moving platforms are var-driven
 			// on every client — once the switch variable arrives each client moves its
 			// own platform natively. Only the map-instance HOST ships platform
@@ -189,6 +205,10 @@ class PuzzleSync implements IPuzzleSync {
 			// half-finished transition back, which made the Temple Chamber 1 pillars
 			// oscillate at ~80% and never reach their final height.
 			if (!m.host && this.isMovingPlatform(e)) continue;
+			// Ball-pushed ice pillars are host-authoritative too: members must not echo
+			// their own (slightly-ahead) slide — the host's copy moves via the synced
+			// ball and streams the one true position back.
+			if (!m.host && this.isSlidingBlock(e)) continue;
 			// Solved-in-this-save boxes are personal save state: never ship them,
 			// but keep them in `seen` so they don't turn into a `gone` packet.
 			if (push && this.placedBoxIds.has(mi)) continue;
@@ -253,6 +273,90 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 30Hz fast stream for MOVING pushable pillars/boxes. Idle pushables are NOT
+	 * touched here — they fall back to the 1Hz host full snapshot. Only entities
+	 * that are actively sliding / being pushed / coasting are shipped, so position
+	 * updates arrive ~3x faster than the 10Hz general scan while moving and cost
+	 * nothing while idle. */
+	private scanFast(): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen()) return;
+			const g: any = ig.game;
+			if (!g || !g.playerEntity || g.isTeleporting()) return;
+			if (!this.inDungeon()) return;
+			const map = (g.mapName || '');
+			const myName = (m.name || '').trim();
+			const entities = (g.entities as any[]) || [];
+			const entries: IPuzzleEntry[] = [];
+			for (const e of entities) {
+				const mi = e && e.mapId;
+				if (!e || e._killed || typeof mi !== 'number' || !mi) continue;
+				const push = this.isPushPull(e);
+				const sliding = this.isSlidingBlock(e);
+				if (!push && !sliding) continue;
+				if (!this.isPushableMoving(e)) continue;
+				// Same authority fence as the 10Hz scan (see tick).
+				if (sliding && !m.host) continue;
+				if (push && this.placedBoxIds.has(mi)) continue;
+				if (push && this.remoteOwners.has(mi)) continue;
+				if (push && !m.host && !this.isLocalGripping(e) && !this.ownedLast.has(mi)) continue;
+				const entry = this.encode(e);
+				if (push && this.isLocalGripping(e)) {
+					if (typeof (e as any)._mpPuzzleGripAt !== 'number') (e as any)._mpPuzzleGripAt = Date.now();
+					entry.own = myName || 'unknown';
+					entry.ot = (e as any)._mpPuzzleGripAt;
+					this.ownedLast.set(mi, true);
+				}
+				entries.push(entry);
+			}
+			if (!entries.length) return;
+			try { m.connection.puzzleState(map, entries); } catch (_) { /* ignore */ }
+		} catch (_) { /* never break the frame */ }
+	}
+	/** 1.74.0: forward a member's sliding-block push to the instance host. Only the
+	 * host is the pillar authority — the member sends the push DIRECTION, the host
+	 * slides its local pillar and streams the position back (puzzleState 30Hz). */
+	private broadcastSlidingPush(mi: number, dx: number, dy: number): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen()) return;
+			if (typeof (m.connection as any).slidingPush !== 'function') return;
+			const g: any = ig.game;
+			const map = (g && g.mapName) || '';
+			(m.connection as any).slidingPush(map, mi, Math.round(dx), Math.round(dy));
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.74.0: host receives a member's push — slide the local pillar natively (or
+	 * flash "blocked" if a wall/fence is in the way). The position streams out via
+	 * the normal 30Hz fast path. */
+	private applySlidingPush(data: { map: string, mi: number, dx: number, dy: number }): void {
+		try {
+			if (!data || typeof data.mi !== 'number' || typeof data.dx !== 'number' || typeof data.dy !== 'number') return;
+			if (!this.isInstanceHost()) return; // only the host pushes
+			const g: any = ig.game;
+			if (data.map && (g.mapName || '') !== data.map) return;
+			const E: any = (ig.ENTITY as any);
+			if (!E || !E.SlidingBlock) return;
+			const entities = (g.entities as any[]) || [];
+			for (const e of entities) {
+				if (!e || e._killed || !(e instanceof E.SlidingBlock) || e.mapId !== data.mi) continue;
+				if (e.moving) return; // already sliding
+				const dir = Vec2.create();
+				dir.x = data.dx; dir.y = data.dy;
+				const trace: any = (ig as any).game.physics.initTraceResult(Vec3.create());
+				if ((ig as any).game.traceEntity(trace, e, dir.x, dir.y, 0, 0, 0, (ig as any).COLLTYPE.IGNORE)) {
+					try { if (e.effects && e.effects.sheet && typeof e.effects.sheet.spawnOnTarget === 'function') e.effects.sheet.spawnOnTarget('blocked', e); } catch (_) { /* ignore */ }
+				} else {
+					Vec2.assign(e.moveDir, dir);
+					e.moving = true;
+					try { if (e.effects && e.effects.sheet && typeof e.effects.sheet.spawnOnTarget === 'function') e.effects.handle = e.effects.sheet.spawnOnTarget('slide', e, { duration: -1 }); } catch (_) { /* ignore */ }
+				}
+				return;
+			}
+		} catch (_) { /* never break */ }
+	}
 	public apply(data: IPuzzlePacket): void {
 		if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
 		const g: any = ig.game;
@@ -348,8 +452,15 @@ class PuzzleSync implements IPuzzleSync {
 		// raised/lowered height is a per-player SAVE mechanism. A solved player's
 		// lowered plate must never be broadcast over an unsolved player's raised
 		// one, and the box that belongs to it is excluded via placedBoxIds.
+		// NOTE (1.74.x): OLPlatform / ExtractPlatform are VAR-DRIVEN — each state's
+		// condition picks a save var, and every client moves its OWN copy natively
+		// when its own ig.vars change. Syncing their position froze the transition
+		// timer and fought the native motion (cold-dng.b3.center's two heat pillars
+		// never lowered on members after the battle cutscene). They are therefore
+		// NOT synced at all. DynamicPlatform (auto-circling) stays in this list and
+		// is handled by the isMovingPlatform host-authority branch.
 		const kinds = [E.PushPullBlock, E.WavePushPullBlock, E.SlidingBlock,
-			E.WaterBlock, E.OLPlatform, E.DynamicPlatform, E.ExtractPlatform, E.OneTimeSwitch,
+			E.WaterBlock, E.DynamicPlatform, E.OneTimeSwitch,
 			E.MultiHitSwitch, E.FloorSwitch, E.Switch, E.BounceSwitch, E.BounceBlock,
 			E.GroupSwitch, E.RotateBlocker, E.Blocker];
 		for (const k of kinds) {
@@ -383,14 +494,59 @@ class PuzzleSync implements IPuzzleSync {
 			|| (E.WavePushPullBlock && e instanceof E.WavePushPullBlock);
 	}
 
-	/** Var-driven moving platforms (OL/Dynamic/Extract): their positions are
-	 * host-authoritative; members never echo them (see tick). */
+	/** Auto-circling moving platforms (DynamicPlatform with a looping action):
+	 * their positions are host-authoritative; members never echo them (see tick).
+	 * OLPlatform / ExtractPlatform are var-driven per-player state and are NOT
+	 * synced at all (see isPuzzleEntity). */
 	private isMovingPlatform(e: any): boolean {
 		const E: any = (ig.ENTITY as any);
 		if (!E) return false;
-		return (E.OLPlatform && e instanceof E.OLPlatform)
-			|| (E.DynamicPlatform && e instanceof E.DynamicPlatform)
-			|| (E.ExtractPlatform && e instanceof E.ExtractPlatform);
+		return (E.DynamicPlatform && e instanceof E.DynamicPlatform);
+	}
+
+	/** Ball-pushed sliding blocks (cold-dng ice pillars): host-authoritative position.
+	 * Only the HOST pushes + publishes them; members mirror the streamed position. */
+	private isSlidingBlock(e: any): boolean {
+		const E: any = (ig.ENTITY as any);
+		return !!(E && E.SlidingBlock && e instanceof E.SlidingBlock);
+	}
+
+	/** True while a pushable pillar/box is actively MOVING (needs the 30Hz fast
+	 * stream): a ball-pushed sliding block is `moving`, a gripped box is in a push/
+	 * pull/lock-in drag state, or a released box still carries velocity (coasting/
+	 * falling). Idle => 1Hz. */
+	private isPushableMoving(e: any): boolean {
+		if (this.isSlidingBlock(e)) return !!e.moving;
+		if (this.isPushPull(e)) {
+			const p = e.pushPullable;
+			if (p && (p.dragState === 2 || p.dragState === 3 || p.dragState === 4)) return true;
+			const c = e.coll;
+			if (c && c.vel && (Math.abs(c.vel.x) > 0.5 || Math.abs(c.vel.y) > 0.5 || Math.abs(c.vel.z) > 0.5)) return true;
+		}
+		return false;
+	}
+
+
+	/** 1.73.x (auto-circling DynamicPlatform): a member's own looping action keeps
+	 * moving the platform between syncs and its phase drifts away from the host
+	 * (cold-dng center's two endless circling plates). Freeze the LOCAL motion so
+	 * the host's position stream (10Hz changes + the 1Hz full snapshot) is the
+	 * single authority. Idempotent + re-asserting: the engine's varsChanged can
+	 * re-play a state action, so every applied entry re-checks the hold. */
+	private freezeMovingPlatform(e: any): void {
+		try {
+			e._mpPlatformFollow = true;
+			const ED: any = (ig.ENTITY as any);
+			if (ED && ED.DynamicPlatform && e instanceof ED.DynamicPlatform) {
+				const cur = e.currentAction;
+				if (!cur || (typeof cur.name === 'string' && cur.name !== 'mpPlatformHold')) {
+					try {
+						const hold = new (ig as any).Action('mpPlatformHold', [{ type: 'WAIT', time: -1 }], false, false);
+						e.setAction(hold);
+					} catch (_) { try { if (typeof e.stashAction === 'function') e.stashAction(); } catch (__) { /* ignore */ } }
+				}
+			}
+		} catch (_) { /* never break the sync */ }
 	}
 
 	private isLocalGripping(e: any): boolean {
@@ -637,7 +793,7 @@ class PuzzleSync implements IPuzzleSync {
 		if (e.coll && e.coll.pos) {
 			s.p = [Math.round(e.coll.pos.x), Math.round(e.coll.pos.y), Math.round(e.coll.pos.z)];
 		}
-		if (typeof e.isOn === 'boolean') s.on = e.isOn ? 1 : 0;
+		if (typeof e.isOn === 'boolean' || typeof e.isOn === 'number') s.on = e.isOn ? 1 : 0;
 		if (typeof e.currentHits === 'number') s.hits = e.currentHits;
 		if (typeof e.remainingHits === 'number') s.hits = e.remainingHits;
 		if (typeof e.state === 'number') s.st = e.state;
@@ -691,6 +847,11 @@ class PuzzleSync implements IPuzzleSync {
 
 		if (s.p && e.coll && !skipBoxPos) {
 			this.setInterpTarget(e, s.p[0], s.p[1], s.p[2]);
+			// 1.73.x (auto-circling platforms): freeze the member's local platform
+			// motion so the host's position stream stays authoritative (entry
+			// alignment comes from the first full block; 1Hz fulls + 10Hz changes
+			// keep it pinned afterwards).
+			if (!this.isInstanceHost() && this.isMovingPlatform(e)) this.freezeMovingPlatform(e);
 			// 1.71.6: this box is a network follower — freeze its local z-physics
 			// until the LOCAL player grabs it (prepareLocalGrip restores gravity).
 			if (boxShouldFollow) {
@@ -760,7 +921,7 @@ class PuzzleSync implements IPuzzleSync {
 				} catch (_) { /* ignore */ }
 			}
 		}
-		if (typeof s.on === 'number' && typeof e.isOn === 'boolean') {
+		if (typeof s.on === 'number' && (typeof e.isOn === 'boolean' || typeof e.isOn === 'number')) {
 			try {
 				const want = s.on === 1;
 				// 1.71.5: permanent OneTimeSwitch (the Temple Chamber 1 attack
@@ -794,6 +955,15 @@ class PuzzleSync implements IPuzzleSync {
 					// blockers on this client re-evaluate via varsChanged).
 					if (typeof e.variable === 'string' && e.variable) {
 						try { (ig as any).vars.set(e.variable, want); } catch (_) { /* ignore */ }
+						// 1.73.x diag: prove a switch var actually landed on this client
+						// (once per var per map) — the EventTrigger should fire off it.
+						try {
+							const k = 'var:' + e.variable + ':' + (e.mapId || 0) + ':' + ((ig.game as any).mapName || '');
+							if (!this._varLogSeen.has(k)) {
+								this._varLogSeen.add(k);
+								console.log('[puzzlesync] applied ' + e.variable + '=' + want + ' (mi=' + (e.mapId || 0) + ')');
+							}
+						} catch (_) { /* ignore */ }
 					}
 					if (!s.anim && typeof e.setCurrentAnim === 'function') {
 						try { e.setCurrentAnim(want ? 'on' : 'off', true, null, true); } catch (_) { /* ignore */ }
@@ -815,7 +985,24 @@ class PuzzleSync implements IPuzzleSync {
 			if (typeof s.act === 'number' && e.pushPullable && typeof e.pushPullable.setActive === 'function' && !followerLocked) {
 				try { e.pushPullable.setActive(s.act === 1); } catch (_) { /* ignore */ }
 			}
-			if (typeof s.mv === 'number' && typeof e.moving === 'boolean') e.moving = s.mv === 1;
+			if (typeof s.mv === 'number' && typeof e.moving === 'boolean') {
+				if (this.isSlidingBlock(e) && !this.isInstanceHost()) {
+					e.moving = false; // host's position stream drives the pillar (never slide natively)
+					// Mirror the white "slide" trail: the host streams mv=1 while sliding,
+					// mv=0 once it stops. Drive the local effect off that flag so members
+					// see the trail too (the native slide effect only plays on the host).
+					const wantSlide = s.mv === 1;
+					if (wantSlide && !e._mpSlidingFx) {
+						e._mpSlidingFx = true;
+						try { if (e.effects && e.effects.sheet && typeof e.effects.sheet.spawnOnTarget === 'function') e.effects.handle = e.effects.sheet.spawnOnTarget('slide', e, { duration: -1 }); } catch (_) { /* ignore */ }
+					} else if (!wantSlide && e._mpSlidingFx) {
+						e._mpSlidingFx = false;
+						try { if (e.effects && e.effects.handle && typeof e.effects.handle.stop === 'function') e.effects.handle.stop(); } catch (_) { /* ignore */ }
+					}
+				} else {
+					e.moving = s.mv === 1;
+				}
+			}
 			if (typeof s.anim === 'string' && s.anim && typeof e.setCurrentAnim === 'function') {
 				try { e.setCurrentAnim(s.anim, true, null, true); } catch (_) { /* ignore */ }
 			}
@@ -947,6 +1134,42 @@ class PuzzleSync implements IPuzzleSync {
 						if (!self.applying) self.broadcastPlacement(box, this);
 					} catch (_) { /* ignore */ }
 					return origPlaced.apply(this, arguments as any);
+				};
+			}
+			// Ball-pushed ice pillars (SlidingBlock) are host-authoritative: on a non-host
+			// member, never slide locally. Replay the native push check (blocked red flash
+			// or forward the push to the host via slidingPush), absorb the ball + show the
+			// hit FX — the host slides and streams the authoritative position back.
+			const SB: any = (ig.ENTITY as any).SlidingBlock;
+			if (SB && SB.prototype && typeof SB.prototype.ballHit === 'function' && !SB.prototype._mpSlidingWrapped) {
+				SB.prototype._mpSlidingWrapped = true;
+				const origSBHit = SB.prototype.ballHit;
+				SB.prototype.ballHit = function (this: any, d: any) {
+					try {
+						if (!self.isInstanceHost()) {
+							// Host-authoritative: never slide locally. Recompute the push
+							// direction, flash the red "blocked" effect if a wall/fence is in
+							// the way, and otherwise forward the push to the host (its copy
+							// slides and streams the authoritative position back).
+							const c = d && typeof d.getHitCenter === 'function' ? d.getHitCenter(this) : null;
+							try {
+								const dir = Vec2.create();
+								(ig as any).ActorEntity.getFaceVec(d.getCollideSide(this), dir);
+								Vec2.flip(dir);
+								const trace: any = (ig as any).game.physics.initTraceResult(Vec3.create());
+								if ((ig as any).game.traceEntity(trace, this, dir.x, dir.y, 0, 0, 0, (ig as any).COLLTYPE.IGNORE)) {
+									if (this.effects && this.effects.sheet && typeof this.effects.sheet.spawnOnTarget === 'function') this.effects.sheet.spawnOnTarget('blocked', this);
+								} else {
+									self.broadcastSlidingPush(this.mapId, dir.x, dir.y);
+								}
+							} catch (_) { /* ignore */ }
+							if (c) {
+								try { (sc as any).combat.showHitEffect(this, c, (sc as any).ATTACK_TYPE.NONE, typeof d.getElement === 'function' ? d.getElement() : 0, true, false, true); } catch (_) { /* ignore */ }
+							}
+							return true;
+						}
+					} catch (_) { /* fall through to vanilla */ }
+					return origSBHit.apply(this, arguments as any);
 				};
 			}
 			console.log('[puzzlesync] push/pull ownership hooks installed');

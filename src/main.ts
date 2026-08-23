@@ -1,7 +1,7 @@
 import { Multiplayer, MP_VERSION } from './multiplayer';
 import { installSocialMenuButton } from './ui/socialMenuInject';
 import { installQuickMenuEnhancements } from './ui/quickMenuInject';
-import { installMpOptionsTab, getMpOption, startNameTagLoop, startNetHudLoop } from './ui/mpOptions';
+import { installMpOptionsTab, getMpOption, startNameTagLoop, startNetHudLoop, installSceneProbe } from './ui/mpOptions';
 import { installMpUiScale } from './ui/uiScale';
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
@@ -125,8 +125,29 @@ async function startMultiplayer(): Promise<void> {
 
 		console.log('[multiplayer] Initialized');
 
+		// 1.73.0 (cutscene name-tag freeze): simplify.fireUpdate fans out to every
+		// registered handler with NO try/catch — one handler that throws (some read
+		// engine state that only exists in certain game states) kills every handler
+		// after it for the rest of the frame, EVERY frame, freezing the name-tag
+		// pump mid-cutscene (probe showed isCutscene+blocking true while the own
+		// tag never re-evaluated). Guard the fan-out once: isolate each handler and
+		// LOG the culprit so the root cause can still be fixed properly.
+		try {
+			const simp: any = (window as any).simplify;
+			if (simp && typeof simp.fireUpdate === 'function' && !simp._mpFireUpdateGuarded) {
+				simp._mpFireUpdateGuarded = true;
+				simp.fireUpdate = function () {
+					const hs = this.updateHandlers || [];
+					for (let i = 0; i < hs.length; i++) {
+						try { hs[i](); }
+						catch (e) { console.error('[simplify] update handler #' + i + ' threw (isolated — others continue):', e); }
+					}
+				};
+			}
+		} catch (e) { console.warn('[multiplayer] fireUpdate guard failed:', e); }
 		// Per-frame name-tag pump (idempotent, reads the instance lazily).
 		startNameTagLoop(() => multiplayer);
+		installSceneProbe(() => multiplayer);
 
 		// Round 21: 1s network-debug HUD overlay (reads the instance lazily too).
 		startNetHudLoop(() => multiplayer);

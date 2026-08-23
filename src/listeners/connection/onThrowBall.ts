@@ -43,7 +43,10 @@ export class OnThrownBallListener {
 					? ((entity as any).getCombatantRoot() || entity) : entity;
 				const pos = root.getAlignedPos((ig as any).ENTITY_ALIGN.BOTTOM, Vec3.create());
 				pos.z = pos.z + ((window as any).Constants ? (window as any).Constants.BALL_HEIGHT : 12);
-				tmpl.spawn(pos.x, pos.y, pos.z, root, ballInfo.dir);
+				// 1.73.x: spawn the template then NEUTRALIZE the copy (visual-only, no
+				// collisions/behaviors/attackInfo). Its real timer (0.166s) is kept, so
+				// the short flight ends exactly like the sender's.
+				this.neutralizeReplayBall(tmpl.spawn(pos.x, pos.y, pos.z, root, ballInfo.dir));
 			} catch (_) { /* a failed ball replay must never break the frame */ }
 			return;
 		}
@@ -87,8 +90,18 @@ export class OnThrownBallListener {
 	// teammates always see SOMETHING fly instead of nothing.
 	if (ballInfo.ballInfo.indexOf('generic:') === 0) {
 		try {
-			const step = new ig.ACTION_STEP.SHOOT_PROXY({ proxy: ballInfo.ballInfo.slice('generic:'.length), dir: ballInfo.dir } as any);
-			step.run(entity as sc.BasicCombatant);
+			// 1.73.x: the stand-in must be a NEUTRALIZED visual, not a real SHOOT_PROXY
+			// ball — a real one flies the normal range with live attackInfo/behaviors,
+			// which is exactly how the assault bug painted the screen with normal balls.
+			const name = ballInfo.ballInfo.slice('generic:'.length);
+			const proxies: any = (entity as any).proxies;
+			const proxy: any = proxies && proxies[name];
+			if (!proxy || typeof proxy.spawn !== 'function') return;
+			const root: any = (entity as any).getCombatantRoot
+				? ((entity as any).getCombatantRoot() || entity) : entity;
+			const pos = root.getAlignedPos((ig as any).ENTITY_ALIGN.BOTTOM, Vec3.create());
+			pos.z = pos.z + ((window as any).Constants ? (window as any).Constants.BALL_HEIGHT : 12);
+			this.neutralizeReplayBall(proxy.spawn(pos.x, pos.y, pos.z, root, ballInfo.dir));
 		} catch (_) { /* a failed ball replay must never break the frame */ }
 		return;
 	}
@@ -107,6 +120,30 @@ export class OnThrownBallListener {
 		// we cast rather than track the game's exact constructor types.
 		const actonStep = new ig.ACTION_STEP.SHOOT_PROXY({ proxy: ballInfo.ballInfo, dir: ballInfo.dir } as any);
 		actonStep.run(entity as sc.BasicCombatant);
+	}
+
+	/** 1.73.x: turn a relayed ball into a purely VISUAL copy — OTHER party,
+	 * IGNORE collision, no attackInfo/behaviors/destroy/bounce proxies. Keeps its
+	 * own timer (assault = 0.166s short flight; defaults to 1.5s) so the copy ends
+	 * like the sender's instead of lingering. Marked so no stream re-broadcasts it. */
+	private neutralizeReplayBall(e: any): void {
+		if (!e) return;
+		try {
+			e.party = (sc as any).COMBATANT_PARTY.OTHER;
+			const c = e.coll;
+			if (c && typeof c.setType === 'function') c.setType((ig as any).COLLTYPE.IGNORE);
+			else if (c) c.type = (ig as any).COLLTYPE.IGNORE;
+			e.attackInfo = null;
+			e.hitProxy = null;
+			if (typeof e.onProjectileHit === 'function') e.onProjectileHit = function () { return false; };
+			e.target = null;
+			e.behaviors = null;
+			e.grab = null;
+			e.destroyProxySrc = null;
+			e.bounceProxySrc = null;
+			if (!(e.timer > 0)) e.timer = 1.5;
+			e._mpPlayerBall = true;
+		} catch (_) { /* visuals must never break sync */ }
 	}
 
 	private resolveEntity(combatant: number | string | undefined): ig.Entity | undefined {

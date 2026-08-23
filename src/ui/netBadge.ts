@@ -753,6 +753,48 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
     if (scAny.KeyHudGui && typeof scAny.KeyHudGui.inject === 'function') {
         const repositionKeyHud = (keyHud: any): void => {
             try {
+                // invisibleUpdate: our fade state machine lives in this update()
+                // pump, which ig.gui SKIPS for HIDDEN hooks unless this flag is set —
+                // without it the menu-hidden HUD's pump stopped, the fade never ran,
+                // and the next close saw a stale timer and popped instantly (the
+                // alternating gone/instant-appear cycle). One-time lazy write.
+                try { if (keyHud.hook && !keyHud.hook.invisibleUpdate) keyHud.hook.invisibleUpdate = true; } catch (_) { /* ignore */ }
+                // Backpack/menu fix: while the game is NOT in the running sub-state
+                // (main menu, quick menu, level-up, cutscene), leave the position to
+                // the engine — and while the MAIN MENU (backpack) is open, hide the
+                // key HUD outright (user request): the engine's menu spot (y=110)
+                // lands on top of our co-op party plates. On menu close the engine
+                // re-runs updateVisibility (SUB_STATE_CHANGED -> isRunning) which
+                // transitions it back to DEFAULT by itself.
+                const model: any = (sc as any).model;
+                if (!model || typeof model.isRunning !== 'function' || !model.isRunning()) {
+                    try {
+                        if (model && typeof model.isMenu === 'function' && model.isMenu()
+                            && keyHud.currentStateName !== 'HIDDEN') {
+                            keyHud._mpMenuHidden = true; // WE hid it -> fade back in on close
+                            keyHud._mpFadeAt = 0;
+                            keyHud.doStateTransition('HIDDEN');
+                        }
+                    } catch (_) { /* ignore */ }
+                    return;
+                }
+                // Fade-back after the backpack closes (user request): the engine pops
+                // the HUD back INSTANTLY on SUB_STATE_CHANGED (time-0 DEFAULT
+                // transition) while the menu's exit zoom is still playing. Undo the
+                // pop in the same frame (time-0 HIDDEN, nothing was drawn yet), wait
+                // out the exit animation (0.2s HIDDEN fade + 0.3s position restore),
+                // then fade in from transparent by ramping hook.localAlpha (0 -> 0.8).
+                if (keyHud._mpMenuHidden) {
+                    const now = Date.now();
+                    if (keyHud.currentStateName !== 'HIDDEN') keyHud.doStateTransition('HIDDEN');
+                    if (!keyHud._mpFadeAt) keyHud._mpFadeAt = now + 300;
+                    if (now < keyHud._mpFadeAt) return; // menu exit zoom still playing
+                    keyHud.doStateTransition('DEFAULT'); // time-0; alpha rides localAlpha below
+                    const fade = Math.min(1, (now - keyHud._mpFadeAt) / 300);
+                    try { if (keyHud.hook) keyHud.hook.localAlpha = 0.8 * fade; } catch (_) { /* ignore */ }
+                    if (fade >= 1) { keyHud._mpMenuHidden = false; keyHud._mpFadeAt = 0; }
+                    // fall through: the dungeon party-plate offset below still applies
+                }
                 let y = 53; // native
                 const hud: any = scAny.gui && scAny.gui.statusHud;
                 const partyHud: any = hud && hud.partyGui;

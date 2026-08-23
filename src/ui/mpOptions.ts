@@ -537,6 +537,15 @@ export function getMpUiCanvasScale(): number {
     return typeof v === 'number' ? v : 1;
 }
 
+/** 1.73.0: set the REAL draw alpha on a tag and its text child. The engine
+ * gates the box's own drawables with hook.localAlpha, but child guis draw with
+ * the parent's state alpha chain WITHOUT the parent's localAlpha — so the text
+ * child must be zeroed separately or the name survives the hide. */
+function setTagAlpha(tag: any, v: number): void {
+    try { tag.hook.localAlpha = v; } catch (_) { /* ignore */ }
+    try { if (tag._mpText && tag._mpText.hook) tag._mpText.hook.localAlpha = v; } catch (_) { /* ignore */ }
+}
+
 function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean, scale?: number }): any {
     const font = opts.font || ((sc as any).fontsystem && (sc as any).fontsystem.tinyFont);
     const alpha = (typeof opts.alpha === 'number') ? opts.alpha : 0.55;
@@ -571,6 +580,18 @@ function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean, 
     try { box.hook.zIndex = 5; } catch (_) { /* ignore */ }
     // A fresh tag stays hidden until its first projection (no pop-in).
     try { box.hook._visible = false; } catch (_) { /* ignore */ }
+    try {
+        const origOvc: any = box.onVisibilityChange;
+        box.onVisibilityChange = function (this: any, vis: any) {
+            try {
+                if (vis) {
+                    const st: any = new Error('tagvis').stack;
+                    console.log('[tagvis] shown: ' + this._mpLabel, String(st).split(String.fromCharCode(10)).slice(2, 6).join(' | '));
+                }
+            } catch (_) { /* spy only */ }
+            if (origOvc) origOvc.call(this, vis);
+        };
+    } catch (_) { /* spy only */ }
     box._mpFontKey = font;
     box._mpAlpha = alpha;
     box._mpGold = gold;
@@ -647,6 +668,10 @@ function setTagLabel(tag: any, label: string): void {
  * tag. The tag is recreated when its styling (font/alpha/gold) changed, because
  * the box size derives from the text hook and the backing is baked at creation. */
 function addTagAt(name: string, ent: any, font: any, alpha: number, gold: boolean, scale: number, label?: string): void {
+    try {
+        const d: any = (window as any).__mpTagDiag;
+        if (d) { (d.lastAdds = d.lastAdds || []).push((Date.now() % 100000) + ':' + name); if (d.lastAdds.length > 12) d.lastAdds.shift(); }
+    } catch (_) { /* ignore */ }
     let tag = tags[name];
     if (tag && (tag._mpFontKey !== font || tag._mpAlpha !== alpha || tag._mpGold !== gold || tag._mpScale !== scale)) {
         try { tagContainer && tagContainer.removeChildGui(tag); } catch (_) { /* ignore */ }
@@ -678,7 +703,11 @@ function addTagAt(name: string, ent: any, font: any, alpha: number, gold: boolea
     const vw = tag.hook.size.x * tag._mpScale;
     const vh = tag.hook.size.y * tag._mpScale;
     tag.setPos(Math.round(scr.x - vw / 2), Math.round(scr.y - vh - 2));
+    // 1.73.0: the engine recomputes hook._visible every frame (renderer's
+    // e(x, G)), so _visible writes are cosmetic — localAlpha is the real draw
+    // gate (D = parentAlpha * state.alpha * localAlpha; 0 = nothing draws).
     try { tag.hook._visible = true; } catch (_) { /* ignore */ }
+    setTagAlpha(tag, 1);
 }
 
 /** Round 17: a ` (Nms)` suffix for a valid (finite, >=0) ping, else nothing. */
@@ -727,18 +756,71 @@ function remoteTagLabel(m: Multiplayer | undefined, name: string): string {
 
 /** Reconcile name tags with the live set of taggable entities. Called every frame
  * from the update loop and immediately when any option toggle changes. */
+// 1.73.0 (cutscene name-tag diag): the pump writes a live heartbeat + its
+// gate values here every call, so __mpSceneProbe can tell a DEAD pump (at goes
+// stale) from a THROWING pass (err set) from gates that simply read false.
+const tagDiag: any = ((window as any).__mpTagDiag = (window as any).__mpTagDiag || { at: 0, show: null, cutHide: null, err: null });
+
 export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
+    tagDiag.at = Date.now();
     try {
         const m = getMain();
         const enabled = !!getMpOption('showNameTags');
         const show = enabled && !!m && inGameOk() && !anyMenuOpen();
+        tagDiag.show = show;
 
         // Off→on: drop stale cached tags so styling rebuilds from current options.
         if (enabled && !lastTagsEnabled) resetAllTags();
         lastTagsEnabled = enabled;
 
+        // 1.71.9 (issue 11): while a synced story video plays, player name tags
+        // (own included) are hidden like the rest of the HUD — the cutscene owns
+        // the screen and must not show names above the actors.
+        const storyHideNames = !!(m && (m as any).storySync
+            && typeof (m as any).storySync.storyEventActive === 'function'
+            && (m as any).storySync.storyEventActive());
+        // 1.72.0 (user report): hide the OWN name tag while the local player is in
+        // a story cutscene too. Remote tags already hide via ROUND 107 below, but
+        // this gate only checked storyHideNames (synced story VIDEO) — during an
+        // engine story cutscene (netSync.inCutscene) the own name stayed visible.
+        const inCutsceneNow = !!((m as any).netSync && (m as any).netSync.inCutscene);
+        // 1.73.0 (user report): the netSync latch only flips for SYNCED story
+        // events — an ordinary LOCAL story cutscene (NPC dialogue, story scene)
+        // never sets it, so the own tag (and remote tags) stayed on screen.
+        // Read the engine's own truth: sc.model.isCutscene() is live for every
+        // cutscene kind; tags rebuild the frame it clears.
+        let engineCutscene = false;
+        try {
+            const mdl: any = (sc as any).model;
+            engineCutscene = !!(mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene());
+        } catch (_) { /* read failure = not in a cutscene */ }
+        // ...and scripted BLOCKING events (pressure-plate wake-up scenes, camera
+        // pans, trap triggers): they never enter GAME_MODEL_STATE.CUTSCENE, so
+        // isCutscene() stays false while the scene plays. A live blocking event
+        // call means the script owns the screen — hide the tags for it too.
+        let blockingEvent = false;
+        try {
+            const evm: any = (ig as any).game && (ig as any).game.events;
+            blockingEvent = !!(evm && typeof evm.getBlockingEventCall === 'function' && evm.getBlockingEventCall());
+        } catch (_) { /* read failure = no blocking event */ }
+        const cutHide = storyHideNames || inCutsceneNow || engineCutscene || blockingEvent;
+        tagDiag.cutHide = cutHide;
+
+        // 1.73.0 (CUTSCENE FIX — the real one): the engine's GUI tree walks
+        // children every frame (_updateRecursive -> e(hook, parentVisible)) and
+        // FORCES each child hook back to the parent's visibility — so our
+        // child-level hook._visible=false was overridden within the same frame
+        // ([tagvis] showed e/_updateRecursive re-showing the tag ~150x/sec).
+        // Child _visible is therefore NOT authoritative; the CONTAINER is. Hide
+        // the whole tagContainer and the tree forces every tag along with it.
+        if (tagContainer) {
+            try { tagContainer.hook._visible = !!(show && !cutHide); } catch (_) { /* ignore */ }
+        }
         if (!show) {
-            for (const n in tags) { try { tags[n].hook._visible = false; } catch (_) { /* ignore */ } }
+            for (const n in tags) {
+                try { tags[n].hook._visible = false; } catch (_) { /* ignore */ }
+                setTagAlpha(tags[n], 0);
+            }
             return;
         }
         // Ensure container exists.
@@ -751,20 +833,9 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         const alpha = pickTagAlpha();
         const tagScale = getMpUiCanvasScale();
         const goldOn = !!getMpOption('leaderGold') && !!(m as any).partyLeader;
-        // 1.71.9 (issue 11): while a synced story video plays, player name tags
-        // (own included) are hidden like the rest of the HUD — the cutscene owns
-        // the screen and must not show names above the actors.
-        const storyHideNames = !!(m.storySync
-            && typeof m.storySync.storyEventActive === 'function'
-            && m.storySync.storyEventActive());
-        // 1.72.0 (user report): hide the OWN name tag while the local player is in
-        // a story cutscene too. Remote tags already hide via ROUND 107 below, but
-        // this gate only checked storyHideNames (synced story VIDEO) — during an
-        // engine story cutscene (netSync.inCutscene) the own name stayed visible.
-        const inCutsceneNow = !!((m as any).netSync && (m as any).netSync.inCutscene);
 
         // Own player tag (account name above the local player entity).
-        if (getMpOption('showOwnName') && !storyHideNames && !inCutsceneNow) {
+        if (getMpOption('showOwnName') && !cutHide) {
             const selfName = (m as any).name;
             const ent = (ig as any).game && (ig as any).game.playerEntity;
             if (selfName && ent && ent.coll && !ent._killed && !(ent.params && ent.params.currentHp <= 0)) {
@@ -797,12 +868,14 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
                 const pl = players[name];
                 const ent = pl && pl.entity;
                 // 1.71.9 (issue 11): hide teammate names during a synced story video.
-                if (storyHideNames) {
+                if (cutHide) {
                     try { dropNameTag(name); } catch (_) { /* ignore */ }
                     continue;
                 }
                 // ROUND 107: while the LOCAL player is in a story cutscene, other
                 // players have no collision and their name tags are hidden entirely.
+                // (1.73.0: folded into cutHide above — kept check retained for the
+                // synced-latch edge where the engine flag races a frame behind.)
                 const nsNow: any = (m as any).netSync;
                 if (nsNow && nsNow.inCutscene) {
                     try { dropNameTag(name); } catch (_) { /* ignore */ }
@@ -838,7 +911,7 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
         // Follower bots (native + mod). Keyed by their sc.party.partyEntities name;
         // the label resolves through the party model's getCharacterName override
         // (mod bots return the account name, native bots their character name).
-        if (getMpOption('showBotNames') && !storyHideNames) {
+        if (getMpOption('showBotNames') && !storyHideNames && !cutHide) {
             const party: any = (sc as any).party;
             const ents = party && party.partyEntities;
             if (ents) {
@@ -866,9 +939,20 @@ export function applyNameTagsNow(getMain: () => Multiplayer | undefined): void {
 
         // Hide tags whose target left / despawned.
         for (const n in tags) {
-            if (!seen[n]) { try { tags[n].hook._visible = false; } catch (_) { /* ignore */ } }
+            if (!seen[n]) {
+                try { tags[n].hook._visible = false; } catch (_) { /* ignore */ }
+                setTagAlpha(tags[n], 0);
+            }
         }
-    } catch (_) { /* never break the update loop */ }
+        try {
+            const selfName: any = (m as any).name;
+            tagDiag.seenSelf = !!(selfName && seen[selfName]);
+            const tg: any = selfName ? (tags as any)[selfName] : null;
+            tagDiag.selfVis = tg ? String(!!tg.hook._visible) : 'none';
+            const prt: any = (sc as any).party;
+            tagDiag.partyKeys = prt && prt.partyEntities ? Object.keys(prt.partyEntities).join(',') : '';
+        } catch (_) { /* diag only */ }
+    } catch (e: any) { try { tagDiag.err = String((e && e.stack) || e).slice(0, 300); } catch (_) { /* ignore */ } }
 }
 
 function inGameOk(): boolean {
@@ -878,6 +962,86 @@ function inGameOk(): boolean {
         if (typeof g.isTeleporting === 'function' && g.isTeleporting()) return false;
         return true;
     } catch (_) { return false; }
+}
+
+// ---- 1.73.0: cutscene-signal probe (diagnostics) ----
+// __mpSceneProbe(): sample every cutscene-adjacent engine signal 100x over 15s
+// and log a TRANSITION timeline. Run it in the console right BEFORE triggering
+// a scripted scene (pressure plate etc.), let the scene play out, then copy the
+// log — it tells us exactly which signal tracks scenes our name-tag hide gate
+// misses (cold-dng.g.room4 wake-up scene reported invisible to both
+// isCutscene() and the blocking-event flag).
+export function installSceneProbe(getMain: () => Multiplayer | undefined): void {
+    const w: any = window as any;
+    if (w.__mpSceneProbe) return;
+    w.__mpSceneProbe = (killContainer?: boolean) => {
+        // killContainer: also force the WHOLE tag container invisible every 50ms.
+        // If the name still renders with the container hidden, the visible name
+        // is NOT drawn by this tag system at all (and we hunt another renderer).
+        let killer: any = null;
+        if (killContainer) {
+            killer = setInterval(() => {
+                try { if (tagContainer) tagContainer.hook._visible = false; } catch (_) { /* ignore */ }
+                try { for (const n in tags) tags[n].hook._visible = false; } catch (_) { /* ignore */ }
+            }, 50);
+        }
+        const tl: any[] = [];
+        let last = '';
+        const t0 = Date.now();
+        const sample = () => {
+            let isCut = false, block = false, runCalls = -1, camTargets = -1, camTarget = '', ready = true, sub = -1, st = -1, ownVis = '-';
+            try { const mdl: any = (sc as any).model; st = mdl.currentState; sub = mdl.currentSubState; isCut = typeof mdl.isCutscene === 'function' && mdl.isCutscene(); } catch (_) { /* ignore */ }
+            try {
+                const evm: any = (ig as any).game && (ig as any).game.events;
+                block = !!(evm && typeof evm.getBlockingEventCall === 'function' && evm.getBlockingEventCall());
+                runCalls = evm && evm.runningEventCalls ? evm.runningEventCalls.length : -1;
+            } catch (_) { /* ignore */ }
+            try { ready = !!(ig.game && typeof (ig.game as any).isEventStartReady === 'function' && (ig.game as any).isEventStartReady()); } catch (_) { /* ignore */ }
+            try {
+                const cam: any = (ig.game as any).camera;
+                if (cam) {
+                    camTargets = cam.targets ? cam.targets.length : -1;
+                    const cur = cam._currentTarget || cam.currentTarget || null;
+                    camTarget = cur && cur.entity ? (cur.entity.name || cur.entity.type || '?') : (cur ? 'set' : '');
+                }
+            } catch (_) { /* ignore */ }
+            try {
+                const m = getMain();
+                const selfName: any = m && (m as any).name;
+                const tg: any = selfName ? (tags as any)[selfName] : null;
+                ownVis = tg && tg.hook ? String(!!tg.hook._visible) : 'none';
+            } catch (_) { /* ignore */ }
+            let pumpAge = -1, pumpShow: any = null, pumpCut: any = null, pumpErr: any = null;
+            try {
+                const d: any = (window as any).__mpTagDiag;
+                if (d) { pumpAge = Date.now() - (d.at || 0); pumpShow = d.show; pumpCut = d.cutHide; pumpErr = d.err || null; }
+            } catch (_) { /* ignore */ }
+            let seenSelf: any = null, selfVis: any = null, partyKeys: any = null, lastAdds: any = null;
+            try {
+                const d2: any = (window as any).__mpTagDiag;
+                if (d2) { seenSelf = d2.seenSelf; selfVis = d2.selfVis; partyKeys = d2.partyKeys; lastAdds = d2.lastAdds ? d2.lastAdds.join(' ') : ''; }
+            } catch (_) { /* ignore */ }
+            const sig = [st, sub, isCut ? 1 : 0, block ? 1 : 0, runCalls, camTargets, camTarget, ready ? 1 : 0, ownVis, pumpAge > 300 ? 'DEAD' : 'live', String(pumpShow), String(pumpCut), pumpErr ? 'ERR' : '', String(seenSelf), String(selfVis), String(partyKeys)].join('|');
+            if (sig !== last) {
+                last = sig;
+                tl.push({ ms: Date.now() - t0, state: st, sub, isCut, blocking: block, runCalls, camTargets, camTarget, evtReady: ready, ownTagVisible: ownVis, pump: pumpAge > 300 ? 'DEAD' : 'live', pumpShow, pumpCutHide: pumpCut, pumpErr, seenSelf, selfVisAfterHide: selfVis, partyKeys, lastAdds });
+            }
+        };
+        sample();
+        let n = 0;
+        const iv = setInterval(() => {
+            sample();
+            if (++n >= 100) {
+                clearInterval(iv);
+                if (killer) clearInterval(killer);
+                console.log('[mpSceneProbe] timeline (state: 0=LOADING? 1=GAME 2=CUTSCENE-ish — raw engine enum):');
+                for (const e of tl) console.log('[mpSceneProbe]', JSON.stringify(e));
+                console.log('[mpSceneProbe] done — ' + tl.length + ' transitions over 15s. Paste this whole block.');
+            }
+        }, 150);
+        console.log('[mpSceneProbe] sampling for 15s — trigger the scene NOW.');
+    };
+    console.log('[multiplayer] __mpSceneProbe() installed');
 }
 
 /** Start the per-frame name-tag pump (idempotent). */

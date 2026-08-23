@@ -112,7 +112,7 @@ export interface IConnection {
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
      * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
      * fixed MEDIUM. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number }): void;
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[] }): void;
     /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
      * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
      * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
@@ -219,9 +219,20 @@ export interface IConnection {
     onPuzzleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
     /** ROUND 132: stream the LOCAL player's thrown-ball positions (bounce-puzzle
      * visibility — throwBall only relays the throw moment, not the steered bounce). */
-    playerBall(map: string, entries: Array<{ i: number, el?: number, x: number, y: number, z: number, vx?: number, vy?: number }>): void;
+    playerBall(map: string, entries: Array<{ i: number, el?: number, chg?: number, x: number, y: number, z: number, vx?: number, vy?: number }>): void;
     /** ROUND 132: a same-instance peer relayed its thrown-ball positions. */
     onPlayerBall(callback: (data: { from: string, map: string, entries: Array<any> }) => void): void;
+
+    /** 1.74.0: a member's charged ball hit a host-authoritative sliding block —
+     * relay the push direction to the instance host, which pushes its local pillar. */
+    slidingPush(map: string, mi: number, dx: number, dy: number): void;
+    /** 1.74.0: a same-instance peer relayed a sliding-block push direction. */
+    onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number }) => void): void;
+    /** ROUND 133: relay a quest-world spawn-driving map/tmp var (chest spawnCondition)
+     * so same-instance members' hidden chests appear too — even outside side-quest sync. */
+    spawnVar(map: string, list: Array<{ b: string, k: string, v: any }>): void;
+    /** ROUND 133: a same-instance peer relayed a spawn-driving var. */
+    onSpawnVar(callback: (data: { from: string, map: string, list: Array<{ b: string, k: string, v: any }> }) => void): void;
 
     updateEntityPosition(id: number, pos: Vec3): void;
     updateEntityAnimation(id: number, face: Vec2, anim: string): void;
@@ -343,6 +354,31 @@ export interface IConnection {
     enemyFxStop?(fx: { uid: number, sheet: string, key: string }): void;
     onEnemyFxStop?(cb: (uid: number, sheet: string, key: string) => void): void;
     onEnemyFx?(callback: (uid: number, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void;
+    /** 1.73.x: the host's enemy counter resolved (battle done) — set the counter
+     * vars locally + zero the visible counter so the relayed battle-done
+     * cutscene's WAIT_UNTIL_TRUE step unblocks and the door opens. */
+    enemyCounterDone?(pkt: { group: string, preVar: string, postVar: string }): void;
+    onEnemyCounterDone?(cb: (data: { group: string, preVar: string, postVar: string }) => void): void;
+    /** 1.73.x: the host's counter marble (red orb flying into the enemy counter
+     * after a kill) — members spawn a copy targeting their local counter. */
+    counterMarble?(pkt: { group: string, x: number, y: number, z: number }): void;
+    onCounterMarble?(cb: (data: { group: string, x: number, y: number, z: number }) => void): void;
+    /** 1.73.x: a player pressed a dungeon elevator — peers run the same native
+     * move on their local elevator so platform riders are carried floor to floor. */
+    elevatorSync?(pkt: { map: string, mi: number, dest: number }): void;
+    onElevatorSync?(cb: (data: { map: string, mi: number, dest: number }) => void): void;
+    /** 1.73.x: the bomb-launching client streams its live bomb positions so peers
+     * render flying bomb copies (the bomb entity runs where it was triggered). */
+    bombState?(map: string, entries: any[]): void;
+    onBombState?(callback: (map: string, list: any[]) => void): void;
+    /** 1.73.x: the triggering client's bomb exploded — peers play the boom + reset
+     * their local bomb panel respawn timer. */
+    bombExplode?(pkt: { map: string, i: number, pmi: number, x: number, y: number, z: number }): void;
+    onBombExplode?(cb: (data: { map: string, i: number, pmi: number, x: number, y: number, z: number }) => void): void;
+    /** 1.73.x: a LOCAL attack hit our bomb copy — relay the interaction to the bomb's
+     * owner so the real bomb detonates early / heat-converts. */
+    bombInteract?(pkt: { map: string, i: number, kind: string, dirx: number, diry: number }): void;
+    onBombInteract?(cb: (data: { map: string, i: number, kind: string, dirx: number, diry: number }) => void): void;
     /** Round 27 (item 2): publish OUR current map to the party so teammates' HUDs
      * can hide our HP/SP/EXP bars + grey our net diamond while we're off their map.
      * `area` carries the engine-resolved current area path (map names do NOT always
@@ -457,6 +493,28 @@ export interface IConnection {
     /** ROUND 34 (item 3): a same-instance player's attack sound (see emitPlayerSound).
      * Replay it locally positioned on that player's mirror. */
     onPlayerSound(callback: (s: { player: string, path: string, volume?: number, variance?: number, loop?: boolean, radius?: number, speed?: number }) => void): void;
+    /** 1.72.0: the local player fired a combat art — relay the art's name
+     * (LangLabel data map or plain string) so teammates can raise the
+     * 战技名 banner over our mirror. */
+    combatArtName(label: any): void;
+    /** 1.72.0: a same-instance player fired a combat art — show the name banner
+     * over their mirror (receiver-side option-gated). */
+    onCombatArtName(callback: (data: { player: string, label: any }) => void): void;
+    /** 1.73.0 (admin UI): the server admin issued a debug command for THIS
+     * player (giveExp/giveCredits/giveItem/teleport). Execute + adminAck. */
+    onAdminCommand(callback: (cmd: { cmdId: number, kind: string, amount?: number, id?: number, map?: string, marker?: string }) => void): void;
+    /** 1.73.0 (admin UI): report the outcome of one adminCommand. */
+    adminAck(cmdId: number, ok: boolean, msg?: string): void;
+    /** 1.73.0 (admin UI): announce our item-catalog size; the server replies
+     * itemdbWant when its cache is missing/stale. */
+    itemdbHello(count: number): void;
+    /** 1.73.0 (admin UI): the server wants a full item-catalog upload. */
+    onItemdbWant(callback: () => void): void;
+    /** 1.73.0 (admin UI): upload the item catalog (id -> localized names). */
+    itemdbUpload(items: any[]): void;
+    /** 1.73.0 (admin UI): an admin renamed our account — the server is about
+     * to disconnect us; warn the player to re-login under the new name. */
+    onAdminRenamed(callback: (name: string) => void): void;
     /** ROUND 43 (skill-release sound): a same-instance player fired a skill's launch
      * sound — replay it on that player's mirror (see NetSync.applySkillSound). */
     onSkillSound(callback: (s: { player: string, path: string, volume?: number, variance?: number, radius?: number, speed?: number }) => void): void;

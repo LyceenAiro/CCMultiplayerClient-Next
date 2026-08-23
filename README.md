@@ -8,10 +8,12 @@ An online-multiplayer mod for [CrossCode](https://www.cross-code.com/). It lets
 several players share the same world: each sees the other players' avatars
 walking around, and the **host's** enemies, projectiles and combat are
 synchronized to everyone else over a central relay server
-([CCMultiplayerServer](https://github.com/CCDirectLink/CCMultiplayerServer)).
+([CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer)).
 
-> **Status:** maintained / revived. The mod was written for CrossCode **1.1.0**
-> and **CCLoader v2**. This tree keeps it on **CCLoader v2** (the current,
+> **Status:** early development.
+> Main-story test progress: Temple Mine.
+> The mod was originally written for CrossCode **1.1.0** and the old
+> **CCLoader v2**. This tree keeps it on **CCLoader v2** (the current,
 > actively-maintained loader) while updating it for **CrossCode 1.4.2** (the
 > final game release). It builds cleanly and the network protocol has been
 > verified end-to-end against the server. In-game multiplayer has **not yet
@@ -21,10 +23,50 @@ synchronized to everyone else over a central relay server
 > **Development note:** This project is developed with **vibe coding**
 > (AI-assisted development).
 
+## FAQ
+
+#### How is this mod different from [cc-multibakery](https://github.com/krypciak/cc-multibakery)?
+
+* This mod focuses on story, side quests and co-op syncing. Its network
+  overhead currently looks much larger than multibakery's. PvP and similar
+  features aren't supported yet, but it aims for a more immersive story-driven
+  co-op experience than multibakery.
+
+#### How long until I can play this CCMultiplayer fork?
+
+* You can start right now. Just run
+  [CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer),
+  install CCMultiplayerClient, and connect from the main menu. Saves are
+  stored by the server, so you can play your account from any client.
+
+#### Discord?
+
+* Unfortunately I'm not very active in the Discord group — I may only check
+  Discord once every two or three months, so this mod probably won't
+  proactively share any information there.
+
+#### Will this compete with cc-multibakery?
+
+* I'll answer plainly: not unless its developer picks a fight with me first.
+  Maintaining this mod has cost me a lot of money (vibe coding) and time on
+  development and testing. I'd actually prefer multibakery to replace this
+  project someday — I don't know TypeScript syntax and I'm unfamiliar with the
+  CCLoader API, so fixing odd bugs is very difficult. Multibakery seems more
+  polished everywhere, has lower network overhead, and even has a
+  smooth-looking PvP mode — I have to give it a plug here.
+
+#### How long until this project is finished?
+
+* I don't know. I'm currently playing through it with a friend plus my own
+  heavy testing and fixing. After two weeks of development the test run is
+  still in the Temple Mine area, and the developer is a perfectionist who
+  stops to adjust anything that looks off.
+
 ---
 
 ## Table of contents
 
+- [FAQ](#faq)
 - [How it works](#how-it-works)
 - [Features](#features)
 - [Main-city (shared town) mechanics](#main-city-shared-town-mechanics)

@@ -99,33 +99,127 @@ class CutsceneRelay implements ICutsceneRelay {
 		try {
 			if (!trig || trig._killed) return false;
 			const EVT: any = (ig as any).EVENT_TYPE || {};
-			if (trig.eventType !== EVT.CUTSCENE && trig.eventType !== EVT.COMBAT_CUTSCENE) return false;
+			const isCutscene = trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE;
+			// Encounter-battle intros are PARALLEL events carrying the dramatic
+			// enemy-target signature (SET_SCREEN_ENEMY_TARGET / SET_FINAL_DRAMATIC_EFFECT)
+			// — e.g. cold-dng.b3.center's BattleStart when stepping off the elevator.
+			const isEncounter = trig.eventType === EVT.PARALLEL && this.hasEncounterSignature(trig);
+			if (!isCutscene && !isEncounter) return false;
 			if (typeof trig.triggerVar !== 'string' || trig.triggerVar.indexOf('map._entity') !== 0) return false;
-			const cond = trig.startCondition;
-			if (!cond || typeof cond.condition !== 'string' || !cond.condition.trim()) return false;
+			// In the BAKED game VarCondition.condition is the COMPILED predicate
+			// function, not the source string — the string check here silently
+			// disqualified every trigger. Read the RAW settings string stashed at
+			// init instead (undefined/''/'false' = condition-less entry cutscene).
+			const raw = trig._mpCsSettings;
+			const condStr = (raw && typeof raw.startCondition === 'string') ? raw.startCondition.trim() : '';
+			if (!condStr || condStr === 'false' || condStr === '0') return false;
 			return true;
 		} catch (_) { return false; }
+	}
+
+	/** An encounter-battle intro is a PARALLEL event whose steps carry the
+	 * dramatic enemy-target signature. Matched by step TYPE only (the raw settings
+	 * steps array), so it works for any map's battle trigger, not just cold-dng. */
+	private hasEncounterSignature(trig: any): boolean {
+		try {
+			const raw = trig._mpCsSettings;
+			const steps = raw && raw.event;
+			if (!Array.isArray(steps)) return false;
+			for (let i = 0; i < steps.length; i++) {
+				const t = steps[i] && steps[i].type;
+				if (t === 'SET_SCREEN_ENEMY_TARGET' || t === 'SET_FINAL_DRAMATIC_EFFECT') return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** Fade + collision-off for other mirrors while an encounter-battle intro plays
+	 * — mirrors the fade a story cutscene triggers, without blocking input. The
+	 * netSync timestamp self-expires ~1.5s later (the intro is a short PARALLEL event). */
+	/** Ask netSync to respawn a stale encounter battle (HOST-only no-op elsewhere).
+	 * Scoped to PARALLEL encounter intros so a story cutscene never re-spawns a
+	 * battle the host legitimately cleared. */
+	private maybeRespawn(trig: any): void {
+		try {
+			if (!this.isEncounterTrigger(trig)) return;
+			const m: any = this.getMain();
+			const ns: any = m && m.netSync;
+			if (ns && typeof ns.maybeRespawnStaleBattle === 'function') ns.maybeRespawnStaleBattle();
+		} catch (_) { /* ignore */ }
+	}
+
+	private isEncounterTrigger(trig: any): boolean {
+		try {
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			return trig.eventType === EVT.PARALLEL && this.hasEncounterSignature(trig);
+		} catch (_) { return false; }
+	}
+
+	private markEncounterFade(trig: any): void {
+		try {
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			if (trig.eventType !== EVT.PARALLEL) return;
+			const m = this.getMain();
+			const ns: any = m && m.netSync;
+			if (ns && typeof ns.encounterFadeUntil === 'number') {
+				ns.encounterFadeUntil = Date.now() + 1500;
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Bail diagnostics are logged ONCE per key per map — enough to diagnose a
+	 * silent relay failure from one console dump without spamming the frame. */
+	private bailLogged = new Set<string>();
+	private bailMap = '';
+	private logOnce(key: string, msg: string): void {
+		try {
+			const map = (ig.game && (ig.game as any).mapName) || '';
+			if (map !== this.bailMap) { this.bailMap = map; this.bailLogged.clear(); }
+			if (this.bailLogged.has(key)) return;
+			this.bailLogged.add(key);
+			console.log('[cutscenerelay] ' + msg);
+		} catch (_) { /* ignore */ }
+	}
+	private trigLabel(trig: any): string {
+		return 'name=' + ((trig && trig.name) || '(none)') + ' mi=' + ((trig && trig.mapId) || 0)
+			+ ' type=' + (trig && trig.eventType) + ' var=' + ((trig && trig.triggerVar) || '(none)');
 	}
 
 	private onLocalTriggerStart(trig: any): void {
 		try {
 			if (this.applying) return;
+			// Probe EVERY story-type trigger start — this is the ground truth for
+			// 'the local engine really fired the cutscene on this client'.
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			if (trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE) {
+				this.logOnce('probe:' + (trig.mapId || trig.name || '?'),
+					'local cutscene start: ' + this.trigLabel(trig)
+					+ ' storySync=' + (this.storySyncActive() ? 1 : 0));
+			}
 			if (this.storySyncActive()) return; // story sync owns trigger authority
-			if (!this.qualifies(trig)) return;
+			if (!this.qualifies(trig)) {
+				if (trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE) {
+					this.logOnce('qual:' + (trig.mapId || '?'), 'start NOT relay-qualified: ' + this.trigLabel(trig)
+						+ ' cond=' + (trig.startCondition && trig.startCondition.condition));
+				}
+				return;
+			}
+			this.markEncounterFade(trig);
+			this.maybeRespawn(trig);
 			const m: any = this.getMain();
 			const conn: any = m && m.connection;
-			if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
-			if (typeof conn.sendCutsceneTrigger !== 'function') return;
+			if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) { this.logOnce('conn', 'relay bail: connection closed'); return; }
+			if (typeof conn.sendCutsceneTrigger !== 'function') { this.logOnce('conn2', 'relay bail: no sendCutsceneTrigger'); return; }
 			const me = m && m.name;
 			const members: string[] = (m && m.partyMembers) || [];
 			let hasOther = false;
 			for (const n of members) { if (n && n !== me) { hasOther = true; break; } }
-			if (!hasOther) return;
+			if (!hasOther) { this.logOnce('alone', 'relay bail: no other party members (roster=' + JSON.stringify(members) + ')'); return; }
 			const player: any = ig.game && ig.game.playerEntity;
 			if (!player || !player.coll) return;
 			const map: string = (ig.game as any).mapName || '';
 			const mi = trig.mapId || 0;
-			if (!map || !mi) return;
+			if (!map || !mi) { this.logOnce('mi', 'relay bail: no map or mapId: ' + this.trigLabel(trig)); return; }
 			conn.sendCutsceneTrigger(map, mi, [
 				Math.round(player.coll.pos.x),
 				Math.round(player.coll.pos.y),
@@ -136,21 +230,35 @@ class CutsceneRelay implements ICutsceneRelay {
 		} catch (_) { /* never break the local cutscene */ }
 	}
 
+	/** A relay that arrived while we were momentarily busy (teleporting / event
+	 * not start-ready) is retried briefly instead of being dropped forever —
+	 * the engine's own trigger retry covers the var-synced native path, but the
+	 * relay is the only carrier when that path never engaged. */
+	private pendingRelay: { data: ICutsceneRelayPacket, until: number } | null = null;
+	private pendingTimer: any = null;
+
 	public onRelay(data: ICutsceneRelayPacket): void {
 		try {
 			if (!data || typeof data.map !== 'string' || typeof data.mi !== 'number') return;
 			if (!Array.isArray(data.p) || data.p.length !== 3) return;
-			if (this.storySyncActive()) return;
+			if (this.storySyncActive()) { this.logOnce('rs:' + data.mi, 'relay mi=' + data.mi + ' ignored: storySync active'); return; }
 			const g: any = ig.game;
-			if (!g || !g.playerEntity || g.isTeleporting()) return;
+			if (!g || !g.playerEntity) return;
 			if ((g.mapName || '') !== data.map) return; // different block — not for us
-			if (typeof g.isEventStartReady === 'function' && !g.isEventStartReady()) return;
+			if (g.isTeleporting() || (typeof g.isEventStartReady === 'function' && !g.isEventStartReady())) {
+				// Busy right now — retry for up to 10s instead of losing the moment.
+				this.logOnce('busy:' + data.mi, 'relay mi=' + data.mi + ' deferred (busy), retrying');
+				this.pendingRelay = { data, until: Date.now() + 10000 };
+				this.armPendingRetry();
+				return;
+			}
 			const trig = this.findTrigger(data.mi);
-			if (!trig) return;
+			if (!trig) { this.logOnce('nf:' + data.mi, 'relay mi=' + data.mi + ' — trigger NOT FOUND on this map'); return; }
 			// We already consumed it (we were standing in the zone ourselves, or
 			// saw it in an earlier session) — no teleport, no replay.
-			if (trig.triggerVar && ig.vars.get(trig.triggerVar)) return;
-			if (trig.eventCall && trig.eventCall.isRunning()) return;
+			this.maybeRespawn(trig);
+			if (trig.triggerVar && ig.vars.get(trig.triggerVar)) { this.logOnce('done:' + data.mi, 'relay mi=' + data.mi + ' already consumed'); return; }
+			if (trig.eventCall && trig.eventCall.isRunning()) { this.logOnce('run:' + data.mi, 'relay mi=' + data.mi + ' already running natively'); return; }
 			const ev = this.eventOf(trig);
 			if (!ev) {
 				console.warn('[cutscenerelay] no event object for trigger mi=' + data.mi);
@@ -162,11 +270,30 @@ class CutsceneRelay implements ICutsceneRelay {
 			this.applying = true;
 			try {
 				(sc as any).Cutscene.startEvent(trig.eventType, ev);
+				this.markEncounterFade(trig);
 				if (trig.triggerVar) { try { ig.vars.set(trig.triggerVar, true); } catch (_) { /* ignore */ } }
 				console.log('[cutscenerelay] started relayed trigger mi=' + data.mi
 					+ ' from=' + (data.from || '?'));
 			} finally { this.applying = false; }
 		} catch (e) { console.warn('[cutscenerelay] relay failed', e); }
+	}
+
+	private armPendingRetry(): void {
+		if (this.pendingTimer) return;
+		const self = this;
+		this.pendingTimer = setInterval(() => {
+			try {
+				const p = self.pendingRelay;
+				if (!p || Date.now() > p.until) { self.pendingRelay = null; return; }
+				const g: any = ig.game;
+				if (!g || !g.playerEntity || g.isTeleporting()) return;
+				if ((g.mapName || '') !== p.data.map) { self.pendingRelay = null; return; }
+				if (typeof g.isEventStartReady === 'function' && !g.isEventStartReady()) return;
+				const data = p.data;
+				self.pendingRelay = null;
+				self.onRelay(data);
+			} catch (_) { /* ignore */ }
+		}, 500);
 	}
 
 	private findTrigger(mi: number): any {

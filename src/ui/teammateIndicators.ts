@@ -33,9 +33,15 @@ import { getMpUiScale } from './uiScale';
  */
 
 const EDGE_MARGIN = 6;
-const ARROW_MIN = 14;
-const ARROW_MAX = 30;
-const ARROW_DIST_DIV = 28;
+// Small visual gap (page px, scales with UI zoom) between the arrow's extreme
+// pixel and the screen border — user request: keep a hair of distance so the
+// arrow never overflows at high zoom, while still visually hugging the edge.
+const EDGE_GAP = 4;
+// Max scale of the .mpArrowPulse breathing animation (matches the CSS keyframes).
+const PULSE_MAX = 1.16;
+// ROUND: user request — the arrow no longer grows/shrinks with distance; it is a
+// single fixed size.
+const ARROW_SIZE = 20;
 
 let installed = false;
 let getMain: (() => Multiplayer | undefined) | null = null;
@@ -48,9 +54,10 @@ function ensureStyle(): void {
 	const style = document.createElement('style');
 	style.id = 'mpTeammateArrowStyle';
 	style.textContent = `.mpTeammateArrow { position: fixed; z-index: 10002; pointer-events: none;
-	filter: drop-shadow(0 1px 3px rgba(0,0,0,0.9)); }
+	filter: drop-shadow(0 1px 3px rgba(0,0,0,0.9)); animation: mpArrowFadeIn 0.28s ease-out; }
 .mpTeammateArrow svg { display: block;
-	transform: rotate(var(--mpRot, 0deg)); }
+	transform: rotate(var(--mpRot, 0deg));
+	animation: mpGoldBreath 0.8s ease-in-out infinite alternate; }
 .mpTeammateArrow::after { content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 6px);
 	transform: translateX(-50%); background: rgba(30,6,6,0.95); border: 1px solid #ff5a52;
 	border-radius: 4px; padding: 3px 8px; color: #ffe9e7; white-space: nowrap;
@@ -62,15 +69,60 @@ function ensureStyle(): void {
 .mpTeammateArrow.showTip::after { opacity: 1; }
 `;
 	document.head.appendChild(style);
+	// Golden breathing glow (user request: the off-screen teammate arrows were not
+	// noticeable enough). Animates only the filter, so the arrow rotation transform is
+	// untouched; paired with the svg rule's infinite-alternate so it pulses dim<->bright.
+	style.textContent += '@keyframes mpGoldBreath { from { filter: drop-shadow(0 0 3px rgba(255,242,205,0.72)) drop-shadow(0 0 9px rgba(255,232,175,0.50)); } to { filter: drop-shadow(0 0 5px rgba(255,251,238,1)) drop-shadow(0 0 16px rgba(255,240,196,0.90)); } }';
+	// Terraria-style scale breathing (user request): the arrow gently grows/shrinks.
+	// On a wrapper span so it never fights the svg's rotate(var(--mpRot)) direction
+	// transform. transform-origin centre keeps it anchored on the arrow point.
+	style.textContent += '.mpArrowPulse { display: block; transform-origin: 50% 50%; animation: mpArrowPulse 1.3s ease-in-out infinite alternate; }';
+	style.textContent += '@keyframes mpArrowPulse { from { transform: scale(1); } to { transform: scale(1.16); } }';
+	// Sci-fi vanish (user request, area-switch only): bright cyan flash, a horizontal
+	// glitch jitter, a vertical stretch, then collapse to a thin line and fade.
+	style.textContent += '.mpTeammateArrow.mpArrowVanish { transform-origin: 50% 50%; animation: mpArrowVanish 0.7s ease-in forwards; }';
+	style.textContent += '@keyframes mpArrowVanish { 0% { opacity: 1; transform: scale(1) translateX(0) rotate(0deg); filter: brightness(1) drop-shadow(0 0 4px rgba(150,240,255,0.6)); } 15% { opacity: 1; transform: scale(1.6) translateX(0) rotate(0deg); filter: brightness(3) drop-shadow(0 0 18px rgba(150,245,255,1)); } 32% { opacity: 1; transform: scale(1.35) translateX(-9px) rotate(-8deg); } 50% { opacity: 0.85; transform: scale(1.3) translateX(9px) rotate(8deg); } 68% { opacity: 0.6; transform: scale(1.15) translateX(-6px) scaleY(2.2); filter: brightness(2.4) drop-shadow(0 0 12px rgba(150,245,255,0.9)); } 100% { opacity: 0; transform: scale(0.2) scaleY(0.05) translateX(0) rotate(0deg); filter: brightness(3.2) drop-shadow(0 0 8px rgba(150,245,255,0.9)); } }';
+	// Fade-in on appearance (user request): any time the arrow appears it eases from
+	// transparent to normal. The animation lives on the root and restarts whenever the
+	// element goes display:none->block (see the show-on-transition guard in tick).
+	style.textContent += '@keyframes mpArrowFadeIn { from { opacity: 0; } to { opacity: 1; } }';
 }
 
+// Pixel-art silhouette of the up-pointing arrowhead (same shape as before: wide
+// triangle body with a bottom-centre notch). '#' = a filled block.
+const ARROW_PIXELS = [
+	"....#....",
+	"...###...",
+	"...###...",
+	"..#####..",
+	"..#####..",
+	".#######.",
+	".#######.",
+	"#########",
+	"####.####",
+	"###...###",
+	"##.....##",
+];
+
 function arrowSvg(size: number): string {
-	// Clean triangle arrowhead (paper-plane style) pointing UP at rest:
-	// a dark outline silhouette with a vivid red body inset inside it.
-	return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 16 16">'
-		+ '<path fill="#26060a" d="M8 0 L16 15 L8 11 L0 15 Z"/>'
-		+ '<path fill="#ff3229" d="M8 2.2 L14.1 13.8 L8 9.9 L1.9 13.8 Z"/>'
-		+ '</svg>';
+	// Pixel-art redraw (user request): keep the same up-pointing arrowhead look (dark
+	// outline + vivid red body) but as chunky pixels. A filled block with all 4
+	// orthogonal neighbours filled is BODY (red); any block touching an empty/outside
+	// cell is the OUTLINE (dark). shape-rendering:crispEdges keeps every block
+	// hard-edged when the SVG is scaled up, which is what reads as "pixelated".
+	const gw = ARROW_PIXELS[0].length, gh = ARROW_PIXELS.length;
+	const filled = (x: number, y: number): boolean =>
+		y >= 0 && y < gh && x >= 0 && x < gw && ARROW_PIXELS[y].charAt(x) === '#';
+	let body = '';
+	for (let y = 0; y < gh; y++) {
+		for (let x = 0; x < gw; x++) {
+			if (!filled(x, y)) continue;
+			const inner = filled(x - 1, y) && filled(x + 1, y) && filled(x, y - 1) && filled(x, y + 1);
+			body += '<rect x="' + x + '" y="' + y + '" width="1" height="1" fill="' + (inner ? '#ff3229' : '#26060a') + '"/>';
+		}
+	}
+	return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + gw + ' ' + gh + '" shape-rendering="crispEdges">'
+		+ body + '</svg>';
 }
 
 function ensureEl(name: string): JQuery {
@@ -109,9 +161,32 @@ function inGameOk(m: Multiplayer): boolean {
 	} catch (_) { return false; }
 }
 
+const prevOnMap: { [name: string]: boolean } = {};
+const vanishUntil: { [name: string]: number } = {};
+const VANISH_MS = 700;
+
+// Sci-fi vanish (user request): when the pointed teammate SWITCHES AREA, play a
+// digital teleport-out on their arrow instead of it popping off. Entering our area
+// stays instant (no animation). The tick stops repositioning the arrow once they are
+// off-map, so it freezes at its last edge spot while the root plays mpArrowVanish,
+// then it is hidden. Only triggered if the arrow was actually pointing (visible) —
+// an on-screen teammate's arrow is already hidden, so there is nothing to vanish.
+function startVanish(name: string): void {
+	const el = els[name];
+	if (!el) return;
+	vanishUntil[name] = Date.now() + VANISH_MS;
+	try { el.removeClass('showTip').addClass('mpArrowVanish'); } catch (_) { /* ignore */ }
+}
+function endVanish(name: string): void {
+	const el = els[name];
+	if (el) { try { el.removeClass('mpArrowVanish').hide(); } catch (_) { /* ignore */ } }
+	delete vanishUntil[name];
+}
+
 function hideAll(): void {
 	for (const name in els) {
-		try { els[name].hide(); } catch (_) { /* ignore */ }
+		try { els[name].removeClass('mpArrowVanish').hide(); } catch (_) { /* ignore */ }
+		delete vanishUntil[name];
 	}
 }
 
@@ -145,22 +220,39 @@ function tick(): void {
 		const vh = sys.height || 1;
 		const cx = vw / 2;
 		const cy = vh / 2;
+		const pcx = player.coll.pos.x + (player.coll.size ? player.coll.size.x / 2 : 0);
+		const pcy = player.coll.pos.y + (player.coll.size ? player.coll.size.y / 2 : 0) - player.coll.pos.z;
 		for (const name of roster) {
 			if (!name || name === m.name) continue;
-			if (!m.isPartyMateOnMap(name)) continue;
+			const onMap = !!m.isPartyMateOnMap(name);
+			// Area-switch vanish: on our map last frame, gone now.
+			if (prevOnMap[name] && !onMap && !vanishUntil[name]) {
+				const elV = els[name];
+				try { if (elV && elV.is(':visible')) startVanish(name); } catch (_) { /* ignore */ }
+			}
+			prevOnMap[name] = onMap;
+			if (vanishUntil[name]) {
+				// Finished, or they re-entered quickly -> end the vanish (a re-entry falls
+				// through and re-shows instantly); otherwise leave it frozen and skip.
+				if (onMap || Date.now() >= vanishUntil[name]) endVanish(name);
+				if (!onMap) continue;
+			}
+			if (!onMap) continue;
 			const rec = m.players && m.players[name];
+			// A soft-dead teammate's corpse is removed; do not keep pointing the arrow at
+			// their last known position (marked by netSync's applyPlayerState dead branch).
+			if (rec && (rec as any)._mpSoftDead) continue;
 			const ent = rec && rec.entity;
 			let wx = 0, wy = 0, dist = 99999;
 			if (ent && ent.coll && !ent._killed) {
 				wx = ent.coll.pos.x + (ent.coll.size ? ent.coll.size.x / 2 : 8);
 				wy = ent.coll.pos.y + (ent.coll.size ? ent.coll.size.y / 2 : 8) - ent.coll.pos.z;
-				dist = Math.hypot(wx - (player.coll.pos.x + player.coll.size.x / 2),
-					wy - (player.coll.pos.y + player.coll.size.y / 2 - player.coll.pos.z));
 			} else if (rec && rec.position && typeof rec.position.x === 'number') {
 				wx = rec.position.x; wy = rec.position.y - (typeof rec.position.z === 'number' ? rec.position.z : 0);
 			} else {
 				continue;
 			}
+			dist = Math.hypot(wx - pcx, wy - pcy);
 			// ig.system.getScreenFromMapPos(dest, x, y) MUTATES and returns `dest`;
 			// give it a real vector like the name-tag projection does.
 			const scr: any = {};
@@ -181,21 +273,30 @@ function tick(): void {
 			else if (py > vh - margin) { py = vh - margin; if (Math.abs(Math.cos(ang)) > 0.001) px = cx + ((vh - margin) - cy) / Math.tan(ang); }
 			px = Math.max(margin, Math.min(vw - margin, px));
 			py = Math.max(margin, Math.min(vh - margin, py));
-			const size = Math.max(ARROW_MIN, Math.min(ARROW_MAX, ARROW_MAX - (isFinite(dist) ? dist : 0) / ARROW_DIST_DIV));
+			const size = ARROW_SIZE;
 			const el = ensureEl(name);
 			if (el.attr('data-size') !== String(Math.round(size))) {
 				el.attr('data-size', Math.round(size));
-				el.html(arrowSvg(Math.round(size)));
+				el.html('<span class="mpArrowPulse">' + arrowSvg(Math.round(size)) + '</span>');
 			}
+			// Tooltip: name + live distance (user request: 'Name 25m', single space).
+			el.attr('data-tip', name + ' ' + Math.round(dist / 10) + 'm');
 			// The arrow root is zoom: var(--mp-ui-scale), and Chromium's zoom
 			// multiplies authored left/top too. Convert the desired CSS center back
 			// into PRE-ZOOM coords (desired / ui - size/2) so the visual center
 			// still lands on the canvas-projected teammate position. Also clamp by
-			// the VISUAL half-size so a 300%/400% arrow never slides half-off the
-			// edge — this is what makes the arrow hug the screen border.
+			// the VISUAL half-extent of the ROTATED glyph: the svg spins toward the
+			// teammate and .mpArrowPulse breathes up to PULSE_MAX, so a plain size/2
+			// clamp let diagonal tips poke past the edge at high UI zoom. The drawn
+			// arrow spans ~9/11 of the box width and the full box height (viewBox
+			// 9x11, preserveAspectRatio meet) and points along `ang`, so its rotated
+			// bounding half-extents are (a*sin+b*cos, a*cos+b*sin). A small EDGE_GAP
+			// keeps the tip hovering just off the border instead of touching it.
 			const ui = getMpUiScale();
-			const halfX = scaleX > 0 ? (size * ui / 2) / scaleX : 0;
-			const halfY = scaleY > 0 ? (size * ui / 2) / scaleY : 0;
+			const rotS = Math.abs(Math.sin(ang)), rotC = Math.abs(Math.cos(ang));
+			const drawA = size * 0.41, drawB = size * 0.5; // drawn glyph half-extents at rest (points up)
+			const halfX = scaleX > 0 ? ((drawA * rotS + drawB * rotC) * PULSE_MAX + EDGE_GAP) * ui / scaleX : 0;
+			const halfY = scaleY > 0 ? ((drawA * rotC + drawB * rotS) * PULSE_MAX + EDGE_GAP) * ui / scaleY : 0;
 			px = Math.max(halfX, Math.min(vw - halfX, px));
 			py = Math.max(halfY, Math.min(vh - halfY, py));
 			const cssX = left0 + px * scaleX;
@@ -223,11 +324,15 @@ function tick(): void {
 				top: Math.round(cssY / ui - size / 2),
 				width: size,
 				height: size,
-			}).show();
+			});
+			// Fade-in guard: only toggle display on the hidden->shown transition so the
+			// mpArrowFadeIn animation restarts once per appearance, not every frame. (On
+			// first creation the insertion itself already plays the fade-in.)
+			if (el.is(':hidden')) el.show();
 			shown[name] = true;
 		}
 		for (const name in els) {
-			if (!shown[name]) { try { els[name].hide(); } catch (_) { /* ignore */ } }
+			if (!shown[name] && !vanishUntil[name]) { try { els[name].hide(); } catch (_) { /* ignore */ } }
 		}
 	} catch (_) { /* never break the frame */ }
 }

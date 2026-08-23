@@ -10,6 +10,12 @@ interface IIdentifyResult {
      * fraction (config.json monsterHpPerPlayer, default 0.7 = +70% HP per extra
      * member). The HOST client applies it using its own party roster size. */
     hpScale?: number;
+    /** Same scheme for the hit-count break threshold (config.json
+     * monsterBreakPerPlayer, default 0.7 = +70% per extra member). */
+    breakScale?: number;
+    /** 1.74.x: whether online players collide with each other (config.json
+     * playerCollision, default false = always walk-through). */
+    playerCollision?: boolean;
     /** Same scheme for the attack/defense/focus stats (defaults 0.1 = +10% per
      * extra party member). */
     attackScale?: number;

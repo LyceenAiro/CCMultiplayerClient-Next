@@ -125,6 +125,16 @@ export class OnEntitySpawnListener {
 		if (entity && !entity.multiplayerId) {
 			entity.settings = settings;
 
+			// 1.74.x: record map-enemy spawn data on the HOST so a late-joining guest's
+			// encounter can be re-spawned after the host already cleared it (see
+			// netSync.maybeRespawnStaleBattle).
+			try {
+				const Enemy = (ig.ENTITY as any).Enemy;
+				if (this.main.host && Enemy && entity instanceof Enemy && (entity as any).mapId && this.main.netSync) {
+					this.main.netSync.recordEnemySpawn((entity as any).mapId, x, y, z, settings);
+				}
+			} catch (_) { /* ignore */ }
+
 			// Under the new block sync the host does NOT register/broadcast enemies here —
 			// it streams the whole map's enemy state (keyed by stable mapId) at ~15Hz and
 			// members spawn their own puppets. Skip registration so entities stay
@@ -197,10 +207,16 @@ export class OnEntitySpawnListener {
 		// the loop above missed them and EVERY swing logged "Could not find type of
 		// ball". Identify by template identity and relay as 'assault:<elementKey>';
 		// the receiver spawns the same template (see onThrowBall).
+		// 1.73.x: BallInfo.spawn passes ballInfo: this.DATA (the raw config), NOT the
+		// BallInfo instance — the old instance-identity check never matched and every
+		// assault ball fell through to the generic fallback, so members saw a pile of
+		// normal ranged balls. Compare data first, instance as a defensive fallback.
 		const assault: any = (sc as any).ASSAULT_PROJECTILES;
 		if (assault && settings.ballInfo) {
 			for (const el in assault) {
-				if (Object.prototype.hasOwnProperty.call(assault, el) && assault[el] === settings.ballInfo) {
+				if (Object.prototype.hasOwnProperty.call(assault, el)
+					&& (assault[el] === settings.ballInfo
+						|| (assault[el] && assault[el].data === settings.ballInfo))) {
 					return {
 						ballInfo: 'assault:' + el,
 						combatant:

@@ -56,7 +56,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.73.0';
+export const MP_VERSION = '1.74.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -263,6 +263,13 @@ export class Multiplayer {
 	 * limit actually throttles rapid map changes. Set true in setSaveReason, reset
 	 * in the hook (consumeSaveReason), never written elsewhere. */
 	private _mpStampedThisHook = false;
+	/** Save-integrity guard: true from ig.game.start() until the downloaded cloud
+	 * save has actually been restored (restoreServerSave -> loadSlot). While true,
+	 * allowUpload rejects EVERY upload so the engine's fresh-game checkpoint save
+	 * (hideout.entrance, the pre-restore map) can never overwrite the player's real
+	 * progress on the server. Cleared in restoreServerSave (success + failure) and
+	 * re-armed false per session in connect(). */
+	private _mpRestorePending = false;
 	/** ITEM 1: Date.now() deadline before which NO save upload happens at all (covers
 	 * "登录、进入游戏" — login + entering the game). Armed at identify success in
 	 * connect() and re-armed when ig.game.start() fires (launchGame/unblockSaveBlock),
@@ -434,6 +441,8 @@ export class Multiplayer {
 		// HOST side only (members' puppets are locked mirrors of host enemies).
 		if (typeof result.hpScale === 'number' && isFinite(result.hpScale)) this.mpHpScale = result.hpScale;
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
+		if (typeof result.breakScale === 'number' && isFinite(result.breakScale)) this.mpBreakScale = result.breakScale;
+		try { if (this.netSync) this.netSync.setBreakScale(this.mpBreakScale); } catch (_) { /* ignore */ }
 		// Same scheme for attack/defense/focus (default +10% per extra member) and
 		// elemental resistance (flat points + positive-only percentage, defaults 0).
 		// Older servers omit the fields — fall back to the documented defaults.
@@ -445,6 +454,12 @@ export class Multiplayer {
 					num(result.resistFlat, 0), num(result.resistPercent, 0));
 			}
 		} catch (_) { /* ignore */ }
+
+		// 1.74.x (player collision): server config playerCollision (default false =
+		// walk-through everywhere). Older servers omit it — fall back to false (no
+		// collision) to match the new default.
+		if (typeof result.playerCollision === 'boolean') this.mpPlayerCollision = result.playerCollision;
+		try { if (this.netSync) this.netSync.setPlayerCollision(this.mpPlayerCollision); } catch (_) { /* ignore */ }
 
 		// Round 23: the server no longer embeds the save in handshakeResponse — it
 		// streams it as paced saveDownload parts right after the handshake. Register
@@ -469,6 +484,9 @@ export class Multiplayer {
 		this._mpExitUploadActive = false;
 		this._mpExitUploadResolve = null;
 		this._mpSuppressNextExitUpload = false;
+		// Save-integrity guard: re-arm per session (a prior session's mid-restore flag
+		// must never block uploads in this one).
+		this._mpRestorePending = false;
 		let resolveDownload: (data: string | undefined) => void = () => { /* no-op */ };
 		this._saveDownloadPromise = new Promise<string | undefined>((res) => { resolveDownload = res; });
 		this.connection.onSaveDownload((download) => {
@@ -605,7 +623,7 @@ export class Multiplayer {
 		try {
 			Object.defineProperty(entity, 'currentState', {
 				get() { return protectedState; },
-				set(data) { if (data && (data as any).protected) { protectedState = (data as any).protected; } },
+				set(data) { if (data && (data as any).protected) { protectedState = (data as any).protected; } else if (typeof data === 'string') { protectedState = data; } },
 				configurable: true,
 			});
 			e._mpStateLock = true;
@@ -1247,11 +1265,29 @@ export class Multiplayer {
 				showMpToast({ title: t('toastSaveDone'), subtitle: slot && slot !== 'autoSlot' ? slot : undefined });
 			} catch (_) { /* a toast must never break the frame */ }
 		});
+		// Save-integrity guard: surface a rejected upload (the server kept the previous
+		// save) with its failure reason. Skipped while the exit-upload dialog is up -
+		// that path already shows its own error and must not double-toast.
+		try {
+			if (typeof this.connection.onSaveFailed === 'function') {
+				this.connection.onSaveFailed((slot, reason) => {
+					try {
+						if (this._mpExitUploadActive) return;
+						if (reason !== 'tooSmall' && reason !== 'invalid') return;
+						if (!getMpOption('showSaveToast')) return;
+						showMpToast({ title: reason === 'tooSmall' ? t('saveTooSmall') : t('saveInvalid'), subtitle: slot && slot !== 'autoSlot' ? slot : undefined });
+					} catch (_) { /* a toast must never break the frame */ }
+				});
+			}
+		} catch (_) { /* ignore */ }
 
 		// Round 27 (item 5): the exit-to-title upload dialog resolves on the server's
 		// saveSaved/saveFailed ack — wire those listeners now (the connection is fresh
 		// per session, so this re-wires each connect without stacking).
 		this.wireExitUploadAcks();
+
+		// 1.73.0: server admin tools (debug commands + rename notice + item catalog feed).
+		try { this.wireAdminTools(); } catch (e) { console.error('[multiplayer] admin wiring failed:', e); }
 
 		// Round 27: belt-and-braces on the whole registration list — the
 		// per-registration isolation inside registerLobbySocial already prevents a
@@ -1672,6 +1708,15 @@ export class Multiplayer {
 	 * spawn by `1 + hpScale * (partySize - 1)`; members never scale (their puppets
 	 * are locked mirrors of host enemies). */
 	public mpHpScale = 0.7;
+	/** Server-provided per-extra-party-member hit-count break threshold fraction
+	 * (handshakeResponse.breakScale, default 0.7 = +70% per extra member). Consumed
+	 * by netSync (setBreakScale) — the HOST multiplies each HIT tracker's target at
+	 * spawn by (1 + breakScale * (partySize - 1)); members never scale. */
+	public mpBreakScale = 0.7;
+	/** 1.74.x: server config playerCollision (handshakeResponse.playerCollision).
+	 * false (default) = online players NEVER collide (walk-through everywhere).
+	 * Consumed by netSync (setPlayerCollision) to drive the mirror collision pass. */
+	public mpPlayerCollision = false;
 	/** Round 17: RTT in ms each remote player in our instance reports to the
 	 * server (relayed as `playerPing`, ~1/s cadence). Shown on their name tag when
 	 * 显示ping值 is on. Stale entries are harmless (tags only render for present
@@ -1689,6 +1734,13 @@ export class Multiplayer {
 	 * to scope cleanup to NETWORK bots only — a solo player's own native bots
 	 * (Emilie/...) in a shared town are never stripped by another host's broadcast. */
 	private _mpAdoptedBots: { [name: string]: boolean } = {};
+	/** 1.73.0 (admin UI): item-catalog announce state (once per session). */
+	/** 1.73.0 (admin UI): god mode — every damage the local player takes reads
+	 * as 0 (see the onPreDamageModification wrap in netSync). Session-only. */
+	public _mpGodMode = false;
+
+	private _mpItemdbAnnounced = false;
+	private _mpItemdbTimer: any = null;
 	/** ROUND 107: true while a LOCAL cutscene lets every client run its own story
 	 * bots independently instead of following the leader's botState stream. */
 	private _mpBotCutsceneActive = false;
@@ -3446,6 +3498,9 @@ export class Multiplayer {
 	 * engine checkpoint save ('other' + unstamped) apart from an explicit saveNow. */
 	private allowUpload(reason: string, stamped: boolean): boolean {
 		try {
+			// Save-integrity guard: hold all uploads while the cloud save is still being
+			// restored (the pre-restore fresh-game save must never reach the server).
+			if (this._mpRestorePending) return false;
 			const now = Date.now();
 			// ITEM 1: no uploads at all for the first 5s after login / entering the game.
 			if (now < this._saveSuppressUntil) {
@@ -3501,7 +3556,14 @@ export class Multiplayer {
 	private inCombat(): boolean {
 		try {
 			const m: any = sc as any;
-			return !!(m.model && m.model.isCombatMode && m.model.isCombatMode());
+			if (m.model && m.model.isCombatMode && m.model.isCombatMode()) return true;
+			// 1.74.x multiplayer backstop: mirror targeting never touches the local
+			// player's combat flags, so fall back to the engine's "a THREAT enemy is
+			// still engaged" signal when the model flags briefly lag the real fight.
+			if (m.combat && typeof m.combat.isPlayerPartyInCombat === 'function') {
+				return !!m.combat.isPlayerPartyInCombat();
+			}
+			return false;
 		} catch (_) { return false; }
 	}
 
@@ -3966,15 +4028,23 @@ export class Multiplayer {
 			// quest save-guard would otherwise substitute the pre-sync quest block
 			// into this final save/upload. Idempotent vs the later clearSession call.
 			try { if (this.storySync) this.storySync.onSessionCleared(); } catch (_) { /* ignore */ }
-			// Best-effort final save (checkpoint-safe — see saveWithoutMovingCheckpoint;
-			// the onStorageSave hook uploads while the socket is still open). Round 23:
-			// stamped 'exit' so the upload bypasses the area-save anti-spam gate.
-			this.setSaveReason('exit');
-			this.saveWithoutMovingCheckpoint();
-			// Round 23: flush the chunked upload queue synchronously (no pacing) so the
-			// final save lands BEFORE the socket closes below — a paced stream would be
-			// cut off mid-way by the close.
-			try { saveUploadQueue.flush(); } catch (_) { /* ignore */ }
+			// 1.74.x: never save during cutscene/combat — the vanilla game never persists
+			// on exit-to-title, and the combat restriction must hold, so the player reverts
+			// to their last checkpoint/save instead of respawning at the combat spot. This
+			// guards the beforeunload / fallback paths uploadThenGotoTitle does not cover.
+			if (this.inCutsceneNow() || this.inCombat()) {
+				console.log('[multiplayer] logout during cutscene/combat — skipping save');
+			} else {
+				// Best-effort final save (checkpoint-safe — see saveWithoutMovingCheckpoint;
+				// the onStorageSave hook uploads while the socket is still open). Round 23:
+				// stamped 'exit' so the upload bypasses the area-save anti-spam gate.
+				this.setSaveReason('exit');
+				this.saveWithoutMovingCheckpoint();
+				// Round 23: flush the chunked upload queue synchronously (no pacing) so the
+				// final save lands BEFORE the socket closes below — a paced stream would be
+				// cut off mid-way by the close.
+				try { saveUploadQueue.flush(); } catch (_) { /* ignore */ }
+			}
 		} catch (e) { /* ignore */ }
 		try {
 			this.connection.logout();
@@ -4019,6 +4089,189 @@ export class Multiplayer {
 	/** Wire the saveSaved / saveFailed ack listeners that settle an exit-upload. Call
 	 * once per connect (the connection is recreated per session, so re-wire each time —
 	 * socket.on is additive per fresh socket, never stacked). */
+	// ---- 1.73.0: server admin tools ----
+
+	/** Wire the admin debug-command / rename-notice / item-catalog handlers onto
+	 * the CURRENT connection (every connect — the socket is per-session). The
+	 * commands themselves are gated server-side by the admin token; the client
+	 * simply executes what the server vouches for. */
+	private wireAdminTools(): void {
+		const conn = this.connection;
+		if (!conn) return;
+		if (typeof (conn as any).onAdminCommand === 'function') {
+			(conn as any).onAdminCommand((cmd: any) => this.applyAdminCommand(cmd));
+		}
+		if (typeof (conn as any).onAdminRenamed === 'function') {
+			(conn as any).onAdminRenamed((name: string) => {
+				try { showMpToast({ title: t('adminRenamed').replace('{name}', name || '?') }); } catch (_) { /* ignore */ }
+			});
+		}
+		// Item catalog: announce once the inventory is resident; upload on demand.
+		if (typeof (conn as any).onItemdbWant === 'function') {
+			(conn as any).onItemdbWant(() => this.uploadItemDb());
+		}
+		if (typeof (conn as any).itemdbHello === 'function') this.announceItemDb();
+	}
+
+	/** Poll until sc.inventory is resident (title screen has no item DB yet),
+	 * then send the one-time itemdbHello for this session. */
+	private announceItemDb(): void {
+		if (this._mpItemdbAnnounced) return;
+		if (this._mpItemdbTimer) return;
+		this._mpItemdbTimer = setInterval(() => {
+			try {
+				const n = this.itemDbCount();
+				if (n > 100) {
+					clearInterval(this._mpItemdbTimer); this._mpItemdbTimer = null;
+					this._mpItemdbAnnounced = true;
+					try { (this.connection as any).itemdbHello(n); } catch (_) { /* ignore */ }
+				}
+			} catch (_) { /* ignore */ }
+		}, 2000);
+	}
+
+	private itemDbCount(): number {
+		try {
+			const inv: any = (sc as any).inventory;
+			if (!inv || !inv.items) return 0;
+			return Object.keys(inv.items).length;
+		} catch (_) { return 0; }
+	}
+
+	/** Collect {id, names} for every inventory item and upload to the server
+	 * (its admin UI fuzzy-searches this). LangLabel data maps carry every
+	 * installed language, so names display localized in the admin page. */
+	private uploadItemDb(): void {
+		try {
+			const inv: any = (sc as any).inventory;
+			if (!inv || !inv.items) return;
+			const out: any[] = [];
+			for (const id in inv.items) {
+				const it: any = inv.items[id];
+				if (!it) continue;
+				const nid = Number(id);
+				if (!isFinite(nid)) continue;
+				let names: any = null;
+				try {
+					const nm = it.name;
+					if (nm && typeof nm === 'object' && nm.data && typeof nm.data === 'object') {
+						names = nm.data; // LangLabel instance: data holds the lang map
+					} else if (nm && typeof nm === 'object') {
+						// sc.inventory stores item names as PLAIN lang maps (items[i].name.en_US),
+						// not LangLabel instances — copy string-valued xx_YY entries directly so
+						// zh_CN/zh_TW survive to the admin UI.
+						const map: any = {};
+						for (const lk in nm) {
+							if (/^[a-z]{2}_[A-Z]{2}$/.test(lk) && typeof nm[lk] === 'string' && nm[lk]) map[lk] = nm[lk];
+						}
+						if (Object.keys(map).length) names = map;
+					} else if (typeof nm === 'string') {
+						names = { en_US: nm };
+					}
+				} catch (_) { /* skip */ }
+				if (names) {
+					// 1.73.0 (admin tooltips): carry the equipment stat summary too —
+					// type/slot/level + the four core stats + elemental factors, so the
+					// admin page can render the vanilla-style stat hover card.
+					const entry: any = { id: nid, names };
+					try {
+						if (typeof it.type === 'string' && it.type.length <= 16) entry.type = it.type;
+						if (typeof it.equipType === 'string' && it.equipType.length <= 16) entry.equipType = it.equipType;
+						const lv = Number(it.level);
+						if (isFinite(lv) && lv > 0) entry.level = Math.floor(lv);
+						const pr = it.params;
+						if (pr && typeof pr === 'object') {
+							const params: any = {};
+							for (const k of ['hp', 'attack', 'defense', 'focus']) {
+								const v = Number(pr[k]);
+								if (isFinite(v) && v !== 0) params[k] = Math.round(v);
+							}
+							if (Array.isArray(pr.elemFactor)) {
+								const ef: number[] = [];
+								for (let i = 0; i < 4; i++) {
+									const v = Number(pr.elemFactor[i]);
+									ef.push(isFinite(v) ? Math.round(v * 100) / 100 : 1);
+								}
+								params.elemFactor = ef;
+							}
+							if (Object.keys(params).length) entry.params = params;
+						}
+					} catch (_) { /* stats are optional */ }
+					out.push(entry);
+				}
+			}
+			if (out.length > 100) {
+				try { (this.connection as any).itemdbUpload(out); } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Execute one server-admin debug command and ack the outcome. Every branch
+	 * also toasts so the player SEES what the admin did. */
+	private applyAdminCommand(cmd: any): void {
+		const conn: any = this.connection;
+		const ack = (ok: boolean, msg?: string) => {
+			try { if (conn && typeof conn.adminAck === 'function') conn.adminAck(cmd.cmdId, ok, msg); } catch (_) { /* ignore */ }
+		};
+		try {
+			if (!cmd || typeof cmd.kind !== 'string') { ack(false, 'bad command'); return; }
+			const game: any = (ig as any).game;
+			const pm: any = (sc as any).model && (sc as any).model.player;
+			if (!game || !pm || !game.playerEntity) { ack(false, '玩家未进入游戏'); return; }
+			try { if (this.netSync && (this.netSync as any)._mpDead) { ack(false, '玩家已死亡'); return; } } catch (_) { /* ignore */ }
+			switch (cmd.kind) {
+				case 'giveExp': {
+					const n = Math.floor(Number(cmd.amount));
+					if (!isFinite(n) || n <= 0) { ack(false, '数量不合法'); return; }
+					const curves: any = (sc as any).LEVEL_CURVES;
+					if (typeof pm.addExperience !== 'function') { ack(false, '接口不可用'); return; }
+					pm.addExperience(n, pm.level || 1, 0, true, curves && curves.REGULAR);
+					try { showMpToast({ title: t('adminGiveExp').replace('{n}', String(n)) }); } catch (_) { /* ignore */ }
+					ack(true); break;
+				}
+				case 'giveCredits': {
+					const n = Math.floor(Number(cmd.amount));
+					if (!isFinite(n) || n <= 0) { ack(false, '数量不合法'); return; }
+					if (typeof pm.addCredit !== 'function') { ack(false, '接口不可用'); return; }
+					pm.addCredit(n, false, false);
+					try { showMpToast({ title: t('adminGiveCredits').replace('{n}', String(n)) }); } catch (_) { /* ignore */ }
+					ack(true); break;
+				}
+				case 'giveItem': {
+					const id = Math.floor(Number(cmd.id));
+					const n = Math.floor(Number(cmd.amount));
+					if (!isFinite(id) || id < 0 || !isFinite(n) || n <= 0) { ack(false, '物品/数量不合法'); return; }
+					const inv: any = (sc as any).inventory;
+					if (!inv || !inv.items || !inv.items[id]) { ack(false, '物品不存在'); return; }
+					if (typeof pm.addItem !== 'function') { ack(false, '接口不可用'); return; }
+					pm.addItem(id, n, false, false);
+					try { showMpToast({ title: t('adminGiveItem').replace('{id}', String(id)).replace('{n}', String(n)) }); } catch (_) { /* ignore */ }
+					ack(true); break;
+				}
+				case 'teleport': {
+					if (typeof game.teleport !== 'function' || !(ig as any).TeleportPosition) { ack(false, '接口不可用'); return; }
+					try { if (game.isTeleporting && game.isTeleporting()) { ack(false, '传送中'); return; } } catch (_) { /* ignore */ }
+					const map = String(cmd.map || '');
+					const marker = typeof cmd.marker === 'string' && cmd.marker ? cmd.marker : null;
+					if (!map) { ack(false, '地图缺失'); return; }
+					const tp: any = new (ig as any).TeleportPosition(marker);
+					game.teleport(map, tp);
+					try { showMpToast({ title: t('adminTeleport') }); } catch (_) { /* ignore */ }
+					ack(true); break;
+				}
+				case 'godMode': {
+					this._mpGodMode = cmd.on === true;
+					try { showMpToast({ title: t(this._mpGodMode ? 'adminGodOn' : 'adminGodOff') }); } catch (_) { /* ignore */ }
+					ack(true, this._mpGodMode ? 'on' : 'off'); break;
+				}
+				default:
+					ack(false, '未知命令: ' + cmd.kind);
+			}
+		} catch (e: any) {
+			ack(false, String((e && e.message) || e));
+		}
+	}
+
 	private wireExitUploadAcks(): void {
 		const conn: any = this.connection;
 		if (!conn || typeof conn.onSaveSaved !== 'function') return;
@@ -4614,6 +4867,10 @@ export class Multiplayer {
 			// block may have held game start longer than the login-time arm).
 			this._saveSuppressUntil = Date.now() + 5000;
 			this._saveSuppressLogged = false;
+			// Save-integrity guard: while a downloaded save is about to be restored, hold
+			// ALL uploads until restoreServerSave finishes - the fresh-game checkpoint save
+			// that fires during ig.game.start() must never overwrite the real progress.
+			this._mpRestorePending = !failed && typeof raw === 'string' && raw.length > 0;
 			ig.game.start(); // Start the game in story mode.
 		};
 		if (failed) {
@@ -4662,8 +4919,10 @@ export class Multiplayer {
 			// the party HUD (addObserver on an undefined PartyMemberModel).
 			this.cleanRestoredParty(slot.getData());
 			(ig as any).storage.loadSlot(slot, true);
+			this._mpRestorePending = false;
 			console.log('[multiplayer] Restored server save' + (data !== raw ? ' (bridge start, playtime zeroed)' : ''));
 		} catch (e) {
+			this._mpRestorePending = false;
 			console.error('[multiplayer] Failed to restore server save, starting fresh', e);
 			ig.game.start();
 		}
