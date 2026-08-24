@@ -1,4 +1,4 @@
-# CCMultiplayerClient(中文)
+# CCMultiplayerClient-Next
 
 > [English README](README.md) | 中文版本
 
@@ -7,7 +7,7 @@
 一款 [CrossCode](https://www.cross-code.com/)(远星物语)的**在线多人联机模组**。
 它让多名玩家共享同一个世界:每个人都能看见其他玩家的分身在世界中走动,
 而**主机**一方的敌人、弹幕与战斗会通过一台中央中继服务器
-([CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer))
+([CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next))
 同步给其余所有玩家。
 
 > **当前状态：初步开发中
@@ -27,7 +27,7 @@
 
 #### 我还有多久可以玩到这个CCMultiplayer-fork？
 
-* 现在你就可以开始尝试游玩它，你只需要运行[CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer)，之后安装好CCMultiplayerClient，在主界面就可以连接服务器，存档的存储均由服务器负责，你可以在任何一个客户端游玩你的账号
+* 现在你就可以开始尝试游玩它，你只需要运行[CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next)，之后安装好CCMultiplayerClient-Next，在主界面就可以连接服务器，存档的存储均由服务器负责，你可以在任何一个客户端游玩你的账号
 
 #### Discord板块？
 
@@ -40,7 +40,6 @@
 #### 你觉得还有多久才能完成这一个项目？
 
 * 我不清楚，目前我正在与朋友一起游玩，加上自己超高强度的测试与修复，开发经过两个星期测试仍然在神庙矿井的区域中，况且开发者还是一个细节狂魔，有一点看不顺眼的地方就要开始调整
-
 
 ---
 

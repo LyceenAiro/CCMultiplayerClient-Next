@@ -96,6 +96,10 @@ export class OnEntitySpawnListener {
 			if (isLocalPlayerBall) {
 				const ballSettings = this.filterBall(settings);
 				if (ballSettings) {
+					// 1.75.x: ship the engine's exact spawn coords. Skill bursts
+					// (SHOOT_PROXY_RANGE's startDist/offset — the Burn! flame cone)
+					// otherwise collapse onto the mirror's face point on receivers.
+					ballSettings.pos = { x, y, z };
 					this.main.connection.throwBall(ballSettings);
 				} else {
 					console.warn('[multiplayer] Could not find type of ball (filterBall returned null). combatant=localPlayer');
@@ -103,6 +107,36 @@ export class OnEntitySpawnListener {
 			}
 			return this.original.call(ig.game, type, x, y, z, settings, showAppearEffects);
 		}
+
+		// 1.75.x (player skill-proxy sync): GENERIC combat proxies (CombatProxyEntity)
+		// placed by the LOCAL player's arts — the heat dash-art mines (mine/moveMine),
+		// flameWall, meteorShower, wave/shock dash dummies, ... — are NOT Balls, so no
+		// existing relay ever carried them and teammates saw nothing. Relay the spawn
+		// over the throwBall channel as 'proxy:<name>'; the receiver replays a
+		// visual-only copy on the caster's mirror (see onThrowBall 'proxy:' branch).
+		// Proxies owned by mirrors/enemies never match the playerEntity gate, so this
+		// cannot echo back from a receiver.
+		try {
+			const CPE: any = (sc as any).CombatProxyEntity;
+			if (CPE && (type as unknown) === CPE && settings && settings.combatant === ig.game.playerEntity) {
+				const proxies: any = (ig.game.playerEntity as any).proxies || {};
+				for (const name in proxies) {
+					const p: any = proxies[name];
+					// settings.data IS the proxy instance's own data object (GENERIC
+					// spawn passes `data: this.data`), so identity match is exact.
+					if (p && p.data && p.data === settings.data) {
+						this.main.connection.throwBall({
+							ballInfo: 'proxy:' + name,
+							combatant: (ig.game.playerEntity as unknown as IMultiplayerEntity).multiplayerId,
+							dir: settings.dir || { x: 0, y: 0 },
+							party: 0,
+							pos: { x, y, z },
+						});
+						break;
+					}
+				}
+			}
+		} catch (_) { /* the proxy relay must never break a spawn */ }
 
 		const entity = this.original.call(ig.game, type, x, y, z, settings, showAppearEffects) as IMultiplayerEntity;
 

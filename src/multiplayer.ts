@@ -56,7 +56,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.74.0';
+export const MP_VERSION = '1.75.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -443,6 +443,8 @@ export class Multiplayer {
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
 		if (typeof result.breakScale === 'number' && isFinite(result.breakScale)) this.mpBreakScale = result.breakScale;
 		try { if (this.netSync) this.netSync.setBreakScale(this.mpBreakScale); } catch (_) { /* ignore */ }
+		if (typeof result.statusScale === 'number' && isFinite(result.statusScale)) this.mpStatusScale = result.statusScale;
+		try { if (this.netSync) this.netSync.setStatusScale(this.mpStatusScale); } catch (_) { /* ignore */ }
 		// Same scheme for attack/defense/focus (default +10% per extra member) and
 		// elemental resistance (flat points + positive-only percentage, defaults 0).
 		// Older servers omit the fields — fall back to the documented defaults.
@@ -452,6 +454,19 @@ export class Multiplayer {
 				this.netSync.setStatScales(
 					num(result.attackScale, 0.1), num(result.defenseScale, 0.1), num(result.focusScale, 0.1),
 					num(result.resistFlat, 0), num(result.resistPercent, 0));
+			}
+		} catch (_) { /* ignore */ }
+
+		// Soft-death revive tuning (server config): HP fraction restored on a
+		// normal vs boss revive and the normal vs boss countdown seconds. Older
+		// servers omit the fields — fall back to the documented defaults (50% /
+		// 25% HP, 30s / 30s).
+		try {
+			if (this.netSync) {
+				const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
+				this.netSync.setDeathConfig(
+					num(result.softDeathReviveHpNormal, 0.5), num(result.softDeathReviveHpBoss, 0.25),
+					num(result.softDeathReviveTimeNormal, 30), num(result.softDeathReviveTimeBoss, 30));
 			}
 		} catch (_) { /* ignore */ }
 
@@ -1713,6 +1728,11 @@ export class Multiplayer {
 	 * by netSync (setBreakScale) — the HOST multiplies each HIT tracker's target at
 	 * spawn by (1 + breakScale * (partySize - 1)); members never scale. */
 	public mpBreakScale = 0.7;
+	/** Server-provided per-extra-party-member elemental-status threshold fraction
+	 * (handshakeResponse.statusScale, default 0.6 = +60% per extra member). Consumed
+	 * by netSync (setStatusScale) — the HOST divides each enemy's statusInflict
+	 * susceptibility by (1 + statusScale * (partySize - 1)); members never scale. */
+	public mpStatusScale = 0.6;
 	/** 1.74.x: server config playerCollision (handshakeResponse.playerCollision).
 	 * false (default) = online players NEVER collide (walk-through everywhere).
 	 * Consumed by netSync (setPlayerCollision) to drive the mirror collision pass. */

@@ -1,23 +1,23 @@
-# CCMultiplayerClient
+# CCMultiplayerClient-Next
 
 > English | [中文版本](README.zh-CN.md)
 
 [![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
 
-An online-multiplayer mod for [CrossCode](https://www.cross-code.com/). It lets
+An **online multiplayer mod** for [CrossCode](https://www.cross-code.com/). It lets
 several players share the same world: each sees the other players' avatars
 walking around, and the **host's** enemies, projectiles and combat are
 synchronized to everyone else over a central relay server
-([CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer)).
+([CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next)).
 
 > **Status:** early development.
 > Main-story test progress: Temple Mine.
 > The mod was originally written for CrossCode **1.1.0** and the old
-> **CCLoader v2**. This tree keeps it on **CCLoader v2** (the current,
-> actively-maintained loader) while updating it for **CrossCode 1.4.2** (the
-> final game release). It builds cleanly and the network protocol has been
-> verified end-to-end against the server. In-game multiplayer has **not yet
-> been battle-tested on a live 1.4.2 install** — see
+> **CCLoader v2**. This codebase is **still based on CCLoader v2** (currently
+> the actively-maintained loader),
+> but has been adapted to **CrossCode 1.4.2** (the final game release). It builds cleanly,
+> and the network protocol has been verified end-to-end against the server. However, in-game multiplayer
+> has **not yet been fully battle-tested on a live 1.4.2 install** — see
 > [Known limitations](#known-limitations--to-verify-in-game).
 >
 > **Development note:** This project is developed with **vibe coding**
@@ -27,16 +27,16 @@ synchronized to everyone else over a central relay server
 
 #### How is this mod different from [cc-multibakery](https://github.com/krypciak/cc-multibakery)?
 
-* This mod focuses on story, side quests and co-op syncing. Its network
+* This mod focuses on story, numerous side quests, and co-op syncing. Its network
   overhead currently looks much larger than multibakery's. PvP and similar
-  features aren't supported yet, but it aims for a more immersive story-driven
-  co-op experience than multibakery.
+  features aren't supported yet, but it aims for a more immersive story co-op
+  experience than multibakery.
 
 #### How long until I can play this CCMultiplayer fork?
 
 * You can start right now. Just run
-  [CCMultiplayerServer](https://github.com/LyceenAiro/CCMultiplayerServer),
-  install CCMultiplayerClient, and connect from the main menu. Saves are
+  [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next),
+  install CCMultiplayerClient-Next, and connect from the main menu. Saves are
   stored by the server, so you can play your account from any client.
 
 #### Discord?
@@ -48,25 +48,24 @@ synchronized to everyone else over a central relay server
 #### Will this compete with cc-multibakery?
 
 * I'll answer plainly: not unless its developer picks a fight with me first.
-  Maintaining this mod has cost me a lot of money (vibe coding) and time on
+  Maintaining this mod has cost me a lot of money (due to vibe coding) and time on
   development and testing. I'd actually prefer multibakery to replace this
-  project someday — I don't know TypeScript syntax and I'm unfamiliar with the
-  CCLoader API, so fixing odd bugs is very difficult. Multibakery seems more
+  project someday. I don't know any TypeScript syntax and I'm unfamiliar with the
+  CCLoader API, so fixing odd bugs is very difficult. By comparison, multibakery seems more
   polished everywhere, has lower network overhead, and even has a
-  smooth-looking PvP mode — I have to give it a plug here.
+  smooth-looking PvP mode — I have to give multibakery a plug here.
 
 #### How long until this project is finished?
 
 * I don't know. I'm currently playing through it with a friend plus my own
-  heavy testing and fixing. After two weeks of development the test run is
-  still in the Temple Mine area, and the developer is a perfectionist who
+  intensive testing and fixing. After two weeks of development the test run is
+  still in the Temple Mine area, and the developer is a detail-obsessed perfectionist who
   stops to adjust anything that looks off.
 
 ---
 
 ## Table of contents
 
-- [FAQ](#faq)
 - [How it works](#how-it-works)
 - [Features](#features)
 - [Main-city (shared town) mechanics](#main-city-shared-town-mechanics)
@@ -112,9 +111,10 @@ everything goes through `CCMultiplayerServer`.
 ## Features
 
 **Connectivity & matchmaking**
+
 - **Server list screen** (Minecraft-style): add / delete servers, **direct
   connect** by `host:port`, a live **reachability indicator** (online/offline +
-  ping), all persisted without editing the config file.
+  latency), all without editing the config file.
 - **Version gate** — the server rejects a client whose mod version differs.
 - **Account login** — username is the identity (LAN trust); duplicate logins are
   rejected and recent usernames are remembered.
@@ -122,6 +122,7 @@ everything goes through `CCMultiplayerServer`.
   [Main-city (shared town) mechanics](#main-city-shared-town-mechanics).
 
 **World & combat sync**
+
 - **Whole-state block sync** — players, host enemies and enemy projectiles are
   broadcast as whole-state blocks (self-healing, no packet-loss desync).
 - **Host election & migration** — the first client in an instance is its host;
@@ -141,39 +142,40 @@ everything goes through `CCMultiplayerServer`.
   `PushPullDest` plates are never networked, and a box that is already placed in
   YOUR save neither sends nor receives position, so one player's solved puzzle
   can never overwrite (or delete) another player's unsolved copy.
-- **Dungeon platform authority (1.71.4)** — OL/dynamic/extract platform positions
+- **Dungeon platform authority (1.71.4)** — OL/Dynamic/Extract platform positions
   are host-authoritative: members apply the host's positions but never echo their
   own half-finished transition back, so the Temple Chamber 1 pillars sink/rise to
   their final height instead of oscillating at ~80%.
 - **Dungeon box echo isolation & one-time switch latch (1.71.5)** — unowned
   push/pull boxes are also host-authoritative (gripping members stay owners), a
-  box is snapped back to its real ground before a grip, and permanent
+  box is snapped back to its real ground before a grip if it was pulled below
+  ground by stale packets, and permanent
   `OneTimeSwitch`es (the Temple Chamber 1 attack switch) stay ON once any peer
   reports them on — a late joiner's stale "not triggered" state can no longer
   revert the party's solved mechanism or leave an unattackable switch behind.
 - **Follower box vertical freeze (1.71.6)** — while a box's position is
   network-driven, its local z-physics is frozen; pulling a mechanism-raised box
   off its platform keeps it on the peer's real floor instead of dropping it into
-  the pit (most visible on guest clients).
-- **Quest kill-progress sync (1.71.7)** — real enemy defeats now advance the
-  players' quest KILL subtasks. In normal multiplayer a kill only counts when
-  the enemy died on the map YOU are on; in story-sync mode any party member's
+  the pit.
+- **Quest kill-progress sync (1.71.7)** — in multiplayer, real enemy defeats now advance the
+  players' quest "kill N" subtasks: **without story sync** enabled, a kill only counts when
+  the enemy died on the map YOU are on; **with story sync** any party member's
   kill is relayed to the whole party regardless of map.
 - **Real gravity after box release (1.71.8)** — when a teammate lets go of a
   box, the map-instance host no longer keeps it frozen at the network height:
   engine gravity resumes immediately, so Temple Chamber 1's upper-left box can
   be pushed off its ledge and actually falls to the lower floor instead of
   being pulled back up to the ledge.
-- **1.71.9 fixes & QoL** — keyboard-typable port field; shared-town shop
-  counters clear stale combat state and retry when a quest-solved dialog is
+- **1.71.9 fixes & QoL** — keyboard-typable port field in the server list; shared-town shop
+  counters clear stale combat state and auto-retry when a quest-solved dialog is
   stacked; remote skill charges darken the screen with one non-stacking effect
-  tied to the party charge time-stop; light/full-party banners always render
-  text; member network badges show the RELATIVE latency between you and that
+  tied to the party charge time-stop; light/full-party banners no longer render
+  blank rectangles; member network badges show the **relative latency** between you and that
   player; side-quest sync no longer rolls back or removes progress on end
-  (already-solved players get a temporary "[Sync]" quest entry, no rewards);
-  main-story sync clamps ahead-teammates to the leader's plot every frame;
+  (already-solved players see a temporary "[Sync]" quest entry, no rewards);
+  main-story sync clamps ahead-teammates to the leader's progress every frame;
   names are hidden during synced story videos; buffalo charge footstep loops
-  are stopped correctly; sync-start fanfares are louder; off-screen teammate
+  are stopped correctly; sync-start fanfare volume increased; off-screen teammate
   arrows and area/world-map teammate avatars were added.
 - **1.71.10 external UI scale** — the Multiplayer options tab gains an
   **External UI Scale** setting (Auto / 50% / 75% / 100% / 125% / 150% / 200% /
@@ -198,6 +200,7 @@ everything goes through `CCMultiplayerServer`.
   reloads the checkpoint in lockstep.
 
 **Social & party**
+
 - **Parties** — invite / accept / decline / leave / kick, leader transfer, and
   "teleport to teammate" regroup.
 - **Friends** — request / accept / decline / remove, request management, and a
@@ -207,17 +210,18 @@ everything goes through `CCMultiplayerServer`.
   (vanilla rule: follower entities are hidden inside dungeons), and they return
   automatically on leaving.
 - **Story-locked companions (1.71.0)** — companions are only unkickable when
-  the game's own `SET_MEMBER_LOCKED` flag is on, exactly like the vanilla
-  Social menu; once a story event unlocks them the normal kick works again.
+  the game's own `SET_MEMBER_LOCKED` flag is on, exactly matching the vanilla
+  Social menu logic; once a story event unlocks them the normal kick works again.
 - **Room players** — see who is in your current map instance, plus a live online
   counter.
 - **Party chat** — press Enter for a chat input with history and speech-bubble
   rendering (party-only).
 
 **HUD & helpers**
+
 - **Name tags** — show names / own name / bot names, gold leader name, ping
   display, adjustable opacity and size.
-- **Network badges** — a green/yellow/orange/red diamond (ping/loss) on party
+- **Network badges** — a green/yellow/orange/red diamond (latency/loss) on party
   portraits and the element indicator, with hover tooltips.
 - **Network debug HUD** — live upload/download rates, packet loss, cumulative
   totals.
@@ -229,6 +233,7 @@ everything goes through `CCMultiplayerServer`.
 - **Command box (F8)** — run `mp.*` console commands without DevTools.
 
 **Saves & persistence**
+
 - **Cloud saves** — your save is streamed from the server on login and restored;
   it uploads (chunked + rate-limited) on save and on exit-to-title.
 - **Save mirror rollback (1.71.0)** — the server keeps the last **five distinct
@@ -247,12 +252,12 @@ everything goes through `CCMultiplayerServer`.
 Six areas act as **main cities** (open matchmaking hubs) where players meet
 without needing to form a party:
 
-- **Rookie Harbor** (`rookie-harbor`, 新手港)
-- **Rhombus Square** (`rhombus-sqr`, 罗姆斯广场, incl. 迎新桥)
-- **Bergen Village** (`bergen`, 俾尔根村)
-- **Ba'kii Kum** (`ba-ki-kum`, 巴基库姆)
-- **Basin Keep** (`basin-keep`, 巴辛堡)
-- **Homestedt** (`homestedt`, 家园)
+- **Rookie Harbor** (`rookie-harbor`)
+- **Rhombus Square** (`rhombus-sqr`, incl. Welcome Bridge)
+- **Bergen Village** (`bergen`)
+- **Ba'kii Kum** (`ba-ki-kum`)
+- **Basin Keep** (`basin-keep`)
+- **Homestedt** (`homestedt`)
 
 Behaviour:
 
@@ -280,7 +285,7 @@ Behaviour:
 | CrossCode | **1.4.2** (final release; the game is no longer updated) |
 | Mod loader | **CCLoader v2** (the current, actively-maintained loader) — it bundles the `simplify` library this mod uses |
 | Node.js (build + server) | ≥ 18 |
-| Relay server | [CCMultiplayerServer](https://github.com/CCDirectLink/CCMultiplayerServer) |
+| Relay server | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next) |
 
 ## Building
 

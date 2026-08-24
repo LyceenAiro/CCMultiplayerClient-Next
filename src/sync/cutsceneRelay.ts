@@ -113,6 +113,14 @@ class CutsceneRelay implements ICutsceneRelay {
 			const raw = trig._mpCsSettings;
 			const condStr = (raw && typeof raw.startCondition === 'string') ? raw.startCondition.trim() : '';
 			if (!condStr || condStr === 'false' || condStr === '0') return false;
+			// 1.74.x (element-get freeze): the per-player upgrade chain (element
+			// get / tutorials / boss-defeat cutscenes) plays LOCALLY on every
+			// client — never relay it (the receiver's own trigger fires natively;
+			// a relayed copy racing it is what wedged members mid-scene).
+			const ctl: any = (window as any).__mpStory;
+			if (ctl && typeof ctl.isPerPlayerChainTrigger === 'function' && ctl.isPerPlayerChainTrigger(trig)) {
+				return false;
+			}
 			return true;
 		} catch (_) { return false; }
 	}
@@ -254,6 +262,16 @@ class CutsceneRelay implements ICutsceneRelay {
 			}
 			const trig = this.findTrigger(data.mi);
 			if (!trig) { this.logOnce('nf:' + data.mi, 'relay mi=' + data.mi + ' — trigger NOT FOUND on this map'); return; }
+			// 1.74.x (element-get freeze): per-player upgrade chain — skip the
+			// relayed copy; our own native trigger plays it locally (mixed
+			// old/new client pairs still send these).
+			{
+				const ctl: any = (window as any).__mpStory;
+				if (ctl && typeof ctl.isPerPlayerChainTrigger === 'function' && ctl.isPerPlayerChainTrigger(trig)) {
+					this.logOnce('chain:' + data.mi, 'relay mi=' + data.mi + ' skipped: per-player upgrade chain');
+					return;
+				}
+			}
 			// We already consumed it (we were standing in the zone ourselves, or
 			// saw it in an earlier session) — no teleport, no replay.
 			this.maybeRespawn(trig);

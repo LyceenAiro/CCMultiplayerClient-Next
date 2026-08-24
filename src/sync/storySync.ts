@@ -291,6 +291,18 @@ export class StorySyncController {
 	private currentEventSeq = 0;
 	private currentEventActive = false;
 	private currentEventPendingSince = 0;
+	/** 1.74.x (freeze fix): relayed story events that arrived while a BLOCKING
+	 * event was still running locally. The engine queues overlapping BLOCKING
+	 * starts itself (blockedEventCallQueue), but INTERRUPTABLE run types —
+	 * AUTO_CONTROL tutorials like the element-get "HEAT TUTORIAL" — start
+	 * IMMEDIATELY and hijack player control out from under the running cutscene:
+	 * its DO_ACTION waits can then never complete and the game wedges (the
+	 * "someone finishes the element cutscene and everyone else freezes" bug).
+	 * Instead of force-starting, the relay is parked here and pumped by the
+	 * per-frame update once the local blocking event has ended. */
+	private pendingEventRelays: Array<{
+		trig: any, kind: 'trigger' | 'location' | 'npc', type: number, seq: number, npc?: any, at: number,
+	}> = [];
 	private passivePrompted: { [key: string]: number } = Object.create(null);
 	private waitingTrigger: any = null;
 	private waitingPromptSince = 0;
@@ -1474,6 +1486,7 @@ export class StorySyncController {
 		this.currentEventSeq = 0;
 		this.currentEventActive = false;
 		this.currentEventPendingSince = 0;
+		this.pendingEventRelays.length = 0;
 		this.resetSkipVote();
 		this.passivePrompted = Object.create(null);
 		this.waitingTrigger = null;
@@ -1622,8 +1635,14 @@ export class StorySyncController {
 			if (this.isPlotQuest(this.quest)) {
 				const line = Math.max(0, Number(state.task) || 0);
 				this.plotSyncTarget = line;
-				(ig as any).vars.set('plot.line', line);
-				if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				// 1.74.x (freeze fix): while a local story scene is running, park the
+				// new value in plotSyncTarget only — writing plot.line + re-evaluating
+				// the map mid-scene wedged the scene's DO_ACTION steps (element-get
+				// freeze). The per-frame clamp pump applies it the frame the scene ends.
+				if (!this.isLocalSceneBusy()) {
+					(ig as any).vars.set('plot.line', line);
+					if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
+				}
 				// The leader's current main-story objective rides the same packet:
 				// rebuild it when it changed so members SEE the party's real task
 				// instead of their own further-along one.
@@ -1889,17 +1908,24 @@ export class StorySyncController {
 					// 1.71.9 (issue 10): a member whose OWN main story is AHEAD of the
 					// leader must stay clamped to the leader's streamed plot.line. Any
 					// local re-evaluation between the 0.25s state packets is corrected
-					// here on the very next frame, so story triggers actually play at
-					// the leader's position instead of skipping ahead.
+					// here on the very next frame, so story triggers actually play at the
+					// leader's position instead of skipping ahead.
+					// 1.74.x (freeze fix): NEVER re-clamp while a local story scene is
+					// running (blocking cutscene / synced event / engine cutscene /
+					// auto-control tutorial). The per-frame set + varsChangedDeferred
+					// re-evaluated the whole map under the running scene's feet — its
+					// DO_ACTION steps then never completed and the client wedged in
+					// cutscene mode (the element-get freeze). The player cannot run
+					// ahead mid-scene anyway; the clamp resumes the frame it ends.
 					try {
 						const cur = this.mainPlotLine();
-						if (cur !== null && cur !== this.plotSyncTarget) {
+						if (cur !== null && cur !== this.plotSyncTarget && !this.isLocalSceneBusy()) {
 							(ig as any).vars.set('plot.line', this.plotSyncTarget);
 							if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred();
 						}
 					} catch (_) { /* ignore */ }
 					// Keep the leader-streamed objective (and its "[同步]" prefix
-					// while we are ahead) in lockstep with the clamp.
+					// while we're ahead) in lockstep with the clamp.
 					try { this.syncPlotTaskDisplay(); } catch (_) { /* ignore */ }
 				}
 				// A pending start whose server reply never lands eventually resets.
@@ -1915,6 +1941,7 @@ export class StorySyncController {
 			this.updateWaitingPrompt();
 			this.updateLeaderCamera();
 			this.updateLocalPlayerStoryHide();
+			this.pumpPendingEventRelays();
 		} catch (_) { /* never break the frame */ }
 	}
 
@@ -2438,6 +2465,11 @@ export class StorySyncController {
 			const EV: any = (ig as any).EVENT_TYPE || {};
 			if (evType === EV.PARALLEL || (EV.PARALLEL === undefined && evType === 1)) return false;
 			const name = String((trig.name || (raw && raw.name) || '') as string);
+			// 1.74.x (element-get freeze): the per-player upgrade chain (see
+			// isLocalChainTrigger) takes precedence — it plays locally on every
+			// client, never gathered/relayed, even when a LATER scene in the chain
+			// carries plot steps.
+			if (this.isLocalChainTrigger(trig, raw)) return true;
 			const steps = raw && raw.event;
 			let hasPlot = false;
 			let hasTeleport = false;
@@ -2472,6 +2504,107 @@ export class StorySyncController {
 			if (/block|barrier|before|runaway|gate|deny|forbid|access/i.test(name)) return true;
 			if (hasRunner && name && /npc|runner|gate|before|block|barrier/i.test(name)) return true;
 			return false;
+		} catch (_) { return false; }
+	}
+
+	/** 1.74.x (element-get freeze): the per-player upgrade chain must NEVER enter
+	 * the leader-authoritative gather/relay flow. These scenes drive each
+	 * client's OWN player (DO_ACTION MOVE_TO_POINT walks, AUTO_CONTROL
+	 * tutorials); replaying a leader's copy on a member while the leader's state
+	 * stream advances plot/vars under it wedged members mid-scene (the
+	 * "one player finishes the element cutscene and everyone else freezes" bug).
+	 * The chain is per-player progression, so every client plays its OWN copy
+	 * exactly like solo play; quest/plot progression still syncs afterwards via
+	 * the leader state stream. Matches:
+	 *   (a) AUTO_CONTROL tutorials armed by a tmp.* var (element / circuit /
+	 *       equip tutorials after each upgrade);
+	 *   (b) any event containing SET_PLAYER_CORE / SET_ALL_PLAYER_CORE — the
+	 *       UpgradeSequence family that grants elements/circuits;
+	 *   (c) a CUTSCENE armed by a manualKill var of a live enemy on this map
+	 *       (BossDies defeat cutscenes — members start these directly from
+	 *       netSync's boss-defeat staging; a relayed duplicate on top started
+	 *       the wedge). */
+	private isLocalChainTrigger(trig: any, raw: any): boolean {
+		try {
+			if (!trig) return false;
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			const evType = Number(trig.eventType) || 0;
+			if (evType === EV.PARALLEL || (EV.PARALLEL === undefined && evType === 1)) return false;
+			// (a)+(b) are static per trigger (event type + step tree) — memoized,
+			// this runs per trigger per frame.
+			if (trig._mpChainStatic === undefined) {
+				let stat = false;
+				if (evType === EV.AUTO_CONTROL || (EV.AUTO_CONTROL === undefined && evType === 4)) {
+					const cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition.trim() : '';
+					if (cond.indexOf('tmp.') === 0) stat = true;
+				}
+				if (!stat) {
+					const steps = raw && raw.event;
+					let hasChainStep = false;
+					const walkCore = (v: any): void => {
+						if (v === null || v === undefined || hasChainStep) return;
+						if (Array.isArray(v)) { for (const x of v) walkCore(x); return; }
+						if (typeof v !== 'object') return;
+						// SET_PLAYER_CORE: the UpgradeSequence family (element/circuit
+						// grants). SHOW_TUTORIAL_*: per-player tutorial UI steps — the
+						// element epilogue (PostUpdate) carries SHOW_TUTORIAL_START /
+						// SHOW_TUTORIAL_PLAYER_MSG + SHOW_MODAL_CHOICE + inline
+						// START_AUTO_CTRL; tutorials and their epilogues drive each
+						// client's OWN player and must never be relayed.
+						if (v.type === 'SET_PLAYER_CORE' || v.type === 'SET_ALL_PLAYER_CORE'
+							|| v.type === 'SHOW_TUTORIAL_START' || v.type === 'SHOW_TUTORIAL_MSG'
+							|| v.type === 'SHOW_TUTORIAL_PLAYER_MSG') hasChainStep = true;
+						for (const k in v) walkCore(v[k]);
+					};
+					walkCore(steps);
+					stat = hasChainStep;
+				}
+				trig._mpChainStatic = stat;
+			}
+			if (trig._mpChainStatic) return true;
+			const condStr = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+			if (condStr) {
+				const mkVars = this.mapManualKillVars();
+				for (let i = 0; i < mkVars.length; i++) {
+					if (condStr.indexOf(mkVars[i]) !== -1) return true;
+				}
+			}
+			return false;
+		} catch (_) { return false; }
+	}
+
+	/** 1.74.x: manualKill vars of live enemies on the current map (5s cache —
+	 * isBlockerTrigger runs per trigger per frame). Used by
+	 * isLocalChainTrigger(c) to recognize BossDies-style defeat triggers. */
+	private _mkVarsCache: { map: string, at: number, vars: string[] } | null = null;
+	private mapManualKillVars(): string[] {
+		try {
+			const mapName = ((ig.game as any).mapName || '') as string;
+			const now = Date.now();
+			if (this._mkVarsCache && this._mkVarsCache.map === mapName && now - this._mkVarsCache.at < 5000) {
+				return this._mkVarsCache.vars;
+			}
+			const vars: string[] = [];
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const list: any[] = ((ig.game as any).entities || []) as any[];
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (Enemy && e instanceof Enemy && typeof e.manualKill === 'string' && e.manualKill) {
+					if (vars.indexOf(e.manualKill) === -1) vars.push(e.manualKill);
+				}
+			}
+			this._mkVarsCache = { map: mapName, at: now, vars };
+			return vars;
+		} catch (_) { return []; }
+	}
+
+	/** 1.74.x: public shim for the cutscene relay — the per-player upgrade chain
+	 * (element get / element tutorials / boss-defeat cutscenes, see
+	 * isLocalChainTrigger) must never be RELAYED by either module: every client
+	 * plays its own copy natively. Works even while story sync is inactive. */
+	public isPerPlayerChainTrigger(trig: any): boolean {
+		try {
+			return this.isLocalChainTrigger(trig, (trig && (trig._mpStorySettings || trig._mpCsSettings)) || null);
 		} catch (_) { return false; }
 	}
 
@@ -2986,6 +3119,7 @@ export class StorySyncController {
 				showMpToast({ title: t('storySyncEventMissingTrigger') });
 				return;
 			}
+			if (this.deferRelayedEventIfBusy(npc, 'npc', 0, data.seq)) return;
 			this.memberReplayNpcEvent(npc, data.seq);
 			return;
 		}
@@ -2995,7 +3129,81 @@ export class StorySyncController {
 			showMpToast({ title: t('storySyncEventMissingTrigger') });
 			return;
 		}
+		if (this.deferRelayedEventIfBusy(trig, data.kind, data.type, data.seq)) return;
 		this.memberReplayEvent(trig, data.kind, data.type, data.seq);
+	}
+
+	/** 1.74.x (freeze fix): true when ANY local scene owns the player — a synced
+	 * event, a blocking cutscene, engine cutscene mode, or an auto-control
+	 * tutorial (incl. the LOCALLY-played per-player upgrade chain, whose
+	 * AUTO_CONTROL tutorials are neither blocking nor tracked as synced events —
+	 * missing them let a relayed epilogue start mid-tutorial and wedge the
+	 * client's GUI/interact stack). PARK the relayed event instead of starting
+	 * it — CUTSCENE relays would merely re-queue in the engine anyway, but an
+	 * AUTO_CONTROL / INTERRUPTABLE relay would start instantly and fight the
+	 * running scene for player control. */
+	private deferRelayedEventIfBusy(trig: any, kind: 'trigger' | 'location' | 'npc', type: number, seq: number): boolean {
+		try {
+			if (!this.isLocalSceneBusy()) return false;
+			if (this.pendingEventRelays.length > 3) this.pendingEventRelays.shift(); // bounded, sequential beats
+			this.pendingEventRelays.push({ trig, kind, type, seq, npc: kind === 'npc' ? trig : undefined, at: Date.now() });
+			console.log('[storysync] relayed story event seq=' + seq + ' DEFERRED — local scene still running');
+			return true;
+		} catch (_) { return false; }
+	}
+
+	private isLocalStoryEventBusy(): boolean {
+		if (this.currentEventActive) return true;
+		try {
+			const ev: any = (ig.game as any).events;
+			return !!(ev && ev.blockingEventCall);
+		} catch (_) { return false; }
+	}
+
+	/** 1.74.x (freeze fix): true while ANY local scene owns the player — a
+	 * blocking event call, the engine's cutscene mode, an active auto-control
+	 * tutorial, or our own synced event. The per-frame plot.line clamp and its
+	 * varsChangedDeferred re-evaluation must not run under a live scene. */
+	private isLocalSceneBusy(): boolean {
+		if (this.isLocalStoryEventBusy()) return true;
+		try {
+			const mdl: any = (sc as any).model;
+			if (mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene()) return true;
+		} catch (_) { /* ignore */ }
+		try {
+			const ac: any = (sc as any).autoControl;
+			if (ac && typeof ac.isActive === 'function' && ac.isActive()) return true;
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** 1.74.x (freeze fix): start parked relays once the local blocking event is
+	 * over (called from the per-frame update). Stale entries (the entity died /
+	 * the map changed / older than 20s) are dropped — the leader's state stream
+	 * still reconciles quest progress, so a dropped replay only costs the visual. */
+	private pumpPendingEventRelays(): void {
+		try {
+			if (!this.active || !this.pendingEventRelays.length) return;
+			if (this.isLocalSceneBusy()) return;
+			while (this.pendingEventRelays.length) {
+				const r = this.pendingEventRelays.shift()!;
+				const ent: any = r.trig;
+				if (!ent || ent._killed || !ig.game || !(ig.game as any).entities) continue;
+				if ((ig.game as any).entities.indexOf(ent) === -1) {
+					console.log('[storysync] dropped stale relayed event seq=' + r.seq + ' (entity left the map)');
+					continue;
+				}
+				if (Date.now() - r.at > 20000) {
+					console.log('[storysync] dropped stale relayed event seq=' + r.seq + ' (older than 20s)');
+					continue;
+				}
+				console.log('[storysync] starting deferred relayed story event seq=' + r.seq);
+				if (r.kind === 'npc') this.memberReplayNpcEvent(r.npc || ent, r.seq);
+				else this.memberReplayEvent(ent, r.kind, r.type, r.seq);
+				// one at a time — the started event may itself block
+				return;
+			}
+		} catch (_) { /* never break the frame */ }
 	}
 
 	private findTrigger(key: string, kind: 'trigger' | 'location'): any {
@@ -3507,6 +3715,7 @@ export class StorySyncController {
 			this.mapVarQueue.length = 0;
 				this.currentEventActive = false;
 				this.currentEventPendingSince = 0;
+				this.pendingEventRelays.length = 0;
 				this.resetSkipVote();
 				this.waitingTrigger = null;
 				this.waitingPromptSince = 0;

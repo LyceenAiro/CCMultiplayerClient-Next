@@ -315,25 +315,27 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { /* never break the frame */ }
 	}
 	/** 1.74.0: forward a member's sliding-block push to the instance host. Only the
-	 * host is the pillar authority — the member sends the push DIRECTION, the host
-	 * slides its local pillar and streams the position back (puzzleState 30Hz). */
-	private broadcastSlidingPush(mi: number, dx: number, dy: number): void {
+	 * host is the pillar authority — the member sends the push INGREDIENTS (ball
+	 * velocity + hit point + direction hint), the host recomputes the real direction
+	 * against its own block and slides it (or shows blocked). */
+	private broadcastSlidingPush(mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number): void {
 		try {
 			const m = this.getMain();
 			if (!m || !m.connection || !m.connection.isOpen()) return;
 			if (typeof (m.connection as any).slidingPush !== 'function') return;
 			const g: any = ig.game;
 			const map = (g && g.mapName) || '';
-			(m.connection as any).slidingPush(map, mi, Math.round(dx), Math.round(dy));
+			(m.connection as any).slidingPush(map, mi, Math.round(dx), Math.round(dy), hx, hy, vx, vy);
 		} catch (_) { /* ignore */ }
 	}
 
-	/** 1.74.0: host receives a member's push — slide the local pillar natively (or
-	 * flash "blocked" if a wall/fence is in the way). The position streams out via
-	 * the normal 30Hz fast path. */
-	private applySlidingPush(data: { map: string, mi: number, dx: number, dy: number }): void {
+	/** 1.74.0: host receives a member's push — recompute the push direction from the
+	 * ball's flight velocity (charged balls) or the hit point (bomb blasts), then
+	 * trace + slide the local pillar natively (or flash "blocked" if a wall/fence is
+	 * in the way). The authoritative position streams out via the 30Hz fast path. */
+	private applySlidingPush(data: { map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number }): void {
 		try {
-			if (!data || typeof data.mi !== 'number' || typeof data.dx !== 'number' || typeof data.dy !== 'number') return;
+			if (!data || typeof data.mi !== 'number') return;
 			if (!this.isInstanceHost()) return; // only the host pushes
 			const g: any = ig.game;
 			if (data.map && (g.mapName || '') !== data.map) return;
@@ -344,7 +346,54 @@ class PuzzleSync implements IPuzzleSync {
 				if (!e || e._killed || !(e instanceof E.SlidingBlock) || e.mapId !== data.mi) continue;
 				if (e.moving) return; // already sliding
 				const dir = Vec2.create();
-				dir.x = data.dx; dir.y = data.dy;
+				let hasDir = false;
+				// 1. Primary (charged ball): the push direction is the ball's dominant
+				// flight axis. This uses the ATTACKER's velocity, not the member's lagged
+				// block position, so the old wrong-direction push can't happen.
+				if (typeof data.vx === 'number' && isFinite(data.vx)
+					&& typeof data.vy === 'number' && isFinite(data.vy)
+					&& (Math.abs(data.vx) > 0.0001 || Math.abs(data.vy) > 0.0001)) {
+					if (Math.abs(data.vx) >= Math.abs(data.vy)) {
+						dir.x = data.vx > 0 ? 1 : -1;
+						dir.y = 0;
+					} else {
+						dir.x = 0;
+						dir.y = data.vy > 0 ? 1 : -1;
+					}
+					hasDir = true;
+				}
+				// 2. Bomb fallback: direction is block-center -> hit-point (dominant
+				// axis), computed against the HOST's authoritative block position.
+				if (!hasDir && typeof data.hx === 'number' && isFinite(data.hx)
+					&& typeof data.hy === 'number' && isFinite(data.hy) && e.coll) {
+					const cx = e.coll.pos.x + e.coll.size.x / 2;
+					const cy = e.coll.pos.y + e.coll.size.y / 2;
+					const ox = cx - data.hx;
+					const oy = cy - data.hy;
+					if (Math.abs(ox) > 0.5 || Math.abs(oy) > 0.5) {
+						if (Math.abs(ox) >= Math.abs(oy)) {
+							dir.x = ox >= 0 ? 1 : -1;
+							dir.y = 0;
+						} else {
+							dir.x = 0;
+							dir.y = oy >= 0 ? 1 : -1;
+						}
+						hasDir = true;
+					}
+				}
+				// 3. Legacy/member-side hint.
+				if (!hasDir) {
+					dir.x = (typeof data.dx === 'number' && isFinite(data.dx)) ? Math.max(-1, Math.min(1, data.dx)) : 0;
+					dir.y = (typeof data.dy === 'number' && isFinite(data.dy)) ? Math.max(-1, Math.min(1, data.dy)) : 0;
+					if (Math.abs(dir.x) < 0.0001 && Math.abs(dir.y) < 0.0001) return;
+					if (Math.abs(dir.x) >= Math.abs(dir.y)) {
+						dir.x = dir.x > 0 ? 1 : -1;
+						dir.y = 0;
+					} else {
+						dir.x = 0;
+						dir.y = dir.y > 0 ? 1 : -1;
+					}
+				}
 				const trace: any = (ig as any).game.physics.initTraceResult(Vec3.create());
 				if ((ig as any).game.traceEntity(trace, e, dir.x, dir.y, 0, 0, 0, (ig as any).COLLTYPE.IGNORE)) {
 					try { if (e.effects && e.effects.sheet && typeof e.effects.sheet.spawnOnTarget === 'function') e.effects.sheet.spawnOnTarget('blocked', e); } catch (_) { /* ignore */ }
@@ -445,9 +494,31 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { return false; }
 	}
 
+	/** 1.75.x (cold-dng.b1.room7 button exploit): the per-player floor switch —
+	 * see isPuzzleEntity. Floor switches on THIS map only (the hold-type plate
+	 * guarding the crate puzzle); every other map's switches are unaffected. */
+	private isLocalOnlyFloorSwitch(e: any): boolean {
+		try {
+			const E: any = (ig.ENTITY as any);
+			if (!E || !E.FloorSwitch || !(e instanceof E.FloorSwitch)) return false;
+			const map = ((ig.game as any).mapName || '') as string;
+			return map === 'cold-dng.b1.room7';
+		} catch (_) { return false; }
+	}
+
 	private isPuzzleEntity(e: any): boolean {
 		const E: any = (ig.ENTITY as any);
 		if (!E) return false;
+		// 1.75.x (cold-dng.b1.room7 button exploit): this room's FloorSwitch is a
+		// hold-type plate meant to be weighed down by the PUSHED CRATE. Syncing its
+		// on-state let one player simply STAND on it to drop the wall for everyone
+		// else — skipping the crate puzzle entirely. Make it PER-PLAYER: never
+		// published, never applied; each client's copy engages only from its own
+		// local weight (the own player, or the host-synced crate resting on it —
+		// the crate's position stays synced, so the intended solution still works
+		// for the whole party). Scoped strictly to this one map so every other
+		// dungeon switch keeps syncing.
+		if (this.isLocalOnlyFloorSwitch(e)) return false;
 		// NOTE (1.71.3): PushPullDest is deliberately NOT listed here — its
 		// raised/lowered height is a per-player SAVE mechanism. A solved player's
 		// lowered plate must never be broadcast over an unsolved player's raised
@@ -825,6 +896,10 @@ class PuzzleSync implements IPuzzleSync {
 	}
 
 	private applyEntry(e: any, s: IPuzzleEntry, push: boolean): void {
+		// 1.75.x (cold-dng.b1.room7): the per-player floor switch accepts NO remote
+		// state — a peer standing on their copy must never drop OUR wall (mixed
+		// client versions / the host full snapshot may still carry it).
+		if (this.isLocalOnlyFloorSwitch(e)) return;
 		// Box authority: the gripping client never accepts box echoes (server
 		// already excludes the sender, but a different client's 1Hz host snapshot
 		// or a stale non-owner packet can still arrive), and follower copies only
@@ -1137,9 +1212,12 @@ class PuzzleSync implements IPuzzleSync {
 				};
 			}
 			// Ball-pushed ice pillars (SlidingBlock) are host-authoritative: on a non-host
-			// member, never slide locally. Replay the native push check (blocked red flash
-			// or forward the push to the host via slidingPush), absorb the ball + show the
-			// hit FX — the host slides and streams the authoritative position back.
+			// member, never slide locally. Replay the native eligibility gate FIRST (only a
+			// charged ball or a BOMB hit may push — melee, uncharged balls and combat arts
+			// are absorbed with the normal hit FX and never forwarded), then send the push
+			// INGREDIENTS (ball velocity + hit point + direction hint) to the host. The
+			// host recomputes the direction against its authoritative block, traces and
+			// pushes — the member no longer makes that judgement against its lagged copy.
 			const SB: any = (ig.ENTITY as any).SlidingBlock;
 			if (SB && SB.prototype && typeof SB.prototype.ballHit === 'function' && !SB.prototype._mpSlidingWrapped) {
 				SB.prototype._mpSlidingWrapped = true;
@@ -1147,25 +1225,55 @@ class PuzzleSync implements IPuzzleSync {
 				SB.prototype.ballHit = function (this: any, d: any) {
 					try {
 						if (!self.isInstanceHost()) {
-							// Host-authoritative: never slide locally. Recompute the push
-							// direction, flash the red "blocked" effect if a wall/fence is in
-							// the way, and otherwise forward the push to the host (its copy
-							// slides and streams the authoritative position back).
-							const c = d && typeof d.getHitCenter === 'function' ? d.getHitCenter(this) : null;
+							const hitFx = () => {
+								try {
+									const c = d && typeof d.getHitCenter === 'function' ? d.getHitCenter(this) : null;
+									if (c) (sc as any).combat.showHitEffect(this, c, (sc as any).ATTACK_TYPE.NONE, typeof d.getElement === 'function' ? d.getElement() : 0, true, false, true);
+								} catch (_) { /* ignore */ }
+							};
 							try {
-								const dir = Vec2.create();
-								(ig as any).ActorEntity.getFaceVec(d.getCollideSide(this), dir);
-								Vec2.flip(dir);
-								const trace: any = (ig as any).game.physics.initTraceResult(Vec3.create());
-								if ((ig as any).game.traceEntity(trace, this, dir.x, dir.y, 0, 0, 0, (ig as any).COLLTYPE.IGNORE)) {
-									if (this.effects && this.effects.sheet && typeof this.effects.sheet.spawnOnTarget === 'function') this.effects.sheet.spawnOnTarget('blocked', this);
-								} else {
-									self.broadcastSlidingPush(this.mapId, dir.x, dir.y);
+								const atk: any = d && d.attackInfo;
+								const hasHint = (h: string) => !!(atk && typeof atk.hasHint === 'function' && atk.hasHint(h));
+								const isBall = !!(d && d.isBall);
+								const isChargedBall = isBall && hasHint('CHARGED');
+								const isBomb = !isBall && hasHint('BOMB');
+								// Vanilla SlidingBlock gate: melee / uncharged ball / any other
+								// combat force is absorbed but must NOT push the block.
+								if (!isChargedBall && !isBomb) {
+									hitFx();
+									return true;
+								}
+								if (!this.moving) {
+									const c = d && typeof d.getHitCenter === 'function' ? d.getHitCenter(this) : null;
+									let hx: number | undefined;
+									let hy: number | undefined;
+									if (c && typeof c.x === 'number' && isFinite(c.x)
+										&& typeof c.y === 'number' && isFinite(c.y)) {
+										hx = c.x; hy = c.y;
+									}
+									// Charged balls: the flight velocity is the reliable push
+									// ingredient. Bombs are stationary, so only the hit point.
+									let vx: number | undefined;
+									let vy: number | undefined;
+									if (isChargedBall && d.coll && d.coll.vel
+										&& typeof d.coll.vel.x === 'number' && typeof d.coll.vel.y === 'number') {
+										vx = d.coll.vel.x; vy = d.coll.vel.y;
+									}
+									// Member-side hint for old/limited relays; the host recomputes
+									// from vx/vy or hx/hy first.
+									let dx = 0; let dy = 0;
+									try {
+										if (typeof d.getCollideSide === 'function') {
+											const dir = Vec2.create();
+											(ig as any).ActorEntity.getFaceVec(d.getCollideSide(this), dir);
+											Vec2.flip(dir);
+											dx = dir.x; dy = dir.y;
+										}
+									} catch (_) { /* leave the hint 0,0 */ }
+									self.broadcastSlidingPush(this.mapId, dx, dy, hx, hy, vx, vy);
 								}
 							} catch (_) { /* ignore */ }
-							if (c) {
-								try { (sc as any).combat.showHitEffect(this, c, (sc as any).ATTACK_TYPE.NONE, typeof d.getElement === 'function' ? d.getElement() : 0, true, false, true); } catch (_) { /* ignore */ }
-							}
+							hitFx();
 							return true;
 						}
 					} catch (_) { /* fall through to vanilla */ }

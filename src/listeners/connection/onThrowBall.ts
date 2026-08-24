@@ -106,6 +106,52 @@ export class OnThrownBallListener {
 		return;
 	}
 
+	// 1.75.x (player skill-proxy relay): 'proxy:<name>' is a GENERIC combat proxy
+	// (sc.CombatProxyEntity) the caster's art placed — the heat dash-art mines
+	// ('mine'/'moveMine'), flameWall, meteorShower, wave/shock dash dummies, ...
+	// These are not Balls, so no other relay covers them (and the dungeon
+	// playerBall skip below must NOT apply — they replay everywhere). The copy
+	// runs its native action (blink/fuse/explode/move) but is neutralized:
+	// its TACKLE is a pure no-op so a streamed puppet/mirror position skew can
+	// never trip cancelOnHit and detonate the copy early (the "heat mine
+	// explodes after ~1s for spectators" bug). The copy's own WAIT-driven
+	// native fuse is its single timing authority, and its damage chains are
+	// swallowed by the _mpProxyVisual gates in netSync — the real damage
+	// arrives via the caster's combatHit/enemyDamage packets exactly like
+	// their melee/ball hits.
+	if (ballInfo.ballInfo.indexOf('proxy:') === 0) {
+		try {
+			const name = ballInfo.ballInfo.slice('proxy:'.length);
+			const me: any = ig.game.playerEntity;
+			const proxies: any = me && me.proxies;
+			const proxy: any = proxies && proxies[name];
+			if (!proxy || typeof proxy.spawn !== 'function') return;
+			// Only GENERIC proxies belong on this channel — a BALL-type name here
+			// means a mismatched sender; those belong to the normal ball branches.
+			const GenericCtor: any = (sc as any).PROXY_TYPE && (sc as any).PROXY_TYPE.GENERIC;
+			if (GenericCtor && !(proxy instanceof GenericCtor)) return;
+			const root: any = (entity as any).getCombatantRoot
+				? ((entity as any).getCombatantRoot() || entity) : entity;
+			// GENERIC spawn wants the CENTER point (it subtracts half its size);
+			// the relay carried the engine's final top-left spawn coords — add it
+			// back. Without pos (old sender) fall back to the mirror's face point.
+			const size: any = proxy.data && proxy.data.size;
+			let px: number, py: number, pz: number;
+			if (ballInfo.pos && typeof ballInfo.pos.x === 'number') {
+				px = ballInfo.pos.x; py = ballInfo.pos.y; pz = ballInfo.pos.z;
+			} else {
+				const fp = root.getAlignedPos((ig as any).ENTITY_ALIGN.BOTTOM, Vec3.create());
+				px = fp.x - (size ? size.x / 2 : 0); py = fp.y - (size ? size.y / 2 : 0); pz = fp.z;
+			}
+			const e = proxy.spawn(
+				px + (size && typeof size.x === 'number' ? size.x / 2 : 0),
+				py + (size && typeof size.y === 'number' ? size.y / 2 : 0),
+				pz, root, ballInfo.dir, true);
+			if (e) this.neutralizeProxyVisual(e);
+		} catch (_) { /* a failed proxy replay must never break the frame */ }
+		return;
+	}
+
 	// ROUND 132: in a dungeon the peer's NORMAL thrown balls are position-streamed
 		// (playerBall) so the bounce-puzzle ball stays visible through every steered
 		// bounce. Spawning a second physical ball here would double the visual — skip
@@ -115,11 +161,51 @@ export class OnThrownBallListener {
 		const smAny: any = (sc as any).map;
 		if (smAny && typeof smAny.isDungeon === 'function' && smAny.isDungeon()) return;
 
+	// 1.75.x: when the relay carries the engine's exact spawn coords, spawn the
+	// resolved proxy right there. Skill bursts (SHOOT_PROXY_RANGE's startDist/
+	// offset — the Burn! flame cone) otherwise collapse onto the mirror's face
+	// point and read as a plain bullet stream. Old senders without pos keep the
+	// legacy SHOOT_PROXY-at-face behaviour.
+	if (ballInfo.pos && typeof ballInfo.pos.x === 'number') {
+		try {
+			const proxy: any = (sc as any).ProxyTools.getProxy(ballInfo.ballInfo, entity as any);
+			if (proxy && typeof proxy.spawn === 'function') {
+				const root: any = (entity as any).getCombatantRoot
+					? ((entity as any).getCombatantRoot() || entity) : entity;
+				proxy.spawn(ballInfo.pos.x, ballInfo.pos.y, ballInfo.pos.z, root, ballInfo.dir);
+			}
+		} catch (_) { /* a failed ball replay must never break the frame */ }
+		return;
+	}
+
 	// `SHOOT_PROXY` settings are an internal shape that has shifted between
 		// game versions; the values we pass are part of our own wire protocol, so
 		// we cast rather than track the game's exact constructor types.
 		const actonStep = new ig.ACTION_STEP.SHOOT_PROXY({ proxy: ballInfo.ballInfo, dir: ballInfo.dir } as any);
 		actonStep.run(entity as sc.BasicCombatant);
+	}
+
+	/** 1.75.x: neutralize a relayed GENERIC skill-proxy copy (the heat mine & co.).
+	 * The copy keeps its native action (blink/move/explode — full visual fidelity)
+	 * but NEVER self-triggers: its TACKLE is a pure no-op. The old override counted
+	 * contacts (cancelOnHit nulls attackInfo) so the art's timing played out — but
+	 * on receivers the streamed puppet/mirror positions skew off the caster's local
+	 * view, and a "contact" that the caster's real mine never saw tripped
+	 * cancelOnHit the moment the TACKLE phase began: the mine exploded ~1.3s after
+	 * placement for everyone watching (armed 1.1s + 0.2s) while the caster's own
+	 * mine ran its full fuse. The copy's WAIT-driven native fuse is the single
+	 * timing authority now; the real damage always arrives via the caster's
+	 * combatHit/enemyDamage packets, and the copy's later damage steps
+	 * (CIRCLE_ATTACK & co.) stay swallowed by the _mpProxyVisual gates. */
+	private neutralizeProxyVisual(e: any): void {
+		if (!e) return;
+		try {
+			e._mpProxyVisual = true;
+			e._mpProxyVisualBorn = Date.now();
+			e.checkTackle = function (_a: any, _c: any, _d: any): boolean {
+				return false;
+			};
+		} catch (_) { /* visuals must never break sync */ }
 	}
 
 	/** 1.73.x: turn a relayed ball into a purely VISUAL copy — OTHER party,

@@ -67,6 +67,11 @@ export interface IConnection {
      * are the only member of our instance — for late-joiner spawn placement and
      * party regroup — without re-enabling the full sync stream. */
     updatePlayerPosition(pos: Vec3): void;
+    /** 1.75.x (encounter-aware room matching): the instance HOST reports its
+     * forceCombatMode (locked encounter battle) and the sub-map it is fighting on
+     * to the server. The world router then avoids matching newcomers into a
+     * channel whose host is mid-encounter on THAT map. */
+    combatState(locked: number, map?: string): void;
     /** Host-only: broadcast the whole enemy state block for the current map.
      * `combat` = host's combat mode, so members enter/see the shared fight.
      * `full` = this block was force-full (f:1 on the wire) — the ~1s heartbeat that
@@ -112,12 +117,12 @@ export interface IConnection {
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
      * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
      * fixed MEDIUM. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[] }): void;
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number }): void;
     /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
      * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
      * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
      * every other member replays the enemy's hurt sound/FX on its own puppet. */
-    emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void;
+    emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }): void;
     /** Round 21: member -> host — a monster hit our real player LOCALLY (native damage
      * pipeline: guard/i-frames/knockback). Bookkeeping only: the member's HP already
      * streams via playerState, so the host must NOT re-apply any damage from this. */
@@ -223,11 +228,13 @@ export interface IConnection {
     /** ROUND 132: a same-instance peer relayed its thrown-ball positions. */
     onPlayerBall(callback: (data: { from: string, map: string, entries: Array<any> }) => void): void;
 
-    /** 1.74.0: a member's charged ball hit a host-authoritative sliding block —
-     * relay the push direction to the instance host, which pushes its local pillar. */
-    slidingPush(map: string, mi: number, dx: number, dy: number): void;
-    /** 1.74.0: a same-instance peer relayed a sliding-block push direction. */
-    onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number }) => void): void;
+    /** 1.74.0: a member's charged ball / bomb hit a host-authoritative sliding
+     * block — relay the push ingredients to the instance host, which judges and
+     * pushes its local pillar. dx/dy = member-side direction hint, hx/hy = hit
+     * point (bomb fallback), vx/vy = ball flight velocity (charged-ball primary). */
+    slidingPush(map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number): void;
+    /** 1.74.0: a same-instance peer relayed a sliding-block push. */
+    onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number }) => void): void;
     /** ROUND 133: relay a quest-world spawn-driving map/tmp var (chest spawnCondition)
      * so same-instance members' hidden chests appear too — even outside side-quest sync. */
     spawnVar(map: string, list: Array<{ b: string, k: string, v: any }>): void;
@@ -344,6 +351,13 @@ export interface IConnection {
     /** Round 11: a player CAST a special skill — replay its effect sheet on the
      * sender's mirror (f = fixed world pos for spawnFixed effects). */
     skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void;
+    /** 1.75.x: one of OUR LOOPING player-skill effects ended (Effect.stop) —
+     * relay the stop so every mirror's replayed copy ends too (the heat guard
+     * art's flameGuard blinkCount:-1 would otherwise blink red forever). */
+    skillFxStop?(fx: { sheet: string, key: string }): void;
+    /** 1.75.x: a remote caster's looping player-skill effect ended — stop the
+     * replayed copy we spawned for their mirror. */
+    onSkillFxStop?(cb: (player: string, data: { sheet: string, key: string }) => void): void;
     /** Elemental-status build-up: a whitelisted effect sheet spawned on a
      * HOST-side real enemy (charge-up telegraphs like the snowman's
      * coldMegaCharge). Receivers replay it on the same-uid puppet. */
@@ -450,10 +464,10 @@ export interface IConnection {
     onCombatHit(callback:
         (hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }) => void): void;
     onEnemyDamage(callback:
-        (hit: { uid: number, damage: number, attacker: string, attackElement?: number, critical?: boolean, type?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void;
+        (hit: { uid: number, damage: number, attacker: string, attackElement?: number, critical?: boolean, type?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }) => void): void;
     /** ROUND 45 (Gap A, host origin): the host relayed that a member's hit landed on a
      * real enemy — replay the hurt FX on our same-uid puppet (cosmetic only, no damage). */
-    onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void;
+    onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }) => void): void;
     /** Round 17: the host's real enemy started an attack — replay it on our puppet
      * (uid) toward the local player with the given attack anim. Round 22 (RC1): `t`
      * is the targeted member's username (null when the host/bot/unknown was targeted). */

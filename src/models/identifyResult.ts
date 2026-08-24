@@ -13,9 +13,26 @@ interface IIdentifyResult {
     /** Same scheme for the hit-count break threshold (config.json
      * monsterBreakPerPlayer, default 0.7 = +70% per extra member). */
     breakScale?: number;
+    /** Same scheme for the elemental-status THRESHOLD (config.json
+     * monsterStatusThresholdPerPlayer, default 0.6 = +60% bar-fill required per
+     * extra member). The HOST divides enemy statusInflict susceptibility by
+     * 1 + statusScale * (partySize - 1). */
+    statusScale?: number;
     /** 1.74.x: whether online players collide with each other (config.json
      * playerCollision, default false = always walk-through). */
     playerCollision?: boolean;
+    /** Soft-death revive HP fraction for normal (non-boss) combat revives
+     * (config.json softDeathReviveHpNormal, default 0.5 = 50%). */
+    softDeathReviveHpNormal?: number;
+    /** Soft-death revive HP fraction while a boss battle is active
+     * (config.json softDeathReviveHpBoss, default 0.25 = 25%). */
+    softDeathReviveHpBoss?: number;
+    /** Soft-death revive countdown in seconds for normal combat (config.json
+     * softDeathReviveTimeNormal, default 30). */
+    softDeathReviveTimeNormal?: number;
+    /** Soft-death revive countdown in seconds for boss combat (config.json
+     * softDeathReviveTimeBoss, default 30). */
+    softDeathReviveTimeBoss?: number;
     /** Same scheme for the attack/defense/focus stats (defaults 0.1 = +10% per
      * extra party member). */
     attackScale?: number;

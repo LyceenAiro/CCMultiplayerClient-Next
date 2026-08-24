@@ -398,14 +398,19 @@ export class SocketIoConnector implements IConnection {
                 resistFlat?: number,
                 resistPercent?: number,
                 breakScale?: number,
+                statusScale?: number,
                 playerCollision?: boolean,
+                softDeathReviveHpNormal?: number,
+                softDeathReviveHpBoss?: number,
+                softDeathReviveTimeNormal?: number,
+                softDeathReviveTimeBoss?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, playerCollision: data.playerCollision, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -935,8 +940,22 @@ export class SocketIoConnector implements IConnection {
 			if (data) callback(data.player, data);
 		});
 	}
+	/** 1.75.x: one of our LOOPING player-skill effects ended — relay the stop so
+	 * every mirror's replayed copy ends too (guard-art flameGuard & co.). */
+	public skillFxStop(fx: { sheet: string, key: string }): void {
+		this.syncEmit('skillFxStop', fx);
+	}
+	public onSkillFxStop(callback: (player: string, data: { sheet: string, key: string }) => void): void {
+		this.socket.on('skillFxStop', (data: any) => {
+			if (!data || typeof data.player !== 'string') return;
+			callback(data.player, {
+				sheet: typeof data.sheet === 'string' ? data.sheet : '',
+				key: typeof data.key === 'string' ? data.key : '',
+			});
+		});
+	}
 
-	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[] }): void {
+	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number }): void {
 		this.syncEmit('enemyDamage', hit);
 	}
 
@@ -968,7 +987,7 @@ export class SocketIoConnector implements IConnection {
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
-	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }): void {
+	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }): void {
 		this.syncEmit('enemyHurt', hit);
 	}
 
@@ -1186,14 +1205,31 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
-	// 1.74.0: member forwards a sliding-block push direction to the instance host.
-	public slidingPush(map: string, mi: number, dx: number, dy: number): void {
-		this.syncEmit('slidingPush', { map, mi, dx, dy });
+	// 1.74.0: member forwards a sliding-block push to the instance host. The host
+	// is the authority: it recomputes the push direction from the ball velocity /
+	// hit point against ITS authoritative block and performs (or refuses) the push.
+	public slidingPush(map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number): void {
+		this.syncEmit('slidingPush', {
+			map, mi, dx, dy,
+			hx: (typeof hx === 'number' && isFinite(hx)) ? hx : undefined,
+			hy: (typeof hy === 'number' && isFinite(hy)) ? hy : undefined,
+			vx: (typeof vx === 'number' && isFinite(vx)) ? vx : undefined,
+			vy: (typeof vy === 'number' && isFinite(vy)) ? vy : undefined,
+		});
 	}
-	public onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number }) => void): void {
+	public onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number }) => void): void {
 		this.socket.on('slidingPush', (data: any) => {
 			if (!data || typeof data.map !== 'string' || typeof data.mi !== 'number') return;
-			callback({ map: data.map, mi: data.mi, dx: (typeof data.dx === 'number' ? data.dx : 0), dy: (typeof data.dy === 'number' ? data.dy : 0) });
+			callback({
+				map: data.map,
+				mi: data.mi,
+				dx: (typeof data.dx === 'number' ? data.dx : 0),
+				dy: (typeof data.dy === 'number' ? data.dy : 0),
+				hx: (typeof data.hx === 'number' && isFinite(data.hx)) ? data.hx : undefined,
+				hy: (typeof data.hy === 'number' && isFinite(data.hy)) ? data.hy : undefined,
+				vx: (typeof data.vx === 'number' && isFinite(data.vx)) ? data.vx : undefined,
+				vy: (typeof data.vy === 'number' && isFinite(data.vy)) ? data.vy : undefined,
+			});
 		});
 	}
 
@@ -1230,6 +1266,14 @@ export class SocketIoConnector implements IConnection {
 	 * the solo-mode keepalive for spawn placement / party regroup. */
 	public updatePlayerPosition(pos: Vec3): void {
 		this.socket.emit('playerState', { pos });
+	}
+	/** 1.75.x (encounter-aware room matching): the instance HOST reports its
+	 * forceCombatMode (locked encounter battle) + the sub-map it is fighting on.
+	 * Plain socket.emit on purpose — syncEmit skips solo instances, but a lone
+	 * town-channel host must still tell the server it is mid-encounter BEFORE
+	 * anyone tries to join that room. */
+	public combatState(locked: number, map?: string): void {
+		this.socket.emit('combatState', { locked: locked ? 1 : 0, map: typeof map === 'string' ? map : '' });
 	}
 	public updateEntityStateBlock(map: string, entities: any[], combat?: boolean, full?: boolean, stream?: 'base' | 'hostile'): void {
 		// Solo-instance optimization: no one else is in our instance, so the block is pure
@@ -1357,7 +1401,7 @@ export class SocketIoConnector implements IConnection {
 			callback(data);
 		});
 	}
-	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void {
+	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }) => void): void {
 		this.socket.on('enemyDamage', (data: any) => {
 			callback(data);
 		});
@@ -1406,7 +1450,7 @@ export class SocketIoConnector implements IConnection {
 	}
 	/** ROUND 45 (Gap A, host origin): the host relayed a member's hit on a real enemy —
 	 * replay the hurt FX on our same-uid puppet (cosmetic only). */
-	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number }) => void): void {
+	public onEnemyHurt(callback: (hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }) => void): void {
 		this.socket.on('enemyHurt', (data: any) => {
 			if (data && typeof data.uid === 'number') callback(data);
 		});
