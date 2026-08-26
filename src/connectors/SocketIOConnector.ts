@@ -447,7 +447,7 @@ export class SocketIoConnector implements IConnection {
 				// rejects the connection unless it matches its own version — on the
 				// first connect AND every reconnect (both re-run this handshake).
 				version: MP_VERSION,
-				client: 'multiplayer',
+				client: 'CCMultiplayerClient-Next',
 				// 1.71.0: mirror rollback mode — the server authenticates but holds
 				// the normal save stream until saveMirrorRestore picks a snapshot.
 				mirrorMode: !!mirrorMode,

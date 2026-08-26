@@ -78,7 +78,7 @@ CrossCode 是一款单机游戏,因此这里的"多人"实质上是**状态镜�
   实体也会被"解锁"交回本地控制。
 
 通信采用 socket.io 中继:客户端之间从不直接通信,所有数据都经由
-`CCMultiplayerServer` 转发。
+`CCMultiplayerServer-Next` 转发。
 
 ## 功能特性
 
@@ -218,7 +218,7 @@ CrossCode 是一款单机游戏,因此这里的"多人"实质上是**状态镜�
 | CrossCode              | **1.4.2**(最终版本,官方已不再更新)                                               |
 | Mod 加载器             | **CCLoader v2**(当前仍在活跃维护的加载器)—— 它自带本模组所用的 `simplify` 库 |
 | Node.js(构建 + 服务器) | ≥ 18                                                                                  |
-| 中继服务器             | [CCMultiplayerServer](https://github.com/CCDirectLink/CCMultiplayerServer)              |
+| 中继服务器             | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next)              |
 
 ## 构建
 
@@ -259,7 +259,7 @@ dist/
 
 1. 启动一台中继服务器(见服务端仓库),例如:
    ```bash
-   cd CCMultiplayerServer
+   cd CCMultiplayerServer-Next
    npm install
    npm start          # 监听 *:1423
    ```

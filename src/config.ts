@@ -19,8 +19,8 @@ export class MultiplayerConfig {
 
 	constructor(configPath = 'config/config.json') {
 		// Simplify (bundled with CCLoader v2) resolves the mod's install
-		// directory from its manifest name ('multiplayer').
-		const mod = simplify.getMod('multiplayer');
+		// directory from its manifest name ('CCMultiplayerClient-Next').
+		const mod = simplify.getMod('CCMultiplayerClient-Next');
 		if (!mod) {
 			throw new Error('[multiplayer] Could not find our own mod via simplify.getMod()');
 		}

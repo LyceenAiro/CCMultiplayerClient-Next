@@ -106,7 +106,7 @@ CrossCode is a single-player game, so "multiplayer" here is really
   back to local control.
 
 Communication is a socket.io relay: clients never talk to each other directly,
-everything goes through `CCMultiplayerServer`.
+everything goes through `CCMultiplayerServer-Next`.
 
 ## Features
 
@@ -327,7 +327,7 @@ Useful scripts:
 
 1. Start a relay server (see the server repo), e.g.:
    ```bash
-   cd CCMultiplayerServer
+   cd CCMultiplayerServer-Next
    npm install
    npm start          # listens on *:1423
    ```

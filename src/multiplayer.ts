@@ -56,7 +56,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '1.75.0';
+export const MP_VERSION = '2.0.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -3374,7 +3374,7 @@ export class Multiplayer {
 	 * Fast-forward for testing: instead of patching stats live (which fights the
 	 * engine and caused the bugs you saw), this builds a savegame and loads it
 	 * through the game's own ig.SaveSlot / ig.storage.loadSlot pipeline — exactly
-	 * how the reference CCMultiplayerClient starts clean from a save instead of
+	 * how the reference CCMultiplayerClient-Next starts clean from a save instead of
 	 * mutating the live model.
 	 *
 	 * The catch: loadSlot notifies EVERY ig.storage listener's onStoragePreLoad(),

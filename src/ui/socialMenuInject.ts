@@ -30,7 +30,7 @@ import { openPrivateChannel } from './chatBox';
 const PARTY_MEMBER_TYPE = { UNKNOWN: 0, CONTACT: 1, FRIEND: 2 };
 
 // ---- bot friends (round 28: re-add accidentally-removed companions) ----
-// Official game companion BOTS: server-side virtual accounts (CCMultiplayerServer/
+// Official game companion BOTS: server-side virtual accounts (CCMultiplayerServer-Next/
 // bots.js). A removed bot friend is re-added through the normal add-friend flow;
 // the server auto-accepts instantly. The story gate below decides whether the
 // add button is enabled.
