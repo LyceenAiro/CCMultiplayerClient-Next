@@ -435,12 +435,17 @@ export class Multiplayer {
 		// latch — the option is read once here, not live).
 		try { if (this.netSync) this.netSync.setBlockInterval(this.getHostTickInterval()); } catch (_) { /* ignore */ }
 
-		// Round 16 (issue 4): read the server's per-extra-party-member enemy max-HP
+		// Round 16 (issue 4): read the server's per-extra-player enemy max-HP
 		// fraction off the handshake (handshakeResponse.hpScale, default 0.7) and hand
-		// it to netSync, which scales monster max/current HP by party size at spawn —
-		// HOST side only (members' puppets are locked mirrors of host enemies).
+		// it to netSync, which scales monster max/current HP by the ROOM's player
+		// count at spawn — HOST side only (members' puppets mirror host enemies).
+		// 1.75.x: the base is the room player count, not the party roster.
 		if (typeof result.hpScale === 'number' && isFinite(result.hpScale)) this.mpHpScale = result.hpScale;
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
+		// 1.76.x: bosses carry their OWN HP increment (default 0.9 = +90% per extra
+		// member). Older servers omit hpScaleBoss — keep the client default.
+		if (typeof result.hpScaleBoss === 'number' && isFinite(result.hpScaleBoss)) this.mpHpScaleBoss = result.hpScaleBoss;
+		try { if (this.netSync) this.netSync.setHpScaleBoss(this.mpHpScaleBoss); } catch (_) { /* ignore */ }
 		if (typeof result.breakScale === 'number' && isFinite(result.breakScale)) this.mpBreakScale = result.breakScale;
 		try { if (this.netSync) this.netSync.setBreakScale(this.mpBreakScale); } catch (_) { /* ignore */ }
 		if (typeof result.statusScale === 'number' && isFinite(result.statusScale)) this.mpStatusScale = result.statusScale;
@@ -1500,6 +1505,13 @@ export class Multiplayer {
 		// After accepting an invite the server tells us to regroup: disband our
 		// current party (server already did) and teleport next to the leader.
 		safeWire(conn.onPartyMove.bind(conn), (data) => {
+			// 1.75.x: the server refused the regroup — the target is mid-encounter /
+			// boss fight (their room is join-locked). Toast the reason, stay put.
+			if (data && data.blocked === 'combat') {
+				console.log('[multiplayer] regroup refused: target is in an encounter/boss fight (' + (data.leader || '?') + ')');
+				try { showMpToast({ title: t('teleportInCombat') }); } catch (_) { /* ignore */ }
+				return;
+			}
 			this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos);
 		});
 
@@ -1598,6 +1610,33 @@ export class Multiplayer {
 					// notify on a real currentHp change so the bar tracks live.
 					if (p.currentHp !== hpBefore) {
 						try { (sc as any).Model.notifyObserver(p, (sc as any).COMBAT_PARAM_MSG.HP_CHANGED); } catch (_) { /* best-effort */ }
+					}
+				}
+				// Element state (party-HUD portrait overload overlay). The three fields
+				// always travel together on new-protocol packets; an old server strips
+				// them all, in which case the overlay simply stays hidden.
+				if (model && (typeof stats.em === 'number' || typeof stats.el === 'number')) {
+					const wasOverload = model._mpOverload === true;
+					model._mpElementMode = (typeof stats.em === 'number') ? (stats.em | 0) : 0;
+					model._mpElementLoad = (typeof stats.el === 'number') ? Math.max(0, Math.min(1, stats.el)) : 0;
+					model._mpOverload = stats.ov === true;
+					// Rising edge: the teammate just overloaded — raise the "元素过载!"
+					// banner (sc.SmallEntityBox, 1s, the engine's own shape) over their
+					// mirror, same as the local player gets. Same-map only (needs the
+					// live mirror entity); the rising-edge guard makes repeat packets
+					// during one overload fire exactly once.
+					if (!wasOverload && model._mpOverload) {
+						try {
+							const pl = this.players[player];
+							const ent = pl && pl.entity;
+							const SEB: any = (sc as any).SmallEntityBox;
+							const gui: any = (ig as any).gui;
+							if (ent && !ent._killed && SEB && gui && typeof gui.addGuiElement === 'function') {
+								const box = new SEB(ent, (ig as any).lang.get('sc.gui.combat.element-overload'), 1);
+								if (typeof box.stopRumble === 'function') box.stopRumble();
+								gui.addGuiElement(box);
+							}
+						} catch (_) { /* the banner must never break stats sync */ }
 					}
 				}
 				// Keep the live mirror entity in sync too (for combat reads on it).
@@ -1717,16 +1756,23 @@ export class Multiplayer {
 	/** Current party roster (usernames, including self) + leader. */
 	public partyMembers: string[] = [];
 	public partyLeader?: string;
-	/** Round 16 (issue 4): server-provided per-extra-party-member enemy max-HP
-	 * fraction (handshakeResponse.hpScale, default 0.5 = +50% HP per extra party
-	 * member). Consumed by netSync (setHpScale) — the HOST scales monster HP at
-	 * spawn by `1 + hpScale * (partySize - 1)`; members never scale (their puppets
-	 * are locked mirrors of host enemies). */
+	/** Round 16 (issue 4): server-provided per-extra-player enemy max-HP
+	 * fraction (handshakeResponse.hpScale). Consumed by netSync (setHpScale) —
+	 * the HOST scales monster HP at spawn by `1 + hpScale * (playersInRoom - 1)`
+	 * (1.75.x: room player count, not party size); members never scale (their
+	 * puppets are locked mirrors of host enemies). */
 	public mpHpScale = 0.7;
-	/** Server-provided per-extra-party-member hit-count break threshold fraction
-	 * (handshakeResponse.breakScale, default 0.7 = +70% per extra member). Consumed
-	 * by netSync (setBreakScale) — the HOST multiplies each HIT tracker's target at
-	 * spawn by (1 + breakScale * (partySize - 1)); members never scale. */
+	/** 1.76.x: server-provided per-extra-player max-HP fraction for BOSS
+	 * enemies only (handshakeResponse.hpScaleBoss, config monsterBossHpPerPlayer,
+	 * default 0.9 = +90% per extra player in the room). Consumed by netSync
+	 * (setHpScaleBoss) — the HOST scales boss max/current HP at spawn by
+	 * `1 + hpScaleBoss * (playersInRoom - 1)`; regular enemies keep mpHpScale. */
+	public mpHpScaleBoss = 0.9;
+	/** Server-provided per-extra-player hit-count break threshold fraction
+	 * (handshakeResponse.breakScale, default 0.7 = +70% per extra player in the
+	 * room). Consumed by netSync (setBreakScale) — the HOST multiplies each HIT
+	 * tracker's target at spawn by (1 + breakScale * (playersInRoom - 1));
+	 * members never scale. */
 	public mpBreakScale = 0.7;
 	/** Server-provided per-extra-party-member elemental-status threshold fraction
 	 * (handshakeResponse.statusScale, default 0.6 = +60% per extra member). Consumed

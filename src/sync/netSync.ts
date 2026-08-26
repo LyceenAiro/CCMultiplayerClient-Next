@@ -1,7 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { ILootDrop } from '../connection';
 import { t } from '../i18n';
-import { isSharedTownNow, isSharedTownMap, currentAreaPath, currentAreaType, AREA_TYPE } from '../util/areaUtil';
+import { isSharedTownNow, isSharedTownMap, currentAreaPath, currentAreaType, AREA_TYPE, storageMapKey } from '../util/areaUtil';
 import { showItemUse } from '../ui/itemUseIndicator';
 import { showRemoteHeal } from '../ui/healSync';
 import { createDeathLineHud, DeathLineHud } from '../ui/deathLineHud';
@@ -107,6 +107,18 @@ interface IEnemySnap {
 	                  // from the member instead of the shield-reduced (silver-number)
 	                  // chip. Synced verbatim so the puppet's native isShielded applies
 	                  // the same factor / hitResist / direction gates as the host.
+	shp?: number;    // 1.75.x (drill-boss chest armor): the host enemy's `shieldHp`
+	                  // actor attribute when it owns a `shield` animation part (the
+	                  // drill-boss chest plates). Drives the chest-plate part anim
+	                  // (shieldA..shieldE/open) on the member's puppet, which only ever
+	                  // shows the default full-plate frame locally.
+	mk?: string;     // ROUND 139: the host enemy's manualKill var NAME (a map-entity
+	                  // setting, bosses only — e.g. "map.bossKilled"). A member's puppet
+	                  // only carries manualKill when it was ADOPTED from its own map copy;
+	                  // a typed-fallback puppet has none, so its scripted defeat cinematic
+	                  // (diePre/dieExplosion/MANUAL_COMBATANT_KILL) could never stage and
+	                  // the boss simply VANISHED on the member. Shipping the var name lets
+	                  // any puppet stage the cinematic (stamped in the h<=0 block-apply).
 }
 
 /** ROUND 66: one active shield connection, serialized from the host enemy's
@@ -144,10 +156,13 @@ export class NetSync {
 	 * catching up. */
 	private memberKills: { [uid: number]: number } = Object.create(null);
 	/** Round 14 (fix 5): member-side deaths pending the delayed death-FX sequence.
-	 * Member kills use kill(true) (silent, no FX), so we stage the puppet for
-	 * ~500ms total (round 16: 220ms flinch/blink + 280ms boom window ≈ vanilla
-	 * DYING): flinch anim + pre_die blink immediately, then boom + silent kill. */
-	private _mpDeathQueue: Array<{ e: any, at: number, doLootMirror: boolean }> = [];
+	 * Member kills use kill(true) (silent, no FX), so we stage the puppet for the
+	 * delayed sequence: flinch anim + pre_die blink immediately, then boom + silent
+	 * kill. 1.76.x (corpse knockback parity): the default stays the old compressed
+	 * 220/280ms FX echo, but the predicted-kill site ships the VANILLA windows
+	 * (boomMs = the killing blow's upgraded fly-level stun 550-1000ms, killMs = the
+	 * 0.5s DYING sink) so the corpse rides its streamed knockback to the end. */
+	private _mpDeathQueue: Array<{ e: any, at: number, doLootMirror: boolean, boomAt: number, killWait: number }> = [];
 	/** Round 14 (fix 1): accumulated ig.system.tick for the host-side combat
 	 * re-evaluation (~every 0.5s) that un-sticks combatMode when the last enemy
 	 * de-aggros a mirror. */
@@ -212,6 +227,15 @@ export class NetSync {
 	 * making its own deliberate vanilla-flow call. Every other respawn call while
 	 * connected is a native defeat leak and gets swallowed (round 8). */
 	private _mpAllowRespawn = false;
+	/** 1.75.x (boss-phase quick revive): timestamp until which a detected boss
+	 * hpBreak phase transition may instantly revive the local player. Set on the
+	 * host by the resolveHpBreak hook and on members by the bossPhase relay; the
+	 * death monitor consumes it next frame (2s grace also covers a death that
+	 * lands within the same instant as the phase break). 0 = not armed. */
+	private _mpBossPhaseReviveAt = 0;
+	/** Host-side throttle for the bossPhase relay (a multi-break hit only needs one
+	 * relay — every dead player revives on the first one). */
+	private _mpBossPhaseRelayAt = 0;
 	// ---- party charge time-stop sync (round 10) ----
 	/** True while WE hold the shared 'mpCharge' slow-motion handle (any party
 	 * member is charging a skill). Cleared when the last charger releases. */
@@ -232,6 +256,12 @@ export class NetSync {
 	 * the HOST multiplies enemy max/current HP at spawn by
 	 * 1 + _mpHpScale * (partySize - 1). Clamped [0, 10]. */
 	private _mpHpScale = 0.7;
+	/** 1.76.x: per-extra-party-member max-HP fraction for BOSS enemies only
+	 * (server handshake hpScaleBoss, config monsterBossHpPerPlayer, default
+	 * 0.9 = +90% HP per additional party member). Boss detection is
+	 * enemyType.boss — the same flag the engine's big HP bar and the manualKill
+	 * defeat chain key on. Regular enemies keep using _mpHpScale. */
+	private _mpHpScaleBoss = 0.9;
 	/** Per-extra-member hit-count break threshold fraction from the server
 	 * handshake (default 0.7 = +70% per additional party member). Set via
 	 * setBreakScale(); the HOST multiplies each HIT tracker's target and
@@ -318,12 +348,57 @@ export class NetSync {
 	 * vars that drive a NON-ENEMY conditionalEntity's spawnCondition on the current map
 	 * (Chest / NPC / Prop / ...). Enemies are excluded (the host's enemy stream already
 	 * puppets those), chest-opened (chest_) vars are excluded (ghost-chest per-player),
-	 * and object-valued vars (PushPullDest _placed) drop out via the type filter. */
+	 * parkour marker vars are excluded (parkour anchors stay per-player), and
+	 * object-valued vars (PushPullDest _placed) drop out via the type filter. */
 	private _mpSpawnVarHookInstalled = false;
 	private _mpSpawnVarSet: { [path: string]: true } = Object.create(null);
 	private _mpSpawnVarSetMap = '';
 	private _mpSpawnVarQueue: Array<{ b: string, k: string, v: any }> = [];
 	private _mpSpawnVarFlushAt = 0;
+	/** 1.75.x (per-player ground pickups): resolved set of vars that drive a
+	 * ground-item Prop (interact contains DROP_ITEM_ENTITY — laser pickaxe, TNT,
+	 * mining docs, ...). These stay strictly local: each player must pick the item
+	 * up themselves, so neither capture nor apply may ever relay them. */
+	private _mpLocalPickupVarSet: { [path: string]: true } = Object.create(null);
+	private _mpLocalPickupVarSetMap = '';
+	/** Resolved pickup var -> granted KEY item id, used to heal characters whose
+	 * var was already poisoned by the old relay (var true but no item owned). */
+	private _mpLocalPickupItems: { [key: string]: number } = Object.create(null);
+	/** 1s throttle for the pickup self-heal (also covers a same-map re-entry, where
+	 * the mapName-change branch above never fires). */
+	private _mpPickupHealAt = 0;
+	/** 1s throttle for the destructible-persistence reapply (covers event-spawned /
+	 * condition-gated blocks that only appear a beat after the map load). */
+	private _mpDestroyedReapplyAt = 0;
+	/** Per-map set of mapIds that are key-locked Destructibles (DUNGEON_KEY /
+	 * DUNGEON_MASTER_KEY walls & pillars). Used to stop storySync/spawnVar from
+	 * relaying those entities' vanilla perma vars across players. */
+	private _mpKeyLockedMapIdSet: { [mapId: string]: true } = Object.create(null);
+	private _mpKeyLockedMapIdSetMap = '';
+	/** Resolved onPreDestructIncrease/onDestructIncrease vars written by the
+	 * current map's key-locked blocks (map.locksOpened, map.keyUsed, ...). These
+	 * unlock counters must stay per-player too. */
+	private _mpKeyLockedVarSet: { [path: string]: true } = Object.create(null);
+	/** 1.75.x (parkour-crash guard): true once the missing-timer remainingTime
+	 * wrap is installed on sc.timers (process-wide, install-once). */
+	private _mpTimerMissingGuardInstalled = false;
+	/** 1.75.x (parkour-crash guard): true once the duplicate ADD_TIMER guard is
+	 * installed on sc.timers (process-wide, install-once). */
+	private _mpTimerDupGuardInstalled = false;
+	/** 1.75.x (boss attack camera sync): member-side camera handles pushed while
+	 * replaying the host's FOCUS_CAMERA action steps, keyed by host enemy uid.
+	 * The host's RESET_CAMERA relay removes them exactly when the host's own
+	 * camera target detaches. */
+	private _mpEnemyCamHandles: { [uid: number]: any[] } = Object.create(null);
+	/** 1.75.x (drill-boss intro): once-flag for the relayed barrier-trigger
+	 * teleport — every blocked teammate is pulled to the triggerer exactly once
+	 * per map visit (the intro trigger itself is ONCE anyway, but the relay can
+	 * be retried/delivered twice; this guarantees no teleport loop). Reset on
+	 * map change. */
+	private _mpDrillIntroOnce = false;
+	/** 1.75.x (saw-suction fix): fallback cleanup timer for forwarded START_LOCK
+	 * holds whose END_LOCK packet never arrived (skill interrupted mid-saw). */
+	private _mpHoldCleanupTimer = 0;
 	/** ROUND 88 (collision-map leak fix): periodic sweep accumulator. Every few
 	 * seconds the impact.js spatial hash is cleaned of entries whose
 	 * `_inCollisionMap` flag is false — the exact stale trail left by a locked
@@ -709,6 +784,16 @@ export class NetSync {
 		// MEMBER ever receives this (broadcastHostState excludes the host sender), and the
 		// attacking member already replayed its own FX, so this covers every spectator.
 		conn.onEnemyHurt((hit) => this.replayEnemyHurtFx(hit));
+		// 1.75.x (quest enemy AR labels): a peer's real enemy action showed a floating
+		// SHOW_AR_MSG window — replay it on our matching puppet/csPuppet.
+		if (typeof (conn as any).onEnemyArMsg === 'function') {
+			(conn as any).onEnemyArMsg((data: any) => this.applyEnemyArMsg(data));
+		}
+		// 1.76.x (barrier denial FX): a teammate was denied by a locked red barrier —
+		// replay the "拒绝访问" AR window on their mirror + the barrier flash.
+		if (typeof (conn as any).onPlayerFx === 'function') {
+			(conn as any).onPlayerFx((data: any) => this.applyPlayerFx(data));
+		}
 		// Round 21: a member reported a monster hit it detected LOCALLY. Bookkeeping only
 		// (their HP streams via playerState); the host must NOT re-apply any damage.
 		conn.onCombatResult((hit) => this.onCombatResult(hit));
@@ -716,6 +801,12 @@ export class NetSync {
 		// relayed, sender excluded). Replay it on our matching puppet / real enemy so the
 		// head popup + speedlines show for everyone, not just the acting member.
 		conn.onCombatFx((uid, kind) => this.replayCombatFx(uid, kind));
+		// 1.75.x (boss-phase quick revive): the instance host detected a boss phase
+		// transition (hpBreak threshold / combat cutscene) — a soft-dead local
+		// player revives immediately.
+		if (typeof (conn as any).onBossPhase === 'function') {
+			(conn as any).onBossPhase((data: any) => this.applyBossPhase(data));
+		}
 		// A party teammate genuinely fell into a fall terrain (water/hole/...) —
 		// replay the splash + fall-damage visual on their mirror (replica-local
 		// terrain falls are suppressed, so genuine falls arrive via this relay).
@@ -756,6 +847,9 @@ export class NetSync {
 		// our own copy at the same mapId (vanilla chain, idempotent). Guarded like
 		// onSkillSound so a mixed client/server pair never crashes.
 		if (typeof conn.onPlantBreak === 'function') conn.onPlantBreak((d) => this.applyPlantBreak(d));
+		// ROUND 141 (prop hit-FX sync): a teammate's ball/melee hit a destructible —
+		// replay the vanilla impact flash at the relayed hit position on our copy.
+		if (typeof (conn as any).onPropHitFx === 'function') (conn as any).onPropHitFx((d: any) => this.applyPropHitFx(d));
 		// ROUND 100 (drop-pickup visibility): a same-instance player obtained an item
 		// drop (monster kill / plant break) — spawn the visual-only drop entity at the
 		// relayed position and let it fly to OUR mirror of that player, so teammates
@@ -803,6 +897,20 @@ export class NetSync {
 			conn.onSpawnVar((data) => this.applySpawnVar(data));
 		}
 		this.installSpawnVarHook();
+		// 1.75.x (boss-phase quick revive): wrap EnemyType.resolveHpBreak so the
+		// host notices the exact frame a boss crosses a phase threshold.
+		this.installBossPhaseHook();
+		// ...and wrap sc.Cutscene.startCombatCutscene for event-driven phase
+		// transitions (e.g. tree-dng f4 whale <-> ape) that have no hpBreak.
+		this.installCombatCutsceneHook();
+		// 1.75.x (parkour-crash guard): a timer-expiry EventTrigger (parkourFail
+		// & co.) must never fire on a client that never started the timer — the
+		// engine's missing-timer remainingTime (null) coerces to 0 in <=0 checks.
+		this.installTimerMissingGuard();
+		// Safety net for the same class of bug: if a synced var rollback still
+		// restarts an ALWAYS trigger whose ADD_TIMER already ran, keep the
+		// existing timer instead of letting the engine throw and crash the game.
+		this.installTimerDuplicateGuard();
 		// ROUND 82 (door transition visuals): a remote player opened a door on OUR map —
 		// open our matching door so their enter/exit walk is visible.
 		if (typeof conn.onDoorTransition === 'function') {
@@ -824,9 +932,40 @@ export class NetSync {
 				const m = (window as any).__mpMain;
 				if (m && m.netSync) m.netSync.tick();
 			});
+			// 1.75.x (destructible persistence): clear the session-memory records
+			// whenever the engine loads a save or starts a new game
+			// (onStoragePreLoad/onNewGameApply fire before map entities spawn). The
+			// persisted records re-merge from THAT save's own map vars on the next
+			// map entry, so destroyed-block state can never leak across characters.
+			try {
+				const st: any = (ig as any).storage;
+				if (st && typeof st.register === 'function') {
+					const clearDestroyed = () => {
+						try {
+							const m = (window as any).__mpMain;
+							if (m && m.netSync) m.netSync.destroyedProps = {};
+						} catch (_) { /* ignore */ }
+					};
+					st.register({
+						onStoragePreLoad: clearDestroyed,
+						onNewGameApply: clearDestroyed,
+					});
+				}
+			} catch (e) { console.warn('[netsync] destroyed-props storage hook failed', e); }
 			// 1.71.0: capture local-player SHOW_EXTERN_ANIM (sit/pose) steps so the
 			// playerState stream can relay them to teammates' mirrors.
 			try { this.installExternAnimHook(); } catch (e) { console.warn('[netsync] extern-anim hook failed', e); }
+			// 1.75.x (per-player quest encounters, 深度呵护 & co.): when a tmp.quest_*
+			// map enemy becomes visible on a MEMBER it must leave the host-puppet pool
+			// and run as that member's own story enemy (streamed as a cutscene entity),
+			// otherwise the host's hidden copy keeps re-hiding it and the waves never show.
+			try { this.installQuestEnemyShowHook(); } catch (e) { console.warn('[netsync] quest-enemy show hook failed', e); }
+			// 1.75.x (quest enemy AR labels): capture REAL enemy SHOW_AR_MSG steps so
+			// teammates replay [饥饿的叫声] / [舔树] floating windows on their puppets.
+			try { this.installEnemyArMsgHook(); } catch (e) { console.warn('[netsync] enemy AR hook failed', e); }
+			try { this.installPlayerFxHook(); } catch (e) { console.warn('[netsync] player FX hook failed', e); }
+			// 1.75.x (boss attack camera sync): host FOCUS_CAMERA/RESET_CAMERA relay.
+			try { this.installEnemyCameraHook(); } catch (e) { console.warn('[netsync] enemy camera hook failed', e); }
 			// SUPPRESS the engine's own player-death flow while connected. Engine
 			// facts (game.compiled.js): Combatant.update fires _onDeathHit when
 			// params.isDefeated() -> sc.combat.onCombatantDeathHit(a, b) -> for the
@@ -1296,7 +1435,19 @@ export class NetSync {
 							// (the EnemyType.update gate) puppets run no action steps locally, so
 							// the relay cannot double with a local copy; embedded sounds stay
 							// single-channel via the _mpFxMuted mute.
-							const enemyRelay = !!(m && m.host && b && b instanceof (ig as any).ENTITY.Enemy && !b._mpPuppet && !b._mpMirror);
+							// 1.75.x (part-anchored boss FX): SHOW_EFFECT steps with a partName
+							// (the drill-boss's handSnow / shieldRegen) resolve the target to an
+							// AnimationPartEntity BEFORE spawnOnTarget, so the old Enemy-instance
+							// check never relayed them. Walk up through .owner and ship the partName
+							// so the receiver can anchor the replay on its puppet's same part.
+							const EnemyCtor: any = (ig as any).ENTITY.Enemy;
+							let fxOwner: any = b;
+							let partParams: any = null;
+							if (fxOwner && !(fxOwner instanceof EnemyCtor) && typeof fxOwner.partName === 'string' && fxOwner.owner) {
+								fxOwner = fxOwner.owner;
+								partParams = Object.assign({}, c || {}, { partName: (b as any).partName });
+							}
+							const enemyRelay = !!(m && m.host && fxOwner && fxOwner instanceof EnemyCtor && !fxOwner._mpPuppet && !fxOwner._mpMirror);
 							if (m && m.netSync && (SKILL_SHEETS[this.path] || telegraph || enemyRelay) && b && ig.game) {
 								if (SKILL_SHEETS[this.path] && b === ig.game.playerEntity) {
 									m.netSync.broadcastSkillFx(this.path, a, null, c);
@@ -1307,8 +1458,8 @@ export class NetSync {
 									// the host — relay the sheet/key so members replay the
 									// telegraph on the same-uid puppet. Puppets/mirrors never
 									// run actions, so this cannot echo back from a receiver.
-									m.netSync.broadcastEnemyFx(this.path, a, b, null, c);
-									markUid = (typeof b.uid === 'number') ? b.uid : 0;
+									m.netSync.broadcastEnemyFx(this.path, a, fxOwner, null, partParams || c);
+									markUid = (typeof fxOwner.uid === 'number') ? fxOwner.uid : 0;
 								}
 							}
 						} catch (_) { /* never break the local effect */ }
@@ -1567,6 +1718,27 @@ export class NetSync {
 				}
 			} catch (e) { console.warn('[netsync] Bomb explode wrap failed', e); }
 			try {
+				// 1.75.x (drill-boss bomb landing dust): the vanilla onTouchGround
+				// spawns a dust puff only on the client that owns the bomb (the host
+				// for RAIN_BOMB boss bombs). Relay the landing so members see the puff.
+				const BE2: any = (sc as any).BombEntity;
+				if (BE2 && BE2.prototype && typeof BE2.prototype.onTouchGround === 'function'
+					&& !BE2.prototype._mpBombTouchWrapped) {
+					BE2.prototype._mpBombTouchWrapped = true;
+					const origTouch = BE2.prototype.onTouchGround;
+					BE2.prototype.onTouchGround = function (this: any, impact: any) {
+						const r = origTouch.call(this, impact);
+						try {
+							const m = (window as any).__mpMain;
+							if (m && m.netSync && !this._mpBombCopy) {
+								m.netSync.relayBombLandingDust(this, impact);
+							}
+						} catch (_) { /* dust is cosmetic */ }
+						return r;
+					};
+				}
+			} catch (e) { console.warn('[netsync] Bomb landing-dust wrap failed', e); }
+			try {
 				// 1.73.x (elevator ride offset): when the LOCAL player teleports to a map
 				// through an elevator ride, the destination elevator's applyMarkerPosition
 				// places them at the canonical marker spot (button area). A RIDER must land
@@ -1800,6 +1972,22 @@ export class NetSync {
 							try {
 								const ns = cur();
 								if (ns) ns.observeDramaticEffect(b, c);
+								// 1.75.x (element overload hitstop): vanilla OVERLOAD freezes the
+								// whole game ~1s (timeFactor 0.001 + zoom blur) — in multiplayer the
+								// hitstop desyncs the local simulation against the server-driven
+								// world. While connected, swap it for a non-freezing variant
+								// (timeFactor 1, shorter) plus a brief PERSONAL stagger (charge
+								// cancel + ~0.7s input block) so the penalty stays but the world
+								// keeps running. Offline keeps the vanilla freeze.
+								if (ns && c && combatAny.DRAMATIC_EFFECT && c === combatAny.DRAMATIC_EFFECT.OVERLOAD
+									&& a && (a as any).isPlayer) {
+									const connOv = ns.main && ns.main.connection;
+									if (connOv && typeof connOv.isOpen === 'function' && connOv.isOpen()) {
+										ns.applyOverloadStagger(a);
+										const lite = Object.assign({}, c, { timeFactor: 1, wait: 0.5, clearTime: 0.2, blurDuration: 0.4, camera: 0 });
+										return origDramatic.call(this, a, b, lite, false);
+									}
+								}
 								// 1.72.x: distance-gate the ENEMY break camera focus on the
 								// NATIVE path too (host-side real enemies break natively and
 								// alwaysFocus variants like BREAK_BIG would yank the camera
@@ -2506,6 +2694,30 @@ export class NetSync {
 									try { ns._sfxLog('fed.hidden', 'uid=' + (this._mpUid || 0) + ' blocked underground hit dmg=' + dmg.damage); } catch (_) { /* ignore */ }
 								} else {
 								const atkInfoA: any = rest[1];
+							// 1.75.x (drill-boss chest-hit forwarding): rest[2] is the actual
+							// PART entity the engine hit (c -> g in onDamage). Ship its center
+							// so the host can resolve the SAME part on its real enemy — without
+							// this every forwarded hit resolves to the enemy root, PARTS shields
+							// (full inverse / center) judge it as a non-part hit and the broken
+							// chest still reads as a blocked guard.
+							let hitX: number | undefined, hitY: number | undefined;
+							try {
+								const hitPartA: any = rest[2];
+								const pc = hitPartA && hitPartA.coll;
+								if (pc && pc.pos && pc.size) {
+									hitX = Math.round(pc.pos.x + pc.size.x / 2);
+									hitY = Math.round(pc.pos.y + pc.size.y / 2);
+								}
+							} catch (_) { /* fall back to the puppet center below */ }
+							if (typeof hitX !== 'number' || typeof hitY !== 'number') {
+								try {
+									const cE: any = (this as any).coll;
+									if (cE && cE.pos) {
+										hitX = Math.round(cE.pos.x + (cE.size ? cE.size.x / 2 : 0));
+										hitY = Math.round(cE.pos.y + (cE.size ? cE.size.y / 2 : 0));
+									}
+								} catch (_) { hitX = undefined; hitY = undefined; }
+							}
 								// ROUND 43 (enemy-hurt sound, attacker side): this MEMBER's own client
 								// suppressed the puppet's native showHitEffect to avoid a double — so the
 								// attacker ALSO heard no hurt sound for their own hit. Re-run the engine's
@@ -2532,7 +2744,7 @@ export class NetSync {
 									weak: !!(a && a.weakness),
 									off: (typeof dmg.baseOffensiveFactor === 'number') ? dmg.baseOffensiveFactor : 1,
 									def: (typeof dmg.defensiveFactor === 'number') ? dmg.defensiveFactor : 1,
-								});
+								}, hitX, hitY);
 								// ROUND 60 (diagnostics): the member→enemy （地鼠） report — a member's
 								// ranged hit sometimes shows NO feedback locally and lands for 0~1 on the
 								// host. Tag the member-side packet at its source: the local damage the
@@ -2592,18 +2804,39 @@ export class NetSync {
 									else {
 									const uid = this._mpUid || 0;
 									if (uid) ns.noteMemberKill(uid);
-									// Round 14 (fix 5): drop the puppet from the block-apply registry
-									// BEFORE the death queue runs — with puppets[uid]/lastAnim[uid]
-									// gone, ensurePuppet's fast path can't re-adopt a dying puppet
-									// during the ~500ms FX window (noteMemberKill is the second fence).
-									if (uid) { delete ns.puppets[uid]; delete ns.lastAnim[uid]; }
+									// 1.76.x (corpse knockback parity): do NOT drop the puppet from the
+									// block-apply registry anymore. The old delete froze the corpse at
+									// the hit spot: interpolatePuppets only drives entities in
+									// ns.puppets, while the host's real corpse rides the killing blow's
+									// upgraded damage movement (onDamage forces >= MASSIVE: vel 300+, a
+									// z-launch, stun 0.55-1s, boom, 0.5s sink). Keeping the entry lets
+									// the streamed positions glide the member's corpse through the
+									// exact same slide. No re-adopt flicker: ensurePuppet's fast path
+									// returns THIS dying puppet, and noteMemberKill above still fences
+									// any fresh adopt after the queue's silent kill (which cleans the
+									// registry entry itself).
 									// Round 14 (fix 5): stage the delayed death instead of the instant
-									// silent kill — flinch anim + pre_die blink now, boom at 220ms then
-									// silent kill at ~500ms (processDeathQueue, two-stage; round 16). The
-									// _mpTg lock-release (old Fix 1) and the EXP/combat-rank mirror (old
-									// Fix 2) moved into the queue's doLootMirror branch, which runs just
-									// before the silent kill there.
-									ns.playPuppetDeath(this, true);
+									// silent kill — flinch anim + pre_die blink now, then the boom +
+									// silent kill after the VANILLA kill window (processDeathQueue,
+									// two-stage; round 16). The _mpTg lock-release (old Fix 1) and the
+									// EXP/combat-rank mirror (old Fix 2) live in the queue's
+									// doLootMirror branch, which runs just before the silent kill there.
+									// 1.76.x: vanilla upgrades the killing blow's fly level by the
+									// overkill ratio (damage/maxHp >= 0.5/1/2 -> MASSIVE+/++/+++);
+									// the boom waits out that fly level's stun, the kill its 0.5s sink.
+									let killStunMs = 550;
+									try {
+										const FL: any = (sc as any).COMBAT_FLY_LEVEL;
+										const maxHpK: number = (this.params && typeof this.params.getStat === 'function') ? (this.params.getStat('hp') || 0) : 0;
+										const dmgN: number = (dmg && typeof dmg.damage === 'number') ? dmg.damage : 0;
+										if (FL && maxHpK > 0 && dmgN > 0) {
+											const ratioK = dmgN / maxHpK;
+											const keyK = ratioK >= 2 ? 'MASSIVE+++' : ratioK >= 1 ? 'MASSIVE++' : ratioK >= 0.5 ? 'MASSIVE+' : 'MASSIVE';
+											const flK: any = FL[keyK];
+											if (flK && typeof flK.stun === 'number') killStunMs = Math.round(flK.stun * 1000);
+										}
+									} catch (_) { /* keep the MASSIVE default */ }
+									ns.playPuppetDeath(this, true, { boomMs: killStunMs, killMs: 500 });
 									}
 								}
 							}
@@ -3135,6 +3368,109 @@ export class NetSync {
 						return r;
 					};
 				}
+				// 1.76.x (master-key door unlock is strictly per-player): the
+				// keyConsume chain inside Destructible.ballHit is the ONE place a
+				// key wall / key pillar / master-key wall can start unlocking — it
+				// checks the hitting ball's DUNGEON_KEY hint against the LOCAL
+				// player's own area-key count and spends THEIR key. A network
+				// replay of the unlocking player's throw (onThrowBall copy or a
+				// playerBall stream puppet, all flagged _mpPlayerBall) must NEVER
+				// run that chain here: a keyless teammate's copy would either fake
+					// an unlock or silently spend this client's key. Refuse any
+				// replayed ball at the choke point — the local player's own ball
+				// (no flag) keeps the vanilla path exactly.
+				try {
+					if (DEProto && typeof DEProto.ballHit === 'function' && !DEProto._mpKeyWallBallHitWrapped) {
+						DEProto._mpKeyWallBallHitWrapped = true;
+						const origBallHit = DEProto.ballHit;
+						DEProto.ballHit = function (this: any, a: any) {
+							try {
+								if (a && (a as any)._mpPlayerBall) {
+									const m = (window as any).__mpMain;
+									const ns = m && m.netSync;
+									if (ns && typeof ns.isKeyLockedDestructible === 'function'
+										&& ns.isKeyLockedDestructible(this)) {
+										try {
+											if (!(this as any)._mpKeyWallBlockedLogged) {
+												(this as any)._mpKeyWallBlockedLogged = true;
+												console.log('[netsync] key-wall blocked replayed ball mapId=' + ((this as any).mapId || 0)
+													+ ' desType blocked per-player');
+											}
+										} catch (_) { /* log only */ }
+										return false;
+									}
+								}
+							} catch (_) { /* never break the native hit */ }
+							return origBallHit.apply(this, arguments as any);
+						};
+					}
+				} catch (e) { console.warn('[netsync] key-wall ballHit wrap failed', e); }
+				// 1.75.1 (regen-destruct melt sync): RegenDestruct ice pillars (and the
+				// other regen gimmicks) are NOT destroyed — destroy() only melts them and
+				// starts their LOCAL regen timer, so the ROUND 74 permanent-break relay
+				// never fires for them. Relay a real player-triggered melt (ballHit's
+				// no-arg destroy) by mapId. The receiver calls its own destroy() so the
+				// pillar melts there too, but its refreeze timing stays fully local
+				// (regenMaxTime), exactly like the non-regen ice pillars.
+				try {
+					const RDProto: any = (ig.ENTITY as any).RegenDestruct && (ig.ENTITY as any).RegenDestruct.prototype;
+					if (RDProto && typeof RDProto.destroy === 'function' && !RDProto._mpRegenDestructWrapped) {
+						RDProto._mpRegenDestructWrapped = true;
+						const origRegenDestroy = RDProto.destroy;
+						RDProto.destroy = function (this: any, a?: any, b?: any) {
+							const synced = !!this._mpSyncedDestroy;
+							this._mpSyncedDestroy = false;
+							// Only a no-arg destroy() is a player melt. destroy(true) is the
+							// activeCondition deactivate path (varsChanged/show) and must stay
+							// local; destroy(true,true) is the spawn-time inactive path.
+							const triggered = arguments.length === 0;
+							const wasIntact = !this.regenTimer && !(this.effects && this.effects.boomHandle)
+								&& !(this.effects && this.effects.hideHandle)
+								&& !!this.coll && (typeof this.coll.size.z !== 'number' || this.coll.size.z > 0);
+							const r = origRegenDestroy.call(this, a, b);
+							try {
+								const m = (window as any).__mpMain;
+								if (!synced && triggered && wasIntact && m && m.netSync) {
+									m.netSync.broadcastPlantBreak(this);
+								}
+							} catch (_) { /* never break the melt chain */ }
+							return r;
+						};
+					}
+				} catch (e) { console.warn('[netsync] RegenDestruct destroy wrap failed', e); }
+				// ROUND 141 (prop hit-FX sync): the vanilla ballHit of all three destructible
+				// classes plays sc.combat.showHitEffect at the impact point — but REMOTE
+				// clients never see it: their copy of the prop is only destroyed via the
+				// plantBreak relay (boom/debris, no impact flash) and their player-ball
+				// puppets are collision-IGNORE neutered, so a teammate's attack never runs
+				// ballHit locally. Wrap ballHit: when a genuinely LOCAL hit is accepted
+				// (returns true => the flash played here), relay the impact (mapId + hit
+				// center + element + attack type) so every other client replays the flash
+				// on its own copy (applyPropHitFx). Stacks cleanly over the key-wall wrap
+				// (a blocked replay returns false -> nothing relays).
+				try {
+					const wrapPropBallHit = (proto: any, guard: string) => {
+						try {
+							if (!proto || typeof proto.ballHit !== 'function' || proto[guard]) return;
+							proto[guard] = true;
+							const origBallHitFx = proto.ballHit;
+							proto.ballHit = function (this: any, a: any) {
+								const r = origBallHitFx.apply(this, arguments as any);
+								try {
+									if (r === true) {
+										const m = (window as any).__mpMain;
+										if (m && m.netSync) m.netSync.observeLocalPropBallHit(this, a);
+									}
+								} catch (_) { /* never break the hit */ }
+								return r;
+							};
+						} catch (_) { /* ignore */ }
+					};
+					const ENT: any = (ig.ENTITY as any) || {};
+					wrapPropBallHit(ENT.ItemDestruct && ENT.ItemDestruct.prototype, '_mpHitFxWrappedID');
+					wrapPropBallHit(ENT.Destructible && ENT.Destructible.prototype, '_mpHitFxWrappedDE');
+					wrapPropBallHit(ENT.RegenDestruct && ENT.RegenDestruct.prototype, '_mpHitFxWrappedRD');
+				} catch (e) { console.warn('[netsync] prop ballHit FX wraps failed', e); }
 									// 1.73.x (break-bar host authority): the member's puppet must NOT run its
 			// own hit-reaction check — that would accumulate a from-zero LOCAL hit-count
 			// tracker and clobber the host's streamed break progress (brp). The HOST is
@@ -4993,8 +5329,146 @@ export class NetSync {
 	 * hit (no rate limit; tiny packets on a LAN) so locally-shown damage always
 	 * matches what the host applies.
 	 */
+	/** 1.75.x (saw-suction fix): serialize an AttackInfo's active stunSteps
+	 * (START_LOCK / BLOCK_XY / PULL / Z_PULL / Z_VEL / ...) for the wire. The
+	 * member's local hit applies these natively to its PUPPET, but the host's
+	 * fabricated AttackInfo had no stunSteps — so hold/pull arts (圆锯 Sphere Saw
+	 * & co.) knocked enemies away on the host instead of holding them. We copy the
+	 * INSTANCE fields the engine's own CombatStun ctors already resolved, so the
+	 * host can rebuild identical raw settings via new AttackInfo({stunSteps}). */
+	private serializeStunSteps(attackInfo: any): Array<{ type: string, [k: string]: any }> | undefined {
+		try {
+			if (!attackInfo || !Array.isArray(attackInfo.stunSteps) || !attackInfo.stunSteps.length) return undefined;
+			const CST: any = (sc as any).COMBAT_STUN;
+			if (!CST) return undefined;
+			const TYPES = ['START_LOCK', 'END_LOCK', 'BLOCK_XY', 'BLOCK_FALL', 'PULL',
+				'Z_PULL', 'FORCE_POS', 'Z_VEL', 'Z_BOUNCINESS', 'SET_FACE'];
+			const num = (v: any, dflt: number, max = 100000): number => {
+				const n = Number(v);
+				if (!isFinite(n)) return dflt;
+				if (n < -max) return -max;
+				if (n > max) return max;
+				return n;
+			};
+			const vec = (v: any): { x: number, y: number, z: number } | null => {
+				if (!v || typeof v !== 'object') return null;
+				const x = Number(v.x), y = Number(v.y), z = Number(v.z);
+				if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return null;
+				return { x, y, z };
+			};
+			const out: Array<{ type: string, [k: string]: any }> = [];
+			for (const st of attackInfo.stunSteps) {
+				if (!st || out.length >= 4) break;
+				let type: string | null = null;
+				for (const t of TYPES) {
+					const C = CST[t];
+					if (C && st instanceof C) { type = t; break; }
+				}
+				if (!type) continue;
+				const raw: { type: string, [k: string]: any } = { type };
+				switch (type) {
+					case 'BLOCK_FALL':
+						raw.maxTime = num(st.maxTime, 0);
+						break;
+					case 'PULL':
+						raw.distance = num(st.distance, 0);
+						raw.speed = num(st.speed, 300);
+						raw.maxTime = num(st.maxTime, 0);
+						break;
+					case 'Z_PULL':
+						raw.maxSpeed = num(st.maxSpeed, 300);
+						raw.accel = num(st.accel, 1);
+						raw.offZ = num(st.offZ, 0);
+						raw.maxTime = num(st.maxTime, 0);
+						break;
+					case 'FORCE_POS': {
+						const align = this.enumName((ig as any).ENTITY_ALIGN, st.align) || 'BOTTOM';
+						raw.align = align;
+						const off = vec(st.offset);
+						if (off) raw.offset = off;
+						raw.maxTime = num(st.maxTime, 0);
+						raw.interpolateFactor = num(st.interpolateFactor, 0);
+						break;
+					}
+					case 'Z_VEL':
+					case 'Z_BOUNCINESS':
+						raw.value = num(st.value, 0);
+						break;
+					case 'SET_FACE':
+						if (Array.isArray(st.faces)) raw.faces = st.faces.slice(0, 8);
+						raw.invert = !!st.invert;
+						break;
+					// START_LOCK / END_LOCK / BLOCK_XY carry no settings.
+				}
+				out.push(raw);
+			}
+			return out.length ? out : undefined;
+		} catch (_) { return undefined; }
+	}
+
+	/** Reverse-lookup an enum's name for a numeric value (e.g. FORCE_POS align). */
+	private enumName(map: any, value: any): string | null {
+		try {
+			if (!map || value === undefined || value === null) return null;
+			for (const k in map) {
+				if (typeof k === 'string' && map[k] === value && !/^\d+$/.test(k)) return k;
+			}
+		} catch (_) { /* ignore */ }
+		return null;
+	}
+
+	/** HOST side: accept only whitelisted stun-step types and scalar settings from
+	 * the wire. Extra keys are stripped so a malformed packet can never feed junk
+	 * into the AttackInfo ctor (which would just throw inside the guarded apply). */
+	private cleanForwardedStunSteps(list: any): Array<{ type: string, [k: string]: any }> | undefined {
+		try {
+			if (!Array.isArray(list) || !list.length) return undefined;
+			const allowed: { [t: string]: boolean } = {
+				START_LOCK: true, END_LOCK: true, BLOCK_XY: true, BLOCK_FALL: true, PULL: true,
+				Z_PULL: true, FORCE_POS: true, Z_VEL: true, Z_BOUNCINESS: true, SET_FACE: true,
+			};
+			const out: Array<{ type: string, [k: string]: any }> = [];
+			for (const e0 of list) {
+				if (!e0 || typeof e0 !== 'object' || typeof e0.type !== 'string'
+					|| !Object.prototype.hasOwnProperty.call(allowed, e0.type)) continue;
+				const raw: { type: string, [k: string]: any } = { type: e0.type };
+				for (const k in e0) {
+					if (k === 'type') continue;
+					const v: any = e0[k];
+					if (typeof v === 'number' && isFinite(v)) {
+						raw[k] = Math.max(-100000, Math.min(100000, v));
+					} else if (typeof v === 'boolean') {
+						raw[k] = v;
+					} else if (typeof v === 'string' && v.length <= 32) {
+						raw[k] = v;
+					} else if (k === 'offset' && v && typeof v === 'object') {
+						const x = Number(v.x), y = Number(v.y), z = Number(v.z);
+						if (isFinite(x) && isFinite(y) && isFinite(z)) {
+							raw.offset = {
+								x: Math.max(-100000, Math.min(100000, x)),
+								y: Math.max(-100000, Math.min(100000, y)),
+								z: Math.max(-100000, Math.min(100000, z)),
+							};
+						}
+					} else if (k === 'faces' && Array.isArray(v)) {
+						const fs: string[] = [];
+						for (const f of v) {
+							if (typeof f !== 'string' || f.length > 32 || fs.length >= 8) continue;
+							if (fs.indexOf(f) === -1) fs.push(f);
+						}
+						if (fs.length) raw.faces = fs;
+					}
+				}
+				out.push(raw);
+				if (out.length >= 4) break;
+			}
+			return out.length ? out : undefined;
+		} catch (_) { return undefined; }
+	}
+
 	public forwardEnemyDamage(entity: any, damage: number, attackInfo?: any,
-		style?: { critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number }): void {
+		style?: { critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number },
+		hitX?: number, hitY?: number): void {
 		if (this.main.host) return;                  // only members forward
 		const uid = entity && entity._mpUid;
 		// ROUND 138: allow damage === 0 (a connected hit whose shielded chip rounded
@@ -5106,19 +5580,27 @@ export class NetSync {
 		// receiver kills its ball puppet exactly where our ball landed, instead
 		// of around its own (differently-lagged) enemy copy.
 		let hx: number | undefined, hy: number | undefined;
-		try {
-			const cE: any = entity && entity.coll;
-			if (cE && cE.pos) {
-				hx = Math.round(cE.pos.x + (cE.size ? cE.size.x / 2 : 0));
-				hy = Math.round(cE.pos.y + (cE.size ? cE.size.y / 2 : 0));
-			}
-		} catch (_) { hx = undefined; hy = undefined; }
+		if (typeof hitX === 'number' && isFinite(hitX) && typeof hitY === 'number' && isFinite(hitY)) {
+			// 1.75.x (drill-boss chest-hit forwarding): prefer the ACTUAL PART hit
+			// point so the host resolves the same part entity (chest shield vs torso).
+			hx = Math.round(hitX);
+			hy = Math.round(hitY);
+		} else {
+			try {
+				const cE: any = entity && entity.coll;
+				if (cE && cE.pos) {
+					hx = Math.round(cE.pos.x + (cE.size ? cE.size.x / 2 : 0));
+					hy = Math.round(cE.pos.y + (cE.size ? cE.size.y / 2 : 0));
+				}
+			} catch (_) { hx = undefined; hy = undefined; }
+		}
 		try {
 			console.log('[mpFwd] uid=' + uid + ' dmg=' + damage + ' el=' + attackElement
 				+ ' hs=' + shield + ' type=' + type + ' ball=' + (isBall ? 1 : 0)
 				+ ' chg=' + (charged ? 1 : 0) + ' puppet=' + ((entity && !entity._killed) ? 1 : 0)
 				+ ' hx=' + hx + ' hy=' + hy);
 		} catch (_) { /* ignore */ }
+		const stunSteps = this.serializeStunSteps(attackInfo);
 		this.main.connection.enemyDamage({
 			uid, damage, attacker: this.main.name,
 			type, ball: isBall, charged, knockback, attackElement, critical,
@@ -5126,6 +5608,7 @@ export class NetSync {
 			stb: stb > 0 ? stb : undefined,
 			hints: hints.length ? hints : undefined,
 			hx, hy,
+			stunSteps,
 		});
 		// Instant local aggro: don't wait the ~66ms for the host's tg=1 block — the hit
 		// itself guarantees the host will aggro this enemy (applyEnemyDamage sets the
@@ -5182,6 +5665,66 @@ export class NetSync {
 		} catch (_) { /* flinch is cosmetic — never break the hit */ }
 	}
 
+	/** 1.76.x (member-ball false stagger): resolve an enemy's poise (hitStable)
+	 * as a NUMBER, with layered fallbacks. The engine's stagger gate compares
+	 * `this.hitStable >= attackType` — if the entity field ever holds the RAW
+	 * STRING form ("LIGHT"), the comparison is false for EVERY hit, so the
+	 * enemy flinches constantly; our own gate had the same hole (`typeof !==
+	 * number` fell back to 0 = always flinch). Sources, in order: the entity
+	 * field (a string is mapped through sc.ATTACK_TYPE), the entity's current
+	 * defaultConfig, then the enemy type's root entityConfig. Returns -1 when
+	 * nothing resolves; callers decide their own fallback. */
+	private mpResolveHitStable(e: any): number {
+		try {
+			const AT: any = (sc as any).ATTACK_TYPE;
+			const readNum = (v: any): number => {
+				if (typeof v === 'number' && isFinite(v) && v >= 0 && v <= 5) return v;
+				if (typeof v === 'string' && AT && typeof AT[v] === 'number') return AT[v];
+				return -1;
+			};
+			let n = readNum(e && e.hitStable);
+			if (n >= 0) return n;
+			try {
+				const dc: any = e && e.defaultConfig;
+				if (dc && typeof dc.get === 'function') { n = readNum(dc.get('hitStable')); if (n >= 0) return n; }
+			} catch (_) { /* ignore */ }
+			try {
+				const ec: any = e && e.enemyType && e.enemyType.entityConfig;
+				if (ec && typeof ec.get === 'function') { n = readNum(ec.get('hitStable')); if (n >= 0) return n; }
+			} catch (_) { /* ignore */ }
+			return -1;
+		} catch (_) { return -1; }
+	}
+
+	/** 1.76.x: same resolution plus a WRITE-BACK repair. When the entity's
+	 * hitStable is not a usable number but a config source resolves one, write
+	 * the number back onto the entity — the puppet's own NATIVE onDamage chain
+	 * (which runs for member-local hits) reads the raw field for its stagger
+	 * gate, so the repair fixes both our gate and the engine's. Rate-limited
+	 * one-shot diagnostic per entity so a recurring corruption is visible in
+	 * the console without flooding. */
+	private mpHitStableWithRepair(e: any): number {
+		try {
+			const direct = e && typeof e.hitStable === 'number' && isFinite(e.hitStable)
+				&& (e.hitStable as number) >= 0 && (e.hitStable as number) <= 5;
+			if (direct) return e.hitStable as number;
+			const n = this.mpResolveHitStable(e);
+			if (n >= 0) {
+				try { e.hitStable = n; } catch (_) { /* locked/readonly — gate still uses n */ }
+				try {
+					if (!(e as any)._mpHsRepairLogged) {
+						(e as any)._mpHsRepairLogged = true;
+						console.warn('[mpStagger] hitStable repaired uid=' + ((e as any)._mpUid || 0)
+							+ ' old=' + JSON.stringify((e as any).hitStable) + ' -> ' + n
+							+ ' state=' + ((e as any).currentState || '?'));
+					}
+				} catch (_) { /* ignore */ }
+				return n;
+			}
+			return 0;
+		} catch (_) { return 0; }
+	}
+
 	/** ROUND 33 (item 3): decide whether a member's hit should play the enemy's damage
 	 * flinch (硬直). Vanilla only staggers for an attack whose ATTACK_TYPE level beats the
 	 * enemy's poise (hitStable) — a weak UNCHARGED ball (LIGHT) has no hitstun, so it must
@@ -5189,11 +5732,14 @@ export class NetSync {
 	 * attack-type number (sc.ATTACK_TYPE 0..5) from the AttackInfo exactly like
 	 * forwardEnemyDamage does, then flinch only when typeNum > hitStable. Default-safe: any
 	 * missing/undeterminable info falls back to the old behaviour (flinch) EXCEPT an
-	 * identified weak uncharged ball (LIGHT), which never flinches. */
+	 * identified weak uncharged ball (LIGHT), which never flinches.
+	 * 1.76.x: the poise now resolves through mpHitStableWithRepair (string-tolerant,
+	 * config-backed, self-repairing) — the old `typeof !== number -> 0` fallback turned a
+	 * corrupted string field into "every member ball staggers the puppet". */
 	private shouldFlinchForHit(e: any, attackInfo?: any): boolean {
 		try {
 			if (!e) return false;
-			const stable = (typeof e.hitStable === 'number' && isFinite(e.hitStable)) ? e.hitStable : 0;
+			const stable = this.mpHitStableWithRepair(e);
 			let type = 2; // default MEDIUM (a plain melee hit)
 			let isBall = false;
 			const c: any = attackInfo;
@@ -5245,7 +5791,13 @@ export class NetSync {
 			if (!e || e._killed || e._mpDying) return false;
 			if (e._mpBossCinematic) return true; // already staged — not a "no cinematic" case
 			const mk = (e as any).manualKill;
-			if (typeof mk !== 'string' || !mk) return false;
+			if (typeof mk !== 'string' || !mk) {
+				// ROUND 139 (diag): the scripted-defeat staging was skipped — the puppet
+				// carried no manualKill var and the host stream shipped none either. The
+				// boss falls back to the generic 500ms death here (reads as "vanishes").
+				try { console.log('[mpBoss] no manualKill for puppet uid=' + (e._mpUid || 0) + ' type=' + (e.enemyName || '?') + ' name=' + (e.name || '') + ' mi=' + (e.mapId || 0)); } catch (_) { /* ignore */ }
+				return false;
+			}
 			e._mpBossCinematic = true;
 			e._mpBossCineAt = Date.now();
 			try { e.dying = (sc as any).DYING_STATE ? (sc as any).DYING_STATE.DYING : 2; } catch (_) { /* ignore */ }
@@ -5253,6 +5805,17 @@ export class NetSync {
 			try {
 				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
 				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
+			} catch (_) { /* ignore */ }
+			// 1.75.x (boss HP bar during the defeat cinematic): on the host the big
+			// boss bar hides the moment the BossDies event starts (force-combat
+			// drops / aggression flips), but the member puppet keeps its streamed
+			// target lock, so both bars (BigHpBar + under-feet StatusBar) stayed
+			// visible until the closing MANUAL_COMBATANT_KILL removed the corpse.
+			// Pin hpBar visibility to HIDDEN — both bar gates check it FIRST, and no
+			// stream-apply path rewrites it (netSync never writes visibility.hpBar).
+			try {
+				const HB: any = (sc as any).ENEMY_HP_BAR;
+				if (e.visibility) e.visibility.hpBar = (HB && typeof HB.HIDDEN === 'number') ? HB.HIDDEN : 2;
 			} catch (_) { /* ignore */ }
 			try { ig.vars.set(mk, true); } catch (_) { /* ignore */ }
 			// The member's own BossDies-style EventTrigger can never carry the event
@@ -5348,7 +5911,7 @@ export class NetSync {
 		} catch (_) { /* ignore */ }
 	}
 
-	private playPuppetDeath(e: any, doLootMirror: boolean): void {
+	private playPuppetDeath(e: any, doLootMirror: boolean, stages?: { boomMs: number, killMs: number }): void {
 		if (!e || e._killed || e._mpDying) return;
 		e._mpDying = true; // freeze AI + shield from block-apply/reap
 		// Round 16 (issue 7): the dying corpse must stop body-blocking the player —
@@ -5375,7 +5938,19 @@ export class NetSync {
 		// death sheet may not be resident yet for a just-adopted puppet (EffectSheet
 		// methods no-op on an unloaded sheet).
 		this.spawnDeathSheetFx(e, 'pre_die');
-		this._mpDeathQueue.push({ e: e, at: Date.now(), doLootMirror: doLootMirror });
+		// 1.76.x (corpse knockback parity): vanilla's Combatant.update times the death
+		// boom by the KILLING blow's damage-movement stun (onDamage upgrades it to at
+		// least MASSIVE = 0.55s, overkill raises it to 1s) and despawns after the 0.5s
+		// DYING sink. The old flat 220ms+280ms cut that window in half while the host's
+		// real corpse was still mid-slide. `stages` ships the vanilla windows from the
+		// predicted-kill site; every other staging (reap echo / boss stream / mirrors)
+		// keeps the old compressed FX-only timing.
+		const nowMs = Date.now();
+		this._mpDeathQueue.push({
+			e: e, at: nowMs, doLootMirror: doLootMirror,
+			boomAt: nowMs + ((stages && typeof stages.boomMs === 'number' && stages.boomMs >= 0) ? stages.boomMs : 220),
+			killWait: (stages && typeof stages.killMs === 'number' && stages.killMs >= 0) ? stages.killMs : 280,
+		});
 	}
 
 	/** Round 14 (fix 5): advance the delayed-death queue. Two-stage (fix 1): after
@@ -5408,14 +5983,15 @@ export class NetSync {
 			const q = this._mpDeathQueue[i];
 			const e = q.e;
 			if (!e || e._killed) { this._mpDeathQueue.splice(i, 1); continue; }
-			// Stage 1 (220ms after staging): play the death boom. Deliberately NOT killing
-			// in the same tick — the boom is attached to the puppet (5th arg), and
+			// Stage 1 (q.boomAt — 220ms for FX-echo stagings, the killing blow's vanilla
+			// fly-level stun for predicted kills): play the death boom. Deliberately NOT
+			// killing in the same tick — the boom is attached to the puppet (5th arg), and
 			// kill(true) -> clearEntityAttached -> Effect.onEntityKillDetach -> stop() would
 			// self-kill the effect before its first render (fix 1). Two-stage: boom now, then
-			// a silent kill once 280ms have elapsed — vanilla keeps the enemy in DYING ~0.5s
-			// after the boom starts, then kills.
+			// a silent kill once q.killWait have elapsed — vanilla keeps the enemy in DYING
+			// ~0.5s after the boom starts, then kills.
 			if (typeof e._mpBoomAt !== 'number') {
-				if (now - q.at < 220) continue;
+				if (now < q.boomAt) continue;
 				try {
 					e._mpTg = false; // let Combatant.onKill's setTarget(null) run (combat cleanup)
 					if (e.coll) {
@@ -5430,12 +6006,20 @@ export class NetSync {
 				} catch (_) { /* never crash the frame */ }
 				continue; // keep the entry across ticks; wait out the kill window
 			}
-			// Stage 2 (280ms after the boom): the corpse's FX window is over — silent kill
-			// (no loot/EXP/FX of its own; those are mirrored by the host's real kill).
-			if (now - e._mpBoomAt < 280) continue;
+			// Stage 2 (q.killWait after the boom): the corpse's FX window is over — silent
+			// kill (no loot/EXP/FX of its own; those are mirrored by the host's real kill).
+			if (now - e._mpBoomAt < q.killWait) continue;
 			this._mpDeathQueue.splice(i, 1);
 			try {
 				try { e.kill(true); } catch (_) { /* ignore */ }
+				// 1.76.x (corpse knockback parity): the predicted-kill path now KEEPS the
+				// dying puppet in the block/interp registry so streamed positions glide the
+				// corpse through its knockback — clean the entry HERE, at the true end of
+				// the window. Identity-guarded: reaped puppets and mirrors were already
+				// dropped from the registry, and this must never evict a respawned
+				// same-uid entry adopted after the memberKills fence expired.
+				const uidK = (e as any)._mpUid || 0;
+				if (uidK && this.puppets[uidK] === e) { delete this.puppets[uidK]; delete this.lastAnim[uidK]; }
 				if (q.doLootMirror) {
 					// MOVE of the member-side predicted-kill EXP/combat-rank mirror (was inline in
 					// onPreDamageModification): a puppet kill goes straight through kill(true),
@@ -5501,7 +6085,33 @@ export class NetSync {
 	 * back to the member via combatHit). This is "member attacks -> host enters
 	 * combat -> monsters attack member" in one packet.
 	 */
-	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number }): void {
+	/** 1.75.x (drill-boss chest-hit forwarding): resolve the real enemy's part
+	 * entity under the forwarded hit point so PARTS shields and PART_HIT reactions
+	 * see the same part the member's attack hit. Null = no matching part -> the
+	 * enemy root stays the damage target (legacy behaviour). */
+	private findHostEnemyPartAt(e: any, hx: number | undefined, hy: number | undefined): any | null {
+		try {
+			if (typeof hx !== 'number' || !isFinite(hx) || typeof hy !== 'number' || !isFinite(hy)) return null;
+			if (!e || !e.coll || !Array.isArray(e.coll.subColls) || !e.coll.subColls.length) return null;
+			const subs: any[] = e.coll.subColls;
+			let best: any = null;
+			let bestDist = 96 * 96; // generous lag tolerance (~3 blocks of interpolation)
+			for (let i = subs.length; i--;) {
+				const part: any = subs[i] && subs[i].entity;
+				const pc: any = part && part.coll;
+				if (!pc || !pc.pos || !pc.size) continue;
+				const px = pc.pos.x + pc.size.x / 2;
+				const py = pc.pos.y + pc.size.y / 2;
+				const dx = hx - px, dy = hy - py;
+				const d2 = dx * dx + dy * dy;
+				if (d2 <= bestDist) { best = part; bestDist = d2; }
+			}
+			return best;
+		} catch (_) { /* fall through to root */ }
+		return null;
+	}
+
+	private applyEnemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number, stunSteps?: Array<{ type: string, [k: string]: any }> }): void {
 		if (!this.main.host) return;                 // only the host owns real enemies
 		try {
 			const list = ig.game.entities;
@@ -5660,6 +6270,17 @@ export class NetSync {
 				&& (sc as any).AttackInfo && !target.params.isDefeated()) {
 				try {
 					const mirrorAny: any = mirror;
+					// 1.75.x (saw-suction fix): rebuild the member's real stunSteps so
+					// START_LOCK / BLOCK_XY / PULL & co. run on the host's real enemy.
+					// START_LOCK attaches enemy params to the ATTACKER's currentAction —
+					// the mirror is a lockEntity'd husk with none, so we lend it a fake
+					// action for the duration of target.damage() and restore it right
+					// after; the attached lock is released by a later END_LOCK hit or by
+					// releaseExpiredForwardedHolds (2.5s fallback).
+					const stunSteps = this.cleanForwardedStunSteps(hit.stunSteps);
+					const needsStartLock = !!(stunSteps && stunSteps.some((s: any) => s && s.type === 'START_LOCK'));
+					const prevCurrentAction = mirrorAny.currentAction;
+					let fakeActionSet = false;
 					mirrorAny._mpForcedDamage = dmg;
 					// ROUND 72 (crit style sync): the host chain rolls crit off the mirror
 					// husk's params, so member crits showed plain on the host. Carry the
@@ -5758,6 +6379,8 @@ export class NetSync {
 						// the engine skip every shield and count the hit toward break, exactly
 						// like the member's own white-number full hit already showed.
 						if ((hit.shield || 0) === 0) (infoOptions as any).guardable = 'NEVER';
+						// 1.75.x (saw-suction fix): the real attack's hold/pull stun steps.
+						if (stunSteps) infoOptions.stunSteps = stunSteps;
 						const info = new (sc as any).AttackInfo(mirrorAny.params, infoOptions, isBall);
 						// ROUND 32 (item 3c): mark the fabricated AttackInfo as a ball when the
 						// real attack was one, so the engine's ball-vs-melee branches (fly level,
@@ -5833,7 +6456,35 @@ export class NetSync {
 									+ ' summon=' + (trS ? Math.round(trS.current) + '/' + trS.target : 'nil')
 									+ ' shieldName=' + ((target.shield && target.shield.name) || 'none'));
 							} catch (_) { /* ignore */ }
-							applied = target.damage(mirror, info, target) !== false;
+							// Lend the lockEntity'd mirror a fake currentAction so
+							// START_LOCK.preHit (params.startLock(attacker)) can actually
+							// attach. The lock itself lives on mirror.actionAttached and
+							// survives restoring currentAction; END_LOCK or the 2.5s
+							// fallback releases it.
+							if (needsStartLock && !mirrorAny.currentAction) {
+								mirrorAny.currentAction = { name: 'mpHoldAction' };
+								fakeActionSet = true;
+							}
+							if (needsStartLock) {
+								try { target._mpForwardedHold = { mirror: mirrorAny, until: Date.now() + 2500 }; }
+								catch (_) { /* fallback lock cleanup only */ }
+							}
+							// 1.76.x (false-stagger insurance): the engine's stagger gate
+							// compares the RAW hitStable field (`this.hitStable >= attackType`).
+							// If it ever holds a non-number, EVERY forwarded hit staggers the
+							// real enemy regardless of poise — repair it from the configs so
+							// the gate sees the same numbers the host's own hits see.
+							this.mpHitStableWithRepair(target);
+							applied = target.damage(mirror, info, this.findHostEnemyPartAt(target, hit.hx, hit.hy) || target) !== false;
+							// END_LOCK (or a shielded/refused hit) may already have
+							// released the lock — only keep the fallback while the enemy
+							// params really are still locked by this mirror.
+							try {
+								if (target.params && typeof target.params.isLockedBy === 'function'
+									&& !target.params.isLockedBy(mirrorAny)) {
+									delete target._mpForwardedHold;
+								}
+							} catch (_) { /* ignore */ }
 							try {
 								const trH2 = target.trackers && target.trackers['heatHits'];
 								const trN2 = target.trackers && target.trackers['nonShieldHitCount'];
@@ -5887,6 +6538,9 @@ export class NetSync {
 						if (mirrorAny.coll && mirrorAny.coll.vel) {
 							mirrorAny.coll.vel.x = prevVelX;
 							mirrorAny.coll.vel.y = prevVelY;
+						}
+						if (fakeActionSet) {
+							try { mirrorAny.currentAction = prevCurrentAction; } catch (_) { /* ignore */ }
 						}
 						// ROUND 80: never leave force/style stashes on the mirror — a
 						// stale stamp would let a future stray mirrored projectile through
@@ -6697,7 +7351,13 @@ export class NetSync {
 			// visual never depends on loot eligibility.
 			try {
 				const puppet = this.puppets[loot.uid];
-				if (puppet && !puppet._killed && !puppet._mpDying) this.playPuppetDeath(puppet, true);
+				// ROUND 139: a puppet mid boss-defeat-cinematic (_mpBossCinematic) is owned
+				// by that cutscene — its own MANUAL_COMBATANT_KILL removes the corpse. The
+				// loot packet lands DURING the member's replay (the host relays it at ITS
+				// cinematic's kill step), so the beacon's generic death would race the
+				// cinematic and pop the corpse mid-scene. Skip it; the 20s watchdog in
+				// processDeathQueue covers a wedged cinematic.
+				if (puppet && !puppet._killed && !puppet._mpDying && !puppet._mpBossCinematic) this.playPuppetDeath(puppet, true);
 			} catch (_) { /* ignore */ }
 			const scAny: any = sc as any;
 			const pm: any = scAny.model && scAny.model.player;
@@ -6767,9 +7427,17 @@ export class NetSync {
 			if (!synced) {
 				const localMap = String((ig.game && (ig.game as any).mapName) || '');
 				if (typeof kill.map !== 'string' || !kill.map || kill.map !== localMap) return;
+				// 1.75.1 (monster codex parity): the same-scope host-confirmed kill also
+				// advances OUR 怪物图鉴 counters (the engine's own kill accounting only
+				// runs on the host).
+				this.mirrorEnemyKillStatsByName(kill.enemy);
 				q.onCombatEvent({ enemyName: kill.enemy }, ev.DEFEATED);
 				return;
 			}
+			// 1.75.1: story-sync kills count party-wide — mirror the 怪物图鉴 counter
+			// for leader and view-only member alike (the native kill chain only ever
+			// ran on the instance host).
+			this.mirrorEnemyKillStatsByName(kill.enemy);
 			// ROUND 124 (quest-scope fix): while a story sync runs, a RELAYED kill must
 			// not advance any NON-SELECTED quest on either side. Member side there is
 			// nothing to pump at all: the synced quest is view-only (the leader's state
@@ -6795,6 +7463,32 @@ export class NetSync {
 				if (typeof story.markStateDirty === 'function') story.markStateDirty();
 			}
 		} catch (_) { /* never let a quest relay crash the frame */ }
+	}
+
+	/** 1.75.1 (monster codex parity): replicate the codex-relevant accounting of
+	 * sc.combat.notifyCombatantDefeated (game.compiled.js) for a host-confirmed enemy
+	 * kill: combat.totalKilled, combat.kill<enemyName> and the enemy/report completion
+	 * rates. Members kill puppets with kill(true), which bypasses the engine death
+	 * chain entirely, so without this their 怪物图鉴 counters stay 0. The call rides
+	 * the existing host-authoritative questKill relay (sender is excluded, so the host
+	 * never double-counts), which is why killStreak / aiGroup / boosted / loot are
+	 * deliberately NOT touched here — those have their own mirror paths and a delayed
+	 * killStreak bump would survive the combat-end reset. */
+	private mirrorEnemyKillStatsByName(name: string): void {
+		try {
+			if (typeof name !== 'string' || !name) return;
+			const scAny: any = sc as any;
+			const combat: any = scAny.combat;
+			if (!scAny.stats || !combat) return;
+			scAny.stats.addMap('combat', 'totalKilled', 1);
+			const prev = scAny.stats.getMap('combat', 'kill' + name) || 0;
+			scAny.stats.setMap('combat', 'kill' + name, Math.max(1, prev + 1));
+			if (typeof combat.updateCombatCompletionData === 'function') {
+				combat.updateCombatCompletionData();
+			} else if (typeof combat.getTotalEnemiesFound === 'function') {
+				scAny.stats.setMap('combat', 'enemyCompletionRate', combat.getTotalEnemiesFound(true));
+			}
+		} catch (_) { /* codex accounting must never break a quest relay */ }
 	}
 
 	/** ROUND 33 (item 2b): HOST-side observer (ig.SoundHelper.playAtEntity wrap).
@@ -7086,19 +7780,310 @@ export class NetSync {
 	}
 
 	// ---- ROUND 74 (plant destruct sync) ----
-	/** The local player just destroyed a map destructible (the ItemDestruct.destroy inject
-	 * above calls this). Broadcast its stable mapId so every other same-instance client
-	 * destroys its own intact copy. The connector's syncEmit skips the packet while we are
-	 * the only member of our instance (pure upload waste). */
+	/** The local player just destroyed a map destructible (the ItemDestruct/Destructible
+	 * destroy injects above call this) or melted a RegenDestruct (melt-and-reform ice
+	 * pillar). Broadcast its stable mapId so every other same-instance client destroys /
+	 * melts its own intact copy. The connector's syncEmit skips the packet while we are
+	 * the only member of our instance (pure upload waste).
+	 * 1.75.x: KEY-LOCKED blocks (key walls / key pillars / master-key walls and the
+	 * AR pillars they range-kill) are the one exception — they stay strictly
+	 * per-player, so one player spending a dungeon key never removes another
+	 * player's locked block. */
 	public broadcastPlantBreak(plant: any): void {
 		try {
+			if (this.isKeyLockedDestructible(plant)) return; // key locks: local-only, never relayed
 			const mapId = plant && plant.mapId;
 			if (!mapId) return;
+			// 1.75.x (destructible persistence): record every break so re-entering
+			// the map keeps it destroyed — vanilla's respawn var expires after 300s
+			// and the relay below only reaches clients currently on this map. The
+			// record is mirrored into vars.storage.map._mpDestroyedProps, so it also
+			// survives save/quit/load.
+			this.recordDestroyedProp(this.mapName, mapId, plant);
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
 			if (typeof conn.plantBreak !== 'function') return;
 			conn.plantBreak({ map: this.mapName, mapId });
 		} catch (_) { /* never break the destroy chain */ }
+	}
+
+	/** 1.75.x (destructible persistence): mapName -> mapId set of destroyed
+	 * destructibles (ItemDestruct plants/rocks, gimmick Destructible rocks/ice
+	 * blocks). Re-applied on every map entry by reapplyDestroyedProps and mirrored
+	 * into the save's map vars (_mpDestroyedProps), so the destroyed state survives
+	 * leaving the map AND full save/quit/load cycles. RegenDestruct melt-reform
+	 * pillars are deliberately EXCLUDED — their regen is a puzzle mechanic — and
+	 * key-locked Destructibles are excluded because each player unlocks their own. */
+	public destroyedProps: Record<string, Record<number, true>> = {};
+
+	/** Save key under vars.storage.map / vars.storage.maps[map] holding the
+	 * comma-separated destroyed mapIds. Written directly into the storage object
+	 * (never through ig.vars.set) so neither the spawn-var nor the story-sync
+	 * relay can carry this per-player state to anyone else. */
+	private static readonly MP_DESTROYED_PROPS_KEY = '_mpDestroyedProps';
+
+	/** Key-locked dungeon destructibles (DUNGEON_KEY / DUNGEON_MASTER_KEY walls
+	 * and pillars, plus the keyPillarAR blocks range-killed by a key pillar) must
+	 * NEVER cross clients: each player consumes their own key and keeps their own
+	 * lock state (vanilla already persists that per-player var). */
+	public isKeyLockedDestructible(e: any): boolean {
+		try {
+			if (!e) return false;
+			if (e.keyConsume) return true;                     // keyWall* / keyPillar / masterKeyWall*
+			if (e.range && e.range.key === 'KEY_PILLAR') return true; // keyPillarAR chain
+			return false;
+		} catch (_) { return false; }
+	}
+
+	/** Rebuild the current map's set of key-locked Destructible mapIds (used by
+	 * isKeyLockedDestructVar to keep those entities' vanilla perma vars local). */
+	private rebuildKeyLockedMapIds(): void {
+		this._mpKeyLockedMapIdSet = Object.create(null);
+		this._mpKeyLockedVarSet = Object.create(null);
+		const liveMap = ((ig.game as any).mapName || this.mapName || '') as string;
+		this._mpKeyLockedMapIdSetMap = liveMap;
+		try {
+			const seen: { [id: string]: true } = Object.create(null);
+			const collect = (e: any) => {
+				if (!e || !e.mapId || seen[e.mapId] || !this.isKeyLockedDestructible(e)) return;
+				seen[e.mapId] = true;
+				this._mpKeyLockedMapIdSet[Math.round(Number(e.mapId))] = true;
+				// Also keep the block's own unlock counter vars local (e.g.
+				// map.locksOpened / map.keyUsed / map.masterDoorOpened) — otherwise
+				// storySync would open the teammate's barrier even though their wall
+				// is still locked.
+				for (const raw of [e.onPreDestructIncrease, e.onDestructIncrease]) {
+					if (typeof raw !== 'string' || !raw) continue;
+					try {
+						const rk = this.resolveSpawnVar(raw);
+						if (rk && rk.b && rk.k) this._mpKeyLockedVarSet[rk.b.replace(/\./g, '/') + '|' + rk.k] = true;
+					} catch (_) { /* ignore */ }
+				}
+			};
+			const ents: any[] = (ig.game && (ig.game as any).entities) || [];
+			for (let i = 0; i < ents.length; i++) collect(ents[i]);
+			// mapEntities keeps entries for blocks the engine already killed at
+			// spawn (own unlock), which the live entity list may have dropped.
+			const mapEnts: any = (ig.game && (ig.game as any).mapEntities) || {};
+			for (const id in mapEnts) collect(mapEnts[id]);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** True when bucket/key is the vanilla perma-destruct var of a KEY-LOCKED
+	 * Destructible (map._entity<id>_destroyed). Only positively judged for the
+	 * CURRENT map (the map whose entities we can inspect); other maps' vars keep
+	 * their normal relay behaviour. Public for storySync's map-var relay. */
+	public isKeyLockedDestructVar(bucket: string, key: string): boolean {
+		try {
+			if (!bucket || !key) return false;
+			const m = /^_entity(\d+)_destroyed$/.exec(key);
+			if (!m) return false;
+			const mapId = parseInt(m[1], 10);
+			if (!isFinite(mapId) || mapId <= 0) return false;
+			const vars: any = (ig as any).vars;
+			const camel = (vars && vars.currentLevelName) || '';
+			if (!camel) return false;
+			// netSync uses dots for wire buckets; storySync keeps the camel slashes.
+			const bucketDots = 'maps.' + camel.replace(/\//g, '.');
+			if (bucket !== bucketDots && bucket !== 'maps.' + camel) return false;
+			const liveMap = ((ig.game as any).mapName || this.mapName || '') as string;
+			if ((this._mpKeyLockedMapIdSetMap || '') !== (liveMap || '')) this.rebuildKeyLockedMapIds();
+			if (this._mpKeyLockedMapIdSet[mapId]) return true;
+			const ent = (ig.game as any).getEntityByMapId && (ig.game as any).getEntityByMapId(mapId);
+			return this.isKeyLockedDestructible(ent);
+		} catch (_) { return false; }
+	}
+
+	/** True when bucket/key belongs to the PER-PLAYER key-lock domain: either the
+	 * vanilla perma var of a key-locked block (isKeyLockedDestructVar) or one of
+	 * the unlock-counter vars its destruction writes (onPreDestructIncrease /
+	 * onDestructIncrease, e.g. map.locksOpened). Bucket separators are normalized
+	 * so netSync's dot form and storySync's slash form match the same map. */
+	public isKeyLockedPerPlayerVar(bucket: string, key: string): boolean {
+		try {
+			if (this.isKeyLockedDestructVar(bucket, key)) return true;
+			if (!bucket || !key) return false;
+			const liveMap = ((ig.game as any).mapName || this.mapName || '') as string;
+			if ((this._mpKeyLockedMapIdSetMap || '') !== (liveMap || '')) this.rebuildKeyLockedMapIds();
+			const norm = String(bucket).replace(/\./g, '/') + '|' + key;
+			return !!this._mpKeyLockedVarSet[norm];
+		} catch (_) { return false; }
+	}
+
+	/** 1.75.x (master-door unlock cutscene stays per-player): true when a
+	 * trigger's raw startCondition references one of THIS map's key-lock unlock
+	 * counters (map.masterDoorOpened / map.keyUsed / map.locksOpened ... — the
+	 * vars collected into _mpKeyLockedVarSet from the key-locked destructibles'
+	 * onPreDestructIncrease/onDestructIncrease). A cutscene armed by such a var
+	 * documents a LOCAL key spend, so it must play per client: relaying it let
+	 * keyless teammates watch (and gather-teleport into) an unlock they never
+	 * paid for. */
+	public isKeyLockGateCondition(cond: any): boolean {
+		try {
+			if (typeof cond !== 'string' || cond.indexOf('map.') === -1) return false;
+			const liveMap = ((ig.game as any).mapName || this.mapName || '') as string;
+			if ((this._mpKeyLockedMapIdSetMap || '') !== (liveMap || '')) this.rebuildKeyLockedMapIds();
+			const re = /map\.([A-Za-z0-9_]+)/g;
+			let m: RegExpExecArray | null;
+			while ((m = re.exec(cond))) {
+				const name = m[1];
+				for (const entry in this._mpKeyLockedVarSet) {
+					if (entry.slice(entry.indexOf('|') + 1) === name) return true;
+				}
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** Resolve the map-var bucket a destructible record is persisted in. Current
+	 * map -> vars.storage.map (the live alias); another visited map -> its
+	 * vars.storage.maps entry. Returns null when the bucket doesn't exist. */
+	private getDestroyedPropsStorageBucket(map: string): any {
+		try {
+			const vars: any = (ig as any).vars;
+			if (!vars || !vars.storage) return null;
+			if (map === this.mapName && vars.storage.map) return vars.storage.map;
+			if (!vars.storage.maps) return null;
+			return vars.storage.maps[storageMapKey(map)] || null;
+		} catch (_) { return null; }
+	}
+
+	/** Merge the save-persisted destroyed-mapId list for `map` into the in-memory
+	 * record. Called by reapplyDestroyedProps on every map entry, so records made
+	 * in a previous game session stay effective after a full restart. */
+	private loadPersistedDestroyedProps(map: string): void {
+		try {
+			if (!map) return;
+			const rec = this.destroyedProps[map] || (this.destroyedProps[map] = {});
+			const bucket = this.getDestroyedPropsStorageBucket(map);
+			if (!bucket) return;
+			const raw = bucket[NetSync.MP_DESTROYED_PROPS_KEY];
+			if (typeof raw !== 'string' || !raw) return;
+			for (const part of raw.split(',')) {
+				const id = parseInt(part, 10);
+				if (isFinite(id) && id > 0) rec[id] = true;
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Write the in-memory record for `map` back into its save-var bucket. Direct
+	 * storage write: bypasses the hooked vars API so this never re-relays. */
+	private persistDestroyedProps(map: string): void {
+		try {
+			if (!map) return;
+			const bucket = this.getDestroyedPropsStorageBucket(map);
+			if (!bucket) return;
+			const rec = this.destroyedProps[map];
+			const ids: number[] = [];
+			if (rec) {
+				for (const k in rec) {
+					const id = parseInt(k, 10);
+					if (isFinite(id) && id > 0) ids.push(id);
+				}
+			}
+			ids.sort((a, b) => a - b);
+			if (ids.length) {
+				bucket[NetSync.MP_DESTROYED_PROPS_KEY] = ids.join(',');
+			} else {
+				delete bucket[NetSync.MP_DESTROYED_PROPS_KEY];
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Records a destroyed destructible. `ent` is the live entity when available
+	 * (sender side / same-map receiver) — then the type is verified, regen pillars
+	 * and key-locked blocks are skipped. Null ent (cross-map relay) records
+	 * unconditionally; the re-apply resolves the real type from the spawned entity
+	 * instead and drops key-locked records there. */
+	private recordDestroyedProp(map: string, mapId: number, ent: any): void {
+		try {
+			if (!map || typeof mapId !== 'number' || !isFinite(mapId)) return;
+			if (ent) {
+				const ID: any = (ig.ENTITY as any).ItemDestruct;
+				const DE: any = (ig.ENTITY as any).Destructible;
+				const RD: any = (ig.ENTITY as any).RegenDestruct;
+				if (RD && ent instanceof RD) return;
+				if (this.isKeyLockedDestructible(ent)) return;
+				if (!((ID && ent instanceof ID) || (DE && ent instanceof DE))) return;
+			}
+			const rec = this.destroyedProps[map] || (this.destroyedProps[map] = {});
+			rec[Math.round(mapId)] = true;
+			this.persistDestroyedProps(map);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Re-apply every recorded destruction after the map's entities spawned
+	 * (called from netSync.tick's map-change branch and redundantly by
+	 * OnMapLoadedListener). This is the SILENT path — no boom/debris FX and no loot
+	 * (both already happened on the original break): ItemDestruct gets setDropped()
+	 * + the vanilla respawn/perma/trigger vars; gimmick Destructibles get the
+	 * perma-reentry path (perma var once, then kill(true)).
+	 * 1.75.x: save-persisted records are merged first, so the state survives a
+	 * full game restart; key-locked blocks found in stale records are dropped. */
+	public reapplyDestroyedProps(): void {
+		try {
+			this.loadPersistedDestroyedProps(this.mapName);
+			const rec = this.destroyedProps[this.mapName];
+			if (!rec) return;
+			const ID: any = (ig.ENTITY as any).ItemDestruct;
+			const DE: any = (ig.ENTITY as any).Destructible;
+			const RD: any = (ig.ENTITY as any).RegenDestruct;
+			let pruned = false;
+			for (const key in rec) {
+				const mapId = +key;
+				let ent: any = null;
+				try { ent = (ig.game as any).getEntityByMapId && (ig.game as any).getEntityByMapId(mapId); } catch (_) { /* ignore */ }
+				if (!ent) {
+					// A key-locked id whose entity is gone from the live map should
+					// not linger in the shared record either.
+					if ((this._mpKeyLockedMapIdSetMap || '') !== (((ig.game as any).mapName || this.mapName || '') as string)) this.rebuildKeyLockedMapIds();
+					if (this._mpKeyLockedMapIdSet[mapId]) {
+						delete rec[key];
+						pruned = true;
+					}
+					continue;
+				}
+				// Key-locked blocks are per-player: never kill them from the shared
+				// record. Drop stale entries old clients may have recorded — even when
+				// the block is already gone (the player unlocked it themselves), so the
+				// stale id can never poison a future map/save state.
+				if (this.isKeyLockedDestructible(ent)) {
+					delete rec[key];
+					pruned = true;
+					continue;
+				}
+				if (ent._killed) continue;
+				try {
+					if (RD && ent instanceof RD) continue; // regen pillar — never persisted
+					if (ID && ent instanceof ID) {
+						if (ent.dropped) continue;
+						ent.setDropped();
+						try { (ig as any).vars.set(ent._getVarPrefix() + '.respawnTime', (sc as any).combat.time + 300); } catch (_) { /* ignore */ }
+						try { if (ent.permaDeath) (ig as any).vars.set('map.itemDestructPerma' + ent.mapId, true); } catch (_) { /* ignore */ }
+						try { if (ent.trigger && !(ig as any).vars.get(ent.trigger)) (ig as any).vars.set(ent.trigger, true); } catch (_) { /* ignore */ }
+					} else if (DE && ent instanceof DE) {
+						if (ent.effects && (ent.effects.boomHandle || ent.effects.preHandle)) continue; // mid-destruction already
+						// Only run the vanilla var chain for permaDestruct blocks that
+						// the engine didn't already kill from its own var (that path
+						// leaves _killed set and is skipped above). For non-perma
+						// blocks, running setVariables() again would keep incrementing
+						// onDestructIncrease on EVERY re-entry — the counter was already
+						// paid on the original destruction, so here we just kill.
+						if (ent.permaDestruct) {
+							ent.varState = 1;
+							try { ent.setVariables(); } catch (_) { /* ignore */ }
+						}
+						ent.varState = 2;
+						try { ent.kill(true); } catch (_) { /* ignore */ }
+					}
+				} catch (_) { /* one bad prop must not stop the rest */ }
+			}
+			if (pruned) this.persistDestroyedProps(this.mapName);
+			// Always re-persist once per pass: records made for this map while we were
+			// standing elsewhere (bucket missing at record time) only get their save
+			// entry once the bucket exists — i.e. now that we are on the map.
+			this.persistDestroyedProps(this.mapName);
+		} catch (_) { /* never break map load */ }
 	}
 
 	/** A same-instance player destroyed a plant — destroy OUR copy at the same mapId if it
@@ -7107,22 +8092,60 @@ export class NetSync {
 	 * player's stats), the propsDestroyed count, the per-mapId respawn var and the trigger
 	 * var. Idempotent: an already-dropped / absent plant is a no-op. The enemy-spawn roll
 	 * (rare cold-dungeon destructibles) is suppressed on the receiver — the enemy already
-	 * spawned on the sender, and a second local spawn would be an unsynced ghost. */
+	 * spawned on the sender, and a second local spawn would be an unsynced ghost.
+	 * 1.75.1: RegenDestruct (melt-and-reform ice pillars) rides the same relay — the
+	 * receiver melts its intact copy via its own destroy(), so the REFREEZE time is
+	 * still judged locally by the receiver's own regen timer. */
 	public applyPlantBreak(data: { map: string, mapId: number }): void {
 		try {
 			if (!data || typeof data.mapId !== 'number' || !isFinite(data.mapId)) return;
-			if (data.map && data.map !== this.mapName) return; // a plant on a map we already left
 			const ID: any = (ig.ENTITY as any).ItemDestruct;
 			const DE: any = (ig.ENTITY as any).Destructible;
-			const plant = ig.game && typeof (ig.game as any).getEntityByMapId === 'function'
-				? (ig.game as any).getEntityByMapId(Math.round(data.mapId)) : null;
-			if (!plant || (!(plant instanceof ID) && !(DE && plant instanceof DE))) return;
+			const RD: any = (ig.ENTITY as any).RegenDestruct;
+			// Resolve the entity only when the event names OUR map — a mapId lookup
+			// while standing on a different map could hit an unrelated entity that
+			// happens to share the numeric id.
+			let plant: any = null;
+			if (data.map && data.map === this.mapName) {
+				try {
+					plant = ig.game && typeof (ig.game as any).getEntityByMapId === 'function'
+						? (ig.game as any).getEntityByMapId(Math.round(data.mapId)) : null;
+				} catch (_) { /* ignore */ }
+			}
+			// Key-locked blocks (key walls / key pillars / master-key walls / AR
+			// pillars) are strictly per-player: one player's unlock must neither
+			// remove the other player's block nor enter the persistence record.
+			if (plant && this.isKeyLockedDestructible(plant)) return;
+			// 1.75.x (persistence): record BEFORE the same-map gate — a break that
+			// happened while we stood on another map must still apply when we enter
+			// it later (reapplyDestroyedProps on map load). Cross-map key-lock
+			// entries from OLD clients are resolved + dropped there.
+			this.recordDestroyedProp(data.map || '', Math.round(data.mapId), plant);
+			if (data.map && data.map !== this.mapName) return; // a plant on a map we already left
+			if (!plant || (!(plant instanceof ID) && !(DE && plant instanceof DE) && !(RD && plant instanceof RD))) return;
 			if (plant._killed) return; // already destroyed — nothing to do
+			// 1.75.1: melt-and-reform RegenDestruct — melt the still-intact copy, but let
+			// the receiver's own regenMaxTime decide when it refreezes (no regen relay).
+			if (RD && plant instanceof RD) {
+				if (plant.regenTimer) return; // already melted / waiting to regen
+				if (plant.effects && (plant.effects.boomHandle || plant.effects.hideHandle)) return;
+				if (plant.coll && typeof plant.coll.size.z === 'number' && plant.coll.size.z <= 0) return;
+				plant._mpSyncedDestroy = true;   // the destroy inject sees this and skips re-broadcast
+				try { plant.destroy(); } catch (_) { plant._mpSyncedDestroy = false; }
+				return;
+			}
 			// 1.73.x: gimmick Destructibles (bomb rocks etc.) — same mapId relay, same
 			// vanilla chain (boom/debris/vars) with the enemy-spawn roll suppressed.
 			if (DE && plant instanceof DE) {
 				const savedEnemyInfo = plant.enemyInfo;
 				plant.enemyInfo = null;
+				// Mirror the vanilla local-destruction bookkeeping too: startDestruction
+				// leaves varState=1 before destroy(), so destroy() -> setVariables()
+				// persists permaDestruct blocks into map._entity<id>_destroyed (saved)
+				// and pays onDestructIncrease on OUR copy exactly once. Before this the
+				// receiver skipped that chain, which is why synced blocks came back
+				// after save/quit/load.
+				plant.varState = 1;
 				plant._mpSyncedDestroy = true;   // the destroy inject sees this and skips re-broadcast
 				try { plant.destroy(); } catch (_) { plant._mpSyncedDestroy = false; }
 				plant.enemyInfo = savedEnemyInfo;
@@ -7141,6 +8164,99 @@ export class NetSync {
 			plant.enemyInfo = savedEnemyInfo;
 			plant.enemyChance = savedEnemyChance;
 		} catch (_) { /* never break the frame */ }
+	}
+
+	/** ROUND 141 (prop hit-FX sync, SENDER): the local ballHit wrap just accepted a
+	 * hit on a map destructible — the vanilla impact flash (sc.combat.showHitEffect)
+	 * played here. Relay the impact so every other same-instance client replays the
+	 * flash on its own copy of the prop (their player-ball puppets are collision-
+	 * IGNORE neutered, so their ballHit never fires for teammates' attacks).
+	 * Gates: key-locked blocks stay per-player (same rule as plantBreak); replayed
+	 * balls/mirrors (_mpPlayerBall/_mpProj/_mpMirror) never re-broadcast. The attack
+	 * type is replicated per class exactly like the vanilla call sites: ItemDestruct
+	 * always HEAVY, RegenDestruct always MASSIVE, Destructible LIGHT/MEDIUM by charge
+	 * and MASSIVE on the fatal hit (hitCount already decremented when we run). */
+	public observeLocalPropBallHit(prop: any, attacker: any): void {
+		try {
+			if (!prop || !attacker) return;
+			const mapId = Math.round(Number(prop.mapId) || 0);
+			if (!mapId) return;
+			if (this.isKeyLockedDestructible(prop)) return;
+			if (attacker._mpPlayerBall || attacker._mpProj || attacker._mpMirror) return;
+			try {
+				const cbt: any = typeof attacker.getCombatant === 'function' ? attacker.getCombatant() : attacker.combatant;
+				if (cbt && cbt._mpMirror) return;
+			} catch (_) { /* ignore */ }
+			const conn: any = this.main.connection;
+			if (!conn || !conn.isOpen() || typeof conn.propHitFx !== 'function') return;
+			const AT: any = (sc as any).ATTACK_TYPE;
+			if (!AT) return;
+			// Hit center exactly like the vanilla ballHit (attacker.getHitCenter(prop));
+			// fall back to the prop's own center when the helper is unavailable.
+			let x = 0, y = 0, z = 0, havePos = false;
+			try {
+				const hc: any = typeof attacker.getHitCenter === 'function' ? attacker.getHitCenter(prop) : null;
+				if (hc && typeof hc.x === 'number' && typeof hc.y === 'number') {
+					x = hc.x; y = hc.y; z = (typeof hc.z === 'number') ? hc.z : 0; havePos = true;
+				}
+			} catch (_) { /* fall through to the prop-center fallback */ }
+			if (!havePos) {
+				try {
+					const c = prop.getCenter ? prop.getCenter() : null;
+					if (c) { x = c.x; y = c.y; z = prop.coll ? prop.coll.pos.z : 0; }
+				} catch (_) { /* ignore */ }
+			}
+			const el: number = (function (a: any): number {
+				try { if (a && typeof a.getElement === 'function') { const v = Number(a.getElement()); if (isFinite(v) && v >= 0 && v <= 4) return Math.round(v); } } catch (_) { /* ignore */ }
+				return 0;
+			})(attacker);
+			let at: number;
+			const ID: any = (ig.ENTITY as any).ItemDestruct, RD: any = (ig.ENTITY as any).RegenDestruct;
+			if (ID && prop instanceof ID) at = AT.HEAVY;
+			else if (RD && prop instanceof RD) at = AT.MASSIVE;
+			else {
+				const chg = !!(attacker.attackInfo && typeof attacker.attackInfo.hasHint === 'function' && attacker.attackInfo.hasHint('CHARGED'));
+				at = chg ? AT.MEDIUM : AT.LIGHT;
+				if (typeof prop.hitCount === 'number' && prop.hitCount <= 0) at = AT.MASSIVE; // fatal hit
+			}
+			conn.propHitFx({
+				map: this.mapName, mapId,
+				x: Math.round(x), y: Math.round(y), z: Math.round(z),
+				el, at,
+			});
+		} catch (_) { /* never break the hit chain */ }
+	}
+
+	/** ROUND 141 (prop hit-FX sync, RECEIVER): a teammate's ball/melee hit a map
+	 * destructible — replay the vanilla impact flash (sc.combat.showHitEffect) at the
+	 * relayed hit position on OUR intact copy of the prop. Skipped when our copy is
+	 * already gone / mid-destruction (a floating flash reads as a glitch); the break
+	 * itself still arrives via the plantBreak relay right behind this. Cosmetic only. */
+	public applyPropHitFx(data: { map: string, mapId: number, x: number, y: number, z: number, el: number, at: number }): void {
+		try {
+			if (!data || typeof data.mapId !== 'number') return;
+			if (!data.map || data.map !== this.mapName) return;
+			const prop: any = (ig.game as any) && typeof (ig.game as any).getEntityByMapId === 'function'
+				? (ig.game as any).getEntityByMapId(Math.round(data.mapId)) : null;
+			if (!prop || prop._killed) return;
+			const ID: any = (ig.ENTITY as any).ItemDestruct, DE: any = (ig.ENTITY as any).Destructible, RD: any = (ig.ENTITY as any).RegenDestruct;
+			const isID = !!(ID && prop instanceof ID), isDE = !!(DE && prop instanceof DE), isRD = !!(RD && prop instanceof RD);
+			if (!isID && !isDE && !isRD) return;
+			if (this.isKeyLockedDestructible(prop)) return;
+			if (isID && prop.dropped) return;
+			if (isDE && prop.effects && (prop.effects.boomHandle || prop.effects.preHandle)) return;
+			if (isRD) {
+				if (prop.regenTimer) return;
+				if (prop.effects && (prop.effects.boomHandle || prop.effects.hideHandle)) return;
+				if (prop.coll && typeof prop.coll.size.z === 'number' && prop.coll.size.z <= 0) return;
+			}
+			const AT: any = (sc as any).ATTACK_TYPE || {};
+			const maxAt = (typeof AT.MASSIVE === 'number') ? AT.MASSIVE : 4;
+			const at = (typeof data.at === 'number' && data.at >= 0 && data.at <= maxAt) ? data.at : (AT.NONE || 0);
+			const el = (typeof data.el === 'number' && data.el >= 0 && data.el <= 4) ? Math.round(data.el) : 0;
+			if (!(sc as any).combat || typeof (sc as any).combat.showHitEffect !== 'function') return;
+			(sc as any).combat.showHitEffect(prop, { x: data.x, y: data.y, z: data.z }, at, el, false, false, true);
+		} catch (_) { /* cosmetic — never break the frame */ }
 	}
 
 	// ---- ROUND 100 (drop-pickup visibility) ----
@@ -7449,6 +8565,364 @@ export class NetSync {
 		console.log('[netsync] SHOW_EXTERN_ANIM relay hook installed');
 	}
 
+	/** 1.75.x (per-player quest encounters, e.g. 深度呵护): wraps Enemy.show so the
+	 * member notices the exact frame a tmp.quest_* map enemy becomes visible. Such
+	 * enemies are per-player quest waves — the host's own copy is hidden unless the
+	 * HOST also runs that encounter, so any prior host adoption must be released and
+	 * the enemy must become owner-local (AI restored, streamed via cutsceneEntity). */
+	private installQuestEnemyShowHook(): void {
+		try {
+			const ENR: any = (ig.ENTITY as any).Enemy;
+			if (!ENR || !ENR.prototype || typeof ENR.prototype.show !== 'function'
+				|| ENR.prototype._mpQuestShowWrapped) return;
+			ENR.prototype._mpQuestShowWrapped = true;
+			const origShow = ENR.prototype.show;
+			ENR.prototype.show = function (this: any, ...args: any[]) {
+				const r = origShow.apply(this, args);
+				try {
+					const m = (window as any).__mpMain;
+					const ns = m && m.netSync;
+					if (ns && typeof ns.onQuestEnemyShown === 'function') {
+						ns.onQuestEnemyShown(this);
+					}
+				} catch (_) { /* never break the engine show */ }
+				return r;
+			};
+			console.log('[netsync] quest-enemy show hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (quest enemy AR labels): wraps ACTION_STEP.SHOW_AR_MSG.start so a REAL
+	 * enemy action's floating window is relayed to teammates. Receiver replays build
+	 * ARBox directly, so replay boxes never re-enter this hook. */
+	private installEnemyArMsgHook(): void {
+		try {
+			const AST: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.SHOW_AR_MSG;
+			if (!AST || !AST.prototype || typeof AST.prototype.start !== 'function'
+				|| AST.prototype._mpArMsgWrapped) return;
+			AST.prototype._mpArMsgWrapped = true;
+			const origStart = AST.prototype.start;
+			AST.prototype.start = function (this: any, actor: any) {
+				const r = origStart.call(this, actor);
+				try {
+					const m = (window as any).__mpMain;
+					const ns = m && m.netSync;
+					if (ns && typeof ns.relayEnemyArMsg === 'function') {
+						ns.relayEnemyArMsg(actor, this);
+					}
+				} catch (_) { /* never break the AR box */ }
+				return r;
+			};
+		console.log('[netsync] enemy AR-msg relay hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.76.x (barrier denial FX): true when a locally-running event may freely
+	 * relay player visuals — NOT inside a cutscene and NOT under the story-sync
+	 * replay token (a relayed story event containing SHOW_AR_MSG/SHOW_EFFECT
+	 * already plays natively on every client; relaying it again would double). */
+	private playerFxRelayAllowed(): boolean {
+		try {
+			if (this.inCutscene) return false;
+			if ((window as any).__mpStoryRun) return false;
+			if (!this.main.connection || !this.main.connection.isOpen()) return false;
+			if (typeof (this.main as any).isSoloInstance === 'function' && (this.main as any).isSoloInstance()) return false;
+			return true;
+		} catch (_) { return false; }
+	}
+
+	/** 1.76.x (barrier denial FX): wraps EVENT_STEP.SHOW_AR_MSG (the "拒绝访问"
+	 * window the BarrierBlock parallel event shows ON THE LOCAL PLAYER) and
+	 * EVENT_STEP.SHOW_EFFECT (its barrierFlash on the barrier prop, sheet
+	 * map.barrier). Both are local-only in vanilla — relay them so teammates see
+	 * the denial too. Receivers replay via ARBox/spawnFixed directly, so replays
+	 * never re-enter this hook; broadcastToInstance excludes the sender. */
+	private installPlayerFxHook(): void {
+		try {
+			const EVS: any = (ig as any).EVENT_STEP;
+			const AR: any = EVS && EVS.SHOW_AR_MSG;
+			if (AR && AR.prototype && typeof AR.prototype.start === 'function' && !AR.prototype._mpPlayerArWrapped) {
+				AR.prototype._mpPlayerArWrapped = true;
+				const origAr = AR.prototype.start;
+				AR.prototype.start = function (this: any, a: any, b: any) {
+					const r = origAr.call(this, a, b);
+					try {
+						const m = (window as any).__mpMain;
+						const ns = m && m.netSync;
+						if (ns && typeof ns.playerFxRelayAllowed === 'function' && ns.playerFxRelayAllowed()) {
+							// Re-resolve the SAME entity the step just anchored on — only the
+							// LOCAL player is per-player state worth relaying (mirror anchors
+							// can never equal playerEntity, so relayed contexts cannot echo).
+							const target = (ig as any).Event && typeof (ig as any).Event.getEntity === 'function'
+								? (ig as any).Event.getEntity(this.entity, b) : null;
+							const pe: any = (ig as any).game && (ig as any).game.playerEntity;
+							if (target && pe && target === pe) ns.relayPlayerArMsg(this);
+						}
+					} catch (_) { /* never break the AR box */ }
+					return r;
+				};
+			}
+			const SE: any = EVS && EVS.SHOW_EFFECT;
+			if (SE && SE.prototype && typeof SE.prototype.start === 'function' && !SE.prototype._mpPlayerFxWrapped) {
+				SE.prototype._mpPlayerFxWrapped = true;
+				const origSe = SE.prototype.start;
+				SE.prototype.start = function (this: any, a: any, b: any) {
+					const r = origSe.call(this, a, b);
+					try {
+						const m = (window as any).__mpMain;
+						const ns = m && m.netSync;
+						if (ns && typeof ns.playerFxRelayAllowed === 'function' && ns.playerFxRelayAllowed()) {
+							// The barrier sheet is ONLY used by locked red barriers — a tight,
+							// targeted filter (cutscene flashes etc. never match it).
+							const sheet: any = this.effect && this.effect.effectSheet;
+							if (sheet && sheet.path === 'map.barrier') ns.relayPlayerBarrierFlash(this, b);
+						}
+					} catch (_) { /* never break the effect */ }
+					return r;
+				};
+			}
+			// 1.76.x (denial drag-back): the entryBlockedHover particle ring is the FIRST
+			// step of the BarrierBlock drag DO_ACTION, on the LOCAL player and the
+			// barrier-only sheet — exactly the moment the hover sequence begins. Relay
+			// kind 'hover' so receivers pin the hover pose + ring on the mirror.
+			const ASE: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.SHOW_EFFECT;
+			if (ASE && ASE.prototype && typeof ASE.prototype.start === 'function' && !ASE.prototype._mpPlayerHoverWrapped) {
+				ASE.prototype._mpPlayerHoverWrapped = true;
+				const origAse = ASE.prototype.start;
+				ASE.prototype.start = function (this: any, actor: any) {
+					const r = origAse.call(this, actor);
+					try {
+						const m = (window as any).__mpMain;
+						const ns = m && m.netSync;
+						if (ns && typeof ns.playerFxRelayAllowed === 'function' && ns.playerFxRelayAllowed()) {
+							const sheet: any = this.effect && this.effect.effectSheet;
+							const pe: any = (ig as any).game && (ig as any).game.playerEntity;
+							if (sheet && sheet.path === 'map.barrier' && actor && actor === pe) {
+								ns.relayPlayerHoverFx(this.effect && this.effect.name);
+							}
+						}
+					} catch (_) { /* never break the effect */ }
+					return r;
+				};
+			}
+			console.log('[netsync] player FX relay hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.76.x (barrier denial FX): send the "拒绝访问" AR window anchored on the
+	 * local player — receivers replay it on that player's MIRROR (same text in
+	 * each receiver's own language via the LangLabel map, same mode/color/time). */
+	public relayPlayerArMsg(step: any): void {
+		try {
+			const conn: any = this.main.connection;
+			if (!conn || typeof conn.sendPlayerFx !== 'function') return;
+			let label: any = null;
+			if (step && step.text) {
+				if (step.text instanceof (ig as any).LangLabel) label = step.text.getSaveData();
+				else if (typeof step.text.getSaveData === 'function') label = step.text.getSaveData();
+				else if (typeof step.text === 'string') label = step.text;
+			}
+			if (!label) return;
+			let time = 1;
+			try {
+				const ev: any = (ig as any).Event;
+				const raw = ev && typeof ev.getExpressionValue === 'function'
+					? ev.getExpressionValue(step.time) : step.time;
+				const n = Number(raw);
+				if (isFinite(n)) time = n;
+			} catch (_) { /* keep 1s */ }
+			if (!(time >= 0)) time = 1;
+			if (time > 60) time = 60;
+			const ARC: any = (sc as any).AR_COLOR;
+			const mode = (typeof step.mode === 'number' && step.mode >= 0 && step.mode <= 2) ? step.mode : 0;
+			const color = (ARC && step.color === ARC.RED) ? 1 : 0;
+			conn.sendPlayerFx({ pl: this.main.name, kind: 'ar', label, time, mode, color });
+		} catch (_) { /* a failed relay must never break the event */ }
+	}
+
+	/** 1.76.x (barrier denial FX): send the barrier's red flash at its
+	 * bottom-center anchor so receivers spawn the same map.barrier effect at the
+	 * same world position (their own copy of the barrier entity lives there). */
+	public relayPlayerBarrierFlash(step: any, ctx: any): void {
+		try {
+			const conn: any = this.main.connection;
+			if (!conn || typeof conn.sendPlayerFx !== 'function') return;
+			const target = (ig as any).Event && typeof (ig as any).Event.getEntity === 'function'
+				? (ig as any).Event.getEntity(step.entity, ctx) : null;
+			if (!target || !target.coll) return;
+			const pos = target.coll.pos;
+			const size = target.coll.size || { x: 0, y: 0 };
+			const key = (step.effect && typeof step.effect.name === 'string') ? step.effect.name : '';
+			if (!key) return;
+			conn.sendPlayerFx({
+				pl: this.main.name, kind: 'flash',
+				sheet: 'map.barrier', key,
+				x: pos.x + size.x / 2, y: pos.y + size.y, z: pos.z,
+			});
+		} catch (_) { /* a failed relay must never break the event */ }
+	}
+
+	/** 1.76.x (barrier denial FX): the denial drag-back began on the LOCAL player
+	 * (entryBlockedHover ring started) — receivers pin the hover pose + the same
+	 * particle ring on the mirror until it lands (updateMirrorHoverFx). */
+	public relayPlayerHoverFx(key: any): void {
+		try {
+			const conn: any = this.main.connection;
+			if (!conn || typeof conn.sendPlayerFx !== 'function') return;
+			const k = (typeof key === 'string' && key) ? key : '';
+			if (!k) return;
+			conn.sendPlayerFx({ pl: this.main.name, kind: 'hover', key: k });
+		} catch (_) { /* a failed relay must never break the event */ }
+	}
+
+	/** 1.76.x (barrier denial FX): a teammate was denied by a locked barrier —
+	 * replay the "拒绝访问" AR window on their mirror (world-anchored AR box,
+	 * exactly the widget the denied player sees) and/or the barrier's red flash
+	 * at the relayed world position. */
+	private applyPlayerFx(data: any): void {
+		try {
+			if (!data || typeof data.pl !== 'string' || !data.pl) return;
+			if (data.pl === this.main.name) return; // echo guard (server already excludes us)
+			const rec = this.main.players && this.main.players[data.pl];
+			const mirror = rec && rec.entity;
+			if (data.kind === 'ar') {
+				const ARBox: any = (ig as any).GUI && (ig as any).GUI.ARBox;
+				const LL: any = (ig as any).LangLabel;
+				const gui: any = (ig as any).gui;
+				if (!ARBox || !gui || typeof gui.addGuiElement !== 'function') return;
+				if (!mirror || mirror._killed || mirror._hidden) return;
+				let text: string;
+				if (typeof data.label === 'string') text = data.label;
+				else if (data.label && typeof data.label === 'object' && LL) text = new LL(data.label).toString();
+				else return;
+				const time = (typeof data.time === 'number' && isFinite(data.time)) ? Math.max(0, Math.min(60, data.time)) : 1;
+				const mode = (typeof data.mode === 'number' && data.mode >= 0 && data.mode <= 2) ? Math.round(data.mode) : 0;
+				const ARC: any = (sc as any).AR_COLOR;
+				const colorObj = (data.color === 1 && ARC) ? ARC.RED : (ARC ? ARC.GREEN : undefined);
+				const box = new ARBox(mirror, text, time, mode, colorObj);
+				gui.addGuiElement(box);
+				try { if (typeof box.setAttachedEntity === 'function') box.setAttachedEntity(mirror); } catch (_) { /* ignore */ }
+				return;
+			}
+			if (data.kind === 'flash') {
+				if (typeof data.sheet !== 'string' || typeof data.key !== 'string') return;
+				if (!isFinite(data.x) || !isFinite(data.y) || !isFinite(data.z)) return;
+				const ES: any = (ig as any).EffectSheet;
+				if (!ES) return;
+				let sheet = this._fxSheets[data.sheet];
+				if (!sheet) sheet = this._fxSheets[data.sheet] = new ES(data.sheet);
+				sheet.load(() => {
+					try {
+						if (!sheet.loaded) return;
+						// NO _mpFxMuteSpawn here: unlike enemy FX (whose sounds relay
+						// through their own channel), the barrier flash has no separate
+						// sound relay — receivers SHOULD hear the denial buzz.
+						sheet.spawnFixed(data.key, data.x, data.y, data.z);
+					} catch (_) { /* cosmetic */ }
+				});
+				return;
+			}
+			if (data.kind === 'hover') {
+				// 1.76.x (denial drag-back): pin the hover pose + entryBlockedHover ring
+				// on the denied player's mirror. The pose uses the same extern-anim action
+				// the sit/pose relay uses; the ring is spawned attached (duration -1) and
+				// stopped by updateMirrorHoverFx when the mirror LANDS (its z streams the
+				// lift + fall) or at a 4s cap.
+				if (data.key !== 'entryBlockedHover') return;
+				if (!mirror || mirror._killed || mirror._hidden || !mirror.coll) return;
+				this.endMirrorHover(data.pl); // a re-trigger replaces any live replay
+				try { this.playExternAnim(mirror, 'player', 'hover'); } catch (_) { /* best-effort pose */ }
+				try { (mirror as any)._mpLastExtern = 'player/hover'; } catch (_) { /* dedupe vs the xa/xf stream */ }
+				const ES2: any = (ig as any).EffectSheet;
+				if (!ES2) return;
+				let sheet2 = this._fxSheets['map.barrier'];
+				if (!sheet2) sheet2 = this._fxSheets['map.barrier'] = new ES2('map.barrier');
+				const rec2 = { ent: mirror, handle: null as any, zMax: mirror.coll.pos.z, at: Date.now() };
+				this._mpMirrorHovers[data.pl] = rec2;
+				sheet2.load(() => {
+					try {
+						if (!sheet2.loaded) return;
+						const live = this._mpMirrorHovers[data.pl];
+						if (!live || live !== rec2 || !mirror.coll || mirror._killed) return;
+						// NO _mpFxMuteSpawn: no separate sound channel exists for this ring.
+						const h = sheet2.spawnOnTarget('entryBlockedHover', mirror, { duration: -1 });
+						if (h) {
+							// Hard lifetime cap — a lost land-detection must never loop forever.
+							try { if (typeof h.duration === 'number' && h.duration < 0) h.duration = 4; } catch (_) { /* ignore */ }
+							live.handle = h;
+						}
+					} catch (_) { /* cosmetic */ }
+				});
+				return;
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** 1.76.x (barrier denial FX): end a live hover replay — stop the particle ring
+	 * and release the pinned pose so the owner's anim stream re-drives the mirror. */
+	private endMirrorHover(name: string): void {
+		const rec = this._mpMirrorHovers[name];
+		if (!rec) return;
+		delete this._mpMirrorHovers[name];
+		try { if (rec.handle && !rec.handle._killed) rec.handle.stop(); } catch (_) { /* ignore */ }
+		const e = rec.ent;
+		try { if (e && !e._killed) { if (typeof e.setAction === 'function') e.setAction(null); e.animationFixed = false; } } catch (_) { /* ignore */ }
+		try { if (e) e._mpLastExtern = ''; } catch (_) { /* ignore */ }
+	}
+
+	/** 1.76.x (barrier denial FX): per-frame pump for live hover replays. Landing
+	 * = the mirror's streamed z fell >=10px below its hover peak (the denial lifts
+	 * ~16px, then drops back to the floor); also ends at a 4s cap or when the
+	 * mirror disappears. Runs in the same per-frame block as the mirror FX pumps. */
+	private updateMirrorHoverFx(): void {
+		try {
+			const now = Date.now();
+			for (const name in this._mpMirrorHovers) {
+				const rec = this._mpMirrorHovers[name];
+				const e = rec && rec.ent;
+				if (!e || e._killed || !e.coll) { this.endMirrorHover(name); continue; }
+				const z = e.coll.pos.z;
+				if (z > rec.zMax) rec.zMax = z;
+				if (now - rec.at > 4000 || (rec.zMax - z) >= 10) this.endMirrorHover(name);
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** 1.75.x (boss attack camera sync): wrap FOCUS_CAMERA / RESET_CAMERA action
+	 * steps so the host relays them for its real enemies. Member puppets never run
+	 * actions, so the relay is one-way and cannot echo. */
+	private installEnemyCameraHook(): void {
+		try {
+			const AST: any = (ig as any).ACTION_STEP;
+			const Enemy: any = (ig as any).ENTITY && (ig as any).ENTITY.Enemy;
+			if (!AST || !Enemy) return;
+			const wrapCamStep = (name: string, kind: string) => {
+				const cls = AST[name];
+				if (!cls || !cls.prototype || typeof cls.prototype.start !== 'function'
+					|| cls.prototype._mpEnemyCamWrapped) return;
+				cls.prototype._mpEnemyCamWrapped = true;
+				const orig = cls.prototype.start;
+				cls.prototype.start = function (this: any, actor: any) {
+					const r = orig.call(this, actor);
+					try {
+						if (actor && actor instanceof Enemy && !actor._mpPuppet && !actor._mpMirror) {
+							const m = (window as any).__mpMain;
+							const ns = m && m.netSync;
+							if (ns && typeof ns.broadcastEnemyCamera === 'function') {
+								ns.broadcastEnemyCamera(actor, this, kind);
+							}
+						}
+					} catch (_) { /* never break the camera step */ }
+					return r;
+				};
+			};
+			wrapCamStep('FOCUS_CAMERA', 'focus');
+			wrapCamStep('RESET_CAMERA', 'reset');
+			console.log('[netsync] enemy camera relay hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+
 	/** ROUND 125 (gameplay interact-stack watchdog): during FREE gameplay (state
 	 * GAME + substate RUNNING) no ButtonInteractEntry may legitimately sit on
 	 * ig.interact — menus, dialogs, the quick menu and the title screen all remove
@@ -7487,7 +8961,7 @@ export class NetSync {
 					}
 					if (allButtonsAbove && !this._mpMenuWedgeLoggedAt) {
 						this._mpMenuWedgeLoggedAt = Date.now();
-						console.warn('[netsync] menu button-interact buried under '
+						this.mpConsoleWarn('[netsync] menu button-interact buried under '
 							+ (entries.length - idx - 1) + ' foreign entry/entries (state=MENU) — input may be dead');
 					}
 				} else if (!menuBI || menuBI.isActive()) {
@@ -7510,6 +8984,33 @@ export class NetSync {
 
 	/** 1.74.x: rate-limit for the menu-wedge diagnostic (log once per wedge). */
 	private _mpMenuWedgeLoggedAt = 0;
+
+	/** CCLoader draws EVERY console.warn call as an in-game toast in the top-right
+	 * corner. Diagnostic warnings that are only meant for the dev console (the
+	 * menu-wedge watchdog and the leak watcher) must bypass that UI wrapper.
+	 * NW.js exposes the untouched Node console through window.require, which
+	 * prints to the console without drawing anything in-game. Browser/dev fallback
+	 * stays on the regular console; never throws. */
+	private _mpRawConsole: any = null;
+	private mpConsoleWarn(...args: any[]): void {
+		try {
+			if (!this._mpRawConsole) {
+				const w: any = window as any;
+				if (w && typeof w.require === 'function') {
+					const nodeConsole: any = w.require('console');
+					if (nodeConsole && typeof nodeConsole.warn === 'function') {
+						this._mpRawConsole = nodeConsole;
+					} else if (nodeConsole && typeof nodeConsole.Console === 'function' && w.process) {
+						this._mpRawConsole = new nodeConsole.Console(w.process.stdout, w.process.stderr);
+					}
+				}
+				if (!this._mpRawConsole) this._mpRawConsole = console;
+			}
+			this._mpRawConsole.warn(...args);
+		} catch (_) {
+			try { console.warn(...args); } catch (_2) { /* ignore */ }
+		}
+	}
 
 	/** 1.74.x (freeze fix): sc.autoControl LATCH recovery. autoControl overrides
 	 * the mouse position (getMouseX/Y) and forces getGuiClickPre — while it is
@@ -7590,6 +9091,28 @@ export class NetSync {
 		} catch (_) { /* the sweep must never break the frame */ }
 	}
 
+	/** 1.75.x (saw-suction fix): release START_LOCK holds applied on the host for
+	 * a member's forwarded hit when the matching END_LOCK packet never arrived
+	 * (the member was interrupted mid-art, shielded final hit, disconnect, ...).
+	 * endLock(mirror) walks the exact vanilla detach path (removeActionAttached ->
+	 * params._decreaseLock), so this is the same cleanup END_LOCK.preHit does. */
+	private releaseExpiredForwardedHolds(): void {
+		try {
+			const now = Date.now();
+			const list: any[] = (ig.game && (ig.game as any).entities) || [];
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				const hold = e && e._mpForwardedHold;
+				if (!hold || !hold.mirror) continue;
+				if (!e._killed && now < (Number(hold.until) || 0)) continue;
+				try { delete e._mpForwardedHold; } catch (_) { /* ignore */ }
+				try {
+					if (e.params && typeof e.params.endLock === 'function') e.params.endLock(hold.mirror);
+				} catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* the cleanup must never break the frame */ }
+	}
+
 	/** 1.75.x (encounter-aware room matching): change-gated report of the LOCAL
 	 * instance host's forceCombatMode to the server. The server only honors host
 	 * reports, so members skip this entirely. Re-arms on host acquisition and map
@@ -7635,6 +9158,7 @@ export class NetSync {
 			if (!conn || !conn.isOpen()) {
 				if (this._mpDead) this.clearDeathState();
 				if (this._mpChargeFrozen) this.clearChargeFreeze();
+				this.clearEnemyCamHandles();
 				return;
 			}
 
@@ -7655,6 +9179,21 @@ export class NetSync {
 				this.puppets = Object.create(null);
 				this.lastAnim = Object.create(null);
 				this.pendingTypes = Object.create(null);
+				// 1.75.x: drop relayed enemy camera targets from the old map and
+				// re-arm the drill-boss intro teleport for the new map.
+				this.clearEnemyCamHandles();
+				this._mpDrillIntroOnce = false;
+				// 1.75.x: heal any ground-pickup var the OLD relay poisoned on this
+				// character (var true but the local player never received the item).
+				this.correctLocalPickupVars();
+				// 1.75.x: index the new map's key-locked blocks so their vanilla
+				// perma vars can never be relayed to teammates (storySync/spawnVar).
+				this.rebuildKeyLockedMapIds();
+				// 1.75.x: keep previously-destroyed rocks/ice/plants destroyed on map
+				// re-entry. Runs HERE (first tick after the load, entities already
+				// spawned) so direct loadLevel transitions that never set loadingMap
+				// are covered too — OnMapLoadedListener remains a redundant backup.
+				this.reapplyDestroyedProps();
 				// Round 22 (opt 2) / Round 23 (split): a map change voids both enemy-block
 				// deltas — the new map's enemies are unknown to them, so the first block in
 				// each stream is FULL (self-heal for anyone who just joined).
@@ -7727,6 +9266,20 @@ export class NetSync {
 				this._mpWasCombatHost = false;
 				this._mpCombatStateHeartbeatAt = 0;
 			}
+			// 1.75.x: periodic ground-pickup self-heal (also catches a same-map
+			// re-entry / teleport-back, where mapName never changes).
+			const healNow = Date.now();
+			if (healNow - this._mpPickupHealAt > 1000) {
+				this._mpPickupHealAt = healNow;
+				this.correctLocalPickupVars();
+			}
+			// 1.75.x: re-apply recorded destructible breaks every second as a
+			// same-map safety net (condition-gated blocks can spawn after the
+			// map-load reapply already ran).
+			if (healNow - this._mpDestroyedReapplyAt > 1000) {
+				this._mpDestroyedReapplyAt = healNow;
+				this.reapplyDestroyedProps();
+			}
 
 			// Move network-driven entities toward their latest synced position EVERY
 			// rendered frame. The host enemy block only arrives ~15x/sec and the
@@ -7735,6 +9288,7 @@ export class NetSync {
 			// stuttering/jittering. Puppets (member-side) and _mpMirror entities
 			// (remote-player mirrors exist on the HOST and members alike) are both
 			// handled inside interpolatePuppets.
+			this.pruneEnemyCamHandles();
 			this.interpolatePuppets();
 			// ROUND 88 (collision-map leak fix): periodically purge any stale
 			// (already-removed) entries still sitting in the spatial hash so the
@@ -7776,9 +9330,26 @@ export class NetSync {
 			// Round 19 (Part 2): the single per-frame fade + collision pass for remote
 			// mirrors (cutscene fade, both directions + shared-town IGNORE).
 			this.updateRemoteMirrorFade();
+			// 1.76.x: replicate the vanilla element-mode walk aura (<element>Aura
+			// loop, sheet combat.mode) on every remote mirror — runs AFTER the fade
+			// pass so it can read that pass's target-alpha cache.
+			this.updateMirrorModeAura();
+			// 1.76.x: replay jump-panel activation FX (jumpTrail / jumpButtom /
+			// glow blink) when a remote mirror bounces off a JumpPanel — the
+			// panel's engine trigger only runs for the LOCAL player.
+			this.updateMirrorJumpPanelFx();
+			// 1.76.x (barrier denial FX): advance live hover drag-back replays —
+			// stop the pose + particle ring when the mirror lands.
+			this.updateMirrorHoverFx();
 			// ROUND 133: replicate the physical collideWith -> checkTackle connect for
 			// stationary proxy TACKLEs (icicles) against teleporting player mirrors.
 			this.sweepProxyTackleHits();
+			// 1.75.x: release forwarded START_LOCK holds whose END_LOCK never came.
+			this._mpHoldCleanupTimer += ig.system.tick;
+			if (this._mpHoldCleanupTimer >= 0.25) {
+				this._mpHoldCleanupTimer = 0;
+				this.releaseExpiredForwardedHolds();
+			}
 
 			// Own-player death/respawn monitor (host AND member — each client owns
 			// its own player's death).
@@ -7790,6 +9361,7 @@ export class NetSync {
 			// 1.75.x: keep the server's per-instance "host mid-encounter" flag fresh
 			// for the encounter-aware town channel router.
 			this.updateCombatStateBroadcast();
+			this.updateRoomScaleWatcher();
 
 			this.sendPlayerState();
 			// ROUND 132: every client (host AND member) streams its own thrown balls so
@@ -7949,6 +9521,10 @@ export class NetSync {
 		} catch (_) { /* extern metadata is cosmetic */ }
 		const face = p.face || { x: 0, y: 1 };
 		const params = p.params || {};
+		// 1.75.x: teammates' ranged-charge aim line. Only armed once the local
+		// crosshair has FOCUSED into a single straight line (rangeCurrent == 0 while
+		// isThrowCharged() is true) — the cone/fan phase is deliberately not synced.
+		const aim = this.localAimLine();
 		// Round 22 (opt 3): quantize pos to integers — matches the enemy block's
 		// Math.round style and shrinks the payload (a mirror lerps between targets
 		// every rendered frame, so integer granularity is invisible).
@@ -7983,6 +9559,15 @@ export class NetSync {
 			// Round 19 (Part 1): cutscene flag — teammates fade our mirror + dim our
 			// name tag while we're in a story sequence, and skip aggro targeting us.
 			cs: (((sc as any).model && (sc as any).model.isCutscene && (sc as any).model.isCutscene()) || (Date.now() < this.encounterFadeUntil)) ? 1 : 0,
+			// 1.75.x: focused ranged-charge aim line (1 = a single straight line is
+			// ready; ax/ay = normalized aim direction; cax/cay/caz = the owner's
+			// actual crosshair anchor world position for the receiver's replay).
+			al: aim.al,
+			ax: aim.ax,
+			ay: aim.ay,
+			cax: aim.cax,
+			cay: aim.cay,
+			caz: aim.caz,
 		};
 		// ---- Round 27 (item 4): guard state for the HOST-authoritative damage model ----
 		// The host judges damage/guard/perfect-guard against our mirror, so it needs our
@@ -8114,6 +9699,8 @@ export class NetSync {
 			const out: any = {
 				pos: snap.pos, face: snap.face, anim: snap.anim, dead: snap.dead,
 				cs: snap.cs, cg: snap.cg, xa: snap.xa, xf: snap.xf,
+				al: snap.al, ax: snap.ax, ay: snap.ay,
+				cax: snap.cax, cay: snap.cay, caz: snap.caz,
 			};
 			if (includeState) {
 				out.hp = snap.hp; out.maxHp = snap.maxHp; out.sp = snap.sp; out.maxSp = snap.maxSp;
@@ -8177,6 +9764,12 @@ export class NetSync {
 		if (snap.maxSp !== prev.maxSp) return true;
 		if (snap.cg !== prev.cg) return true;
 		if (snap.cs !== prev.cs) return true;
+		// Aim-line edge: fade in/out must start at network latency, not at the
+		// next 10/30Hz floor. While the line is live, aim-direction / anchor
+		// changes also ship immediately (values are already rounded).
+		if (snap.al !== prev.al) return true;
+		if (snap.al && (snap.ax !== prev.ax || snap.ay !== prev.ay)) return true;
+		if (snap.al && (snap.cax !== prev.cax || snap.cay !== prev.cay || snap.caz !== prev.caz)) return true;
 		if (snap.em !== prev.em) return true;
 		if (snap.cl !== prev.cl) return true;
 		if (snap.anim !== prev.anim) return true;
@@ -8222,10 +9815,60 @@ export class NetSync {
 		} catch (_) { return ''; }
 	}
 
+	/** 1.75.x: true + normalized direction + the crosshair anchor world position
+	 * when the LOCAL ranged charge has focused into a single straight aim line.
+	 * The engine draws the fan as two rotated ray arcs while
+	 * crosshair.rangeCurrent > 0; once it reaches 0 and isThrowCharged() is true,
+	 * all dots collapse onto ONE straight ray — that edge is what receivers fade
+	 * in/out on (the un-focused cone is never synced). */
+	private localAimLine(): { al: number, ax: number, ay: number, cax: number, cay: number, caz: number } {
+		const off = { al: 0, ax: 0, ay: 0, cax: 0, cay: 0, caz: 0 };
+		try {
+			const p: any = (ig as any).game && (ig as any).game.playerEntity;
+			const ch: any = p && p.gui && p.gui.crosshair;
+			if (!ch || !ch.active || typeof ch.rangeCurrent !== 'number' || ch.rangeCurrent > 0.001) {
+				return off;
+			}
+			// Ranged only: an active special charge must be the THROW_SPECIAL art.
+			// Melee / guard / dash charge arts also set crosshair.special, but their
+			// "line" is not a ranged throw and must never sync.
+			const chg: any = p.charging;
+			if (chg && typeof chg.time === 'number' && chg.time >= 0) {
+				const type: any = chg.type;
+				if (!type || type.actionKey !== 'THROW_SPECIAL') return off;
+			}
+			if (typeof ch.isThrowCharged !== 'function' || !ch.isThrowCharged()) return off;
+			const d = ch._aimDir && typeof ch._aimDir.x === 'number' && typeof ch._aimDir.y === 'number'
+				? ch._aimDir : (p.face || { x: 0, y: 1 });
+			let x = Number(d.x) || 0;
+			let y = Number(d.y) || 0;
+			const len = Math.sqrt(x * x + y * y);
+			if (len < 0.0001) { x = 0; y = 1; }
+			else { x = x / len; y = y / len; }
+			// The receiver needs the ACTUAL crosshair anchor (mouse world pos), not
+			// just a direction, so the remote line can point through it and the
+			// anchor can be drawn + interpolated.
+			const ap: any = ch.coll && ch.coll.pos;
+			return {
+				al: 1,
+				ax: Math.round(x * 100) / 100,
+				ay: Math.round(y * 100) / 100,
+				cax: ap && typeof ap.x === 'number' && isFinite(ap.x) ? Math.round(ap.x * 100) / 100 : 0,
+				cay: ap && typeof ap.y === 'number' && isFinite(ap.y) ? Math.round(ap.y * 100) / 100 : 0,
+				caz: ap && typeof ap.z === 'number' && isFinite(ap.z) ? Math.round(ap.z * 100) / 100 : 0,
+			};
+		} catch (_) { return off; }
+	}
+
 	// ---- skill effect sync (round 11) ----
 
 	/** Cached EffectSheets on the receiving side (new ig.EffectSheet per path). */
 	private _fxSheets: { [path: string]: any } = {};
+	/** 1.76.x (barrier denial FX): active hover drag-back replays per player name —
+	 * the mirror is pinned to the hover pose + the entryBlockedHover particle ring
+	 * until it LANDS (z drops >=10px below its hover peak) or the 4s cap expires
+	 * (see updateMirrorHoverFx). */
+	private _mpMirrorHovers: { [name: string]: { ent: any, handle: any, zMax: number, at: number } } = Object.create(null);
 	/** 1.71.11: member-side replayed enemy-telegraph effect handles per puppet uid,
 	 * so the host's stop relay can end looping glows (see applyEnemyFxStop). */
 	private _enemyTelegraphFx: { [uid: number]: Array<{ sheet: string, key: string, handle: any, loop?: boolean }> } = {};
@@ -8301,6 +9944,145 @@ export class NetSync {
 			if (typeof box.stopRumble === 'function') box.stopRumble();
 			gui.addGuiElement(box);
 		} catch (_) { /* banners must never break sync */ }
+	}
+
+	/** 1.75.x (element overload without the global freeze): the personal penalty
+	 * half of the OVERLOAD replacement — cancel any in-progress charge and block
+	 * ALL player inputs for ~0.7s via the engine's own actionBlocked flags (the
+	 * same gates combat arts use). The restore pump is a static one-shot install
+	 * (registerUpdate never unregisters and NetSync can be recreated on
+	 * reconnect). The restore only fires while OUR flag values (1) are still in
+	 * place — a real action's own setActionBlocked(100)/clearActionBlocked wins
+	 * the interleave and is never clobbered. */
+	public applyOverloadStagger(p: any): void {
+		try {
+			if (!p || p._killed) return;
+			try { if (p.charging && p.charging.time !== -1 && typeof p.clearCharge === 'function') p.clearCharge(); } catch (_) { /* ignore */ }
+			if (typeof p.setActionBlocked === 'function') p.setActionBlocked({ action: 1, charge: 1, dash: 1, reaim: 1, move: 1 });
+			(NetSync as any)._overloadStunT = 0.7;
+			if ((NetSync as any)._overloadStunPump) return;
+			(NetSync as any)._overloadStunPump = true;
+			simplify.registerUpdate(() => {
+				try {
+					let t: number = (NetSync as any)._overloadStunT || 0;
+					if (t <= 0) return;
+					t -= (ig as any).system.actualTick;
+					if (t > 0) { (NetSync as any)._overloadStunT = t; return; }
+					(NetSync as any)._overloadStunT = 0;
+					const pl: any = (ig as any).game && (ig as any).game.playerEntity;
+					if (pl && pl.actionBlocked && pl.actionBlocked.action === 1 && pl.actionBlocked.move === 1
+						&& typeof pl.clearActionBlocked === 'function') pl.clearActionBlocked();
+				} catch (_) { /* never break the update loop */ }
+			});
+		} catch (_) { /* the stagger must never break the overload effect */ }
+	}
+
+	/** 1.75.x (quest enemy AR labels): a REAL local enemy action just started a
+	 * SHOW_AR_MSG step — relay the LangLabel + timing/color to the instance. */
+	public relayEnemyArMsg(actor: any, step: any): void {
+		try {
+			if (!actor || actor._killed || actor._mpMirror || actor._mpPuppet) return;
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			if (!Enemy || !(actor instanceof Enemy)) return;
+			if (!actor.uid) return;
+			const conn: any = this.main.connection;
+			if (!conn || !conn.isOpen() || typeof conn.sendEnemyArMsg !== 'function') return;
+			let label: any = null;
+			if (step && step.text) {
+				if (step.text instanceof (ig as any).LangLabel) label = step.text.getSaveData();
+				else if (typeof step.text.getSaveData === 'function') label = step.text.getSaveData();
+				else if (typeof step.text === 'string') label = step.text;
+			}
+			if (!label) return;
+			let time = 1;
+			try {
+				const ev: any = (ig as any).Event;
+				const raw = ev && typeof ev.getExpressionValue === 'function'
+					? ev.getExpressionValue(step.time) : step.time;
+				const n = Number(raw);
+				if (isFinite(n)) time = n;
+			} catch (_) { /* keep 1s */ }
+			if (!(time >= 0)) time = 1;
+			if (time > 60) time = 60;
+			const mode = (typeof step.mode === 'number' && step.mode >= 0 && step.mode <= 2) ? step.mode : 0;
+			const color = (step.color && step.color === (sc as any).AR_COLOR.RED) ? 1 : 0;
+			conn.sendEnemyArMsg({ uid: actor.uid, label, time, mode, color });
+		} catch (_) { /* a failed relay must never break the action */ }
+	}
+
+	/** 1.75.x (quest enemy AR labels): replay a relayed SHOW_AR_MSG window on our
+	 * matching host-puppet / csPuppet. The HOST only resolves csPuppets (a member's
+	 * per-player quest waves) — never its own real enemy by uid, because uid spaces
+	 * are unrelated across clients. */
+	private applyEnemyArMsg(data: { uid: number, label: any, time: number, mode: number, color: number }): void {
+		try {
+			if (!data || typeof data.uid !== 'number') return;
+			const ARBox: any = (ig as any).GUI && (ig as any).GUI.ARBox;
+			const LL: any = (ig as any).LangLabel;
+			const gui: any = (ig as any).gui;
+			if (!ARBox || !LL || !gui || typeof gui.addGuiElement !== 'function') return;
+			let entity: any = null;
+			if (this.main.host) {
+				const Enemy: any = (ig.ENTITY as any).Enemy;
+				const cs = this.csPuppets['cs' + data.uid];
+				if (cs && cs instanceof Enemy && !cs._killed && !cs._hidden) entity = cs;
+			} else {
+				entity = this.findEntityForArUid(data.uid);
+			}
+			if (!entity || entity._killed || entity._hidden) return;
+		// 1.75.x (drill-boss "Shield Recovered"): the host anchors the AR window on
+		// the `shield` animation part — anchor the replay there too, not on the
+		// boss's center, so the floating text sits on the chest plates.
+		try {
+			if (entity.coll && Array.isArray(entity.coll.subColls)) {
+				const subs: any[] = entity.coll.subColls;
+				for (let i = subs.length; i--;) {
+					const part: any = subs[i] && subs[i].entity;
+					if (part && part.partName === 'shield') { entity = part; break; }
+				}
+			}
+		} catch (_) { /* anchor stays on the enemy */ }
+			let text: string;
+			if (typeof data.label === 'string') text = data.label;
+			else if (data.label && typeof data.label === 'object') text = new LL(data.label).toString();
+			else return;
+			const time = (typeof data.time === 'number' && isFinite(data.time)) ? Math.max(0, Math.min(60, data.time)) : 1;
+			const mode = (typeof data.mode === 'number' && data.mode >= 0 && data.mode <= 2) ? Math.round(data.mode) : 0;
+			const colorObj = (data.color === 1 && (sc as any).AR_COLOR) ? (sc as any).AR_COLOR.RED : (sc as any).AR_COLOR && (sc as any).AR_COLOR.GREEN;
+			const box = new ARBox(entity, text, time, mode, colorObj || undefined);
+			gui.addGuiElement(box);
+			try { box.setAttachedEntity(entity); } catch (_) { /* position still works via target */ }
+		} catch (_) { /* floating labels must never break sync */ }
+	}
+
+	/** Puppet first (host block uid space), then csPuppets (cutsceneEntity stream uid
+	 * space) — both key the same numeric uid the sender used. */
+	private findEntityForArUid(uid: number): any {
+		try {
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const p = this.puppets[uid];
+			if (p && p instanceof Enemy && !p._killed && !p._hidden) return p;
+			const cs = this.csPuppets['cs' + uid];
+			if (cs && cs instanceof Enemy && !cs._killed && !cs._hidden) return cs;
+		} catch (_) { /* fall through */ }
+		return null;
+	}
+
+	/** 1.75.x (quest wave host dedupe): true when the HOST already has a VISIBLE real
+	 * enemy for the same mapId (it is running the same per-player encounter itself). */
+	private hostHasVisibleMapEnemy(mapId: number): boolean {
+		try {
+			if (!mapId) return false;
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const list = ig.game && ig.game.entities;
+			if (!Enemy || !list) return false;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (e instanceof Enemy && !e._killed && !e._mpMirror && !e._mpPuppet
+					&& e.mapId === mapId && !e._hidden) return true;
+			}
+		} catch (_) { /* fall through */ }
+		return false;
 	}
 
 	private applySkillFx(player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
@@ -8397,7 +10179,7 @@ export class NetSync {
 			const p: any = {};
 			if (params && typeof params === 'object') {
 				const keep = ['offset', 'rotOffset', 'align', 'angle', 'flipX', 'rotateFace',
-					'flipLeftFace', 'duration', 'group', 'noMultiGroup'];
+					'flipLeftFace', 'duration', 'group', 'noMultiGroup', 'partName', 'fixPos'];
 				for (const k of keep) if (params[k] !== undefined) p[k] = params[k];
 			}
 			const conn: any = this.main.connection;
@@ -8440,6 +10222,11 @@ export class NetSync {
 			// TEMP DIAG (weak-break angry2): trace relayed loop fx through every early return
 			const mpLoop = !!(fx.p && typeof fx.p.duration === 'number' && fx.p.duration < 0);
 			if (mpLoop) console.log('[mpfx] MEMBER looprecv uid=' + uid + ' ' + fx.sheet + '/' + fx.key);
+			// 1.75.x (boss attack camera): FOCUS_CAMERA / RESET_CAMERA relayed on the
+			// enemyFx wire under a reserved pseudo-sheet — never an EffectSheet load.
+			if (fx.sheet === '__mpCam') { this.applyEnemyCamera(uid, fx.key, fx.p || {}); return; }
+			// 1.75.x (drill-boss bomb landing dust): fixed world FX pseudo-sheet.
+			if (fx.sheet === '__mpFx') { this.applyFixedWorldFx(fx); return; }
 			const e: any = this.puppets[uid];
 			if (!e || e._killed) {
 				if (mpLoop) console.log('[mpfx] MEMBER looprecv uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' DROPPED no-puppet killed=' + (e ? !!e._killed : 'none'));
@@ -8447,6 +10234,20 @@ export class NetSync {
 			}
 			const ES: any = (ig as any).EffectSheet;
 			if (!ES) return;
+			// 1.75.x (part-anchored boss FX): the host resolves partName BEFORE calling
+			// spawnOnTarget; mirror that here by anchoring on the puppet's same part.
+			let fxTarget: any = e;
+			try {
+				const partName = fx.p && typeof fx.p.partName === 'string' ? fx.p.partName : '';
+				if (partName && e.coll && Array.isArray(e.coll.subColls)) {
+					const subs: any[] = e.coll.subColls;
+					for (let i = subs.length; i--;) {
+						const sub: any = subs[i] && subs[i].entity;
+						if (sub && sub.partName === partName) { fxTarget = sub; break; }
+					}
+					if (fxTarget === e) return; // part not initialized yet — the next FX still works
+				}
+			} catch (_) { /* anchor stays on the enemy root */ }
 			let sheet = this._fxSheets[fx.sheet];
 			if (!sheet) { sheet = this._fxSheets[fx.sheet] = new ES(fx.sheet); }
 			sheet.load(() => {
@@ -8471,8 +10272,8 @@ export class NetSync {
 					this._mpFxMuteSpawn = true;
 					let handle: any = null;
 					try {
-						if (fx.f) handle = sheet.spawnFixed(fx.key, fx.f.x, fx.f.y, fx.f.z, e, fx.p || {});
-						else handle = sheet.spawnOnTarget(fx.key, e, fx.p || {});
+						if (fx.f) handle = sheet.spawnFixed(fx.key, fx.f.x, fx.f.y, fx.f.z, fxTarget, fx.p || {});
+						else handle = sheet.spawnOnTarget(fx.key, fxTarget, fx.p || {});
 					} finally { this._mpFxMuteSpawn = false; }
 					// Track the replayed handle so the host's stop relay
 					// (applyEnemyFxStop) can end LOOPING telegraphs (enemy/angry2 blinks
@@ -8546,8 +10347,214 @@ export class NetSync {
 		} catch (_) { /* ignore */ }
 	}
 
-	/** 1.73.x (enemy-counter battle-done): the HOST's counter reached 0 — relay
-	 * the resolution so members' relayed cutscenes complete and doors open. */
+	/** 1.75.x (drill-boss bomb landing dust): replay a fixed world effect relayed
+	 * under the __mpFx pseudo-sheet. Currently only `dustMedium` (the engine's
+	 * dust/medium landing puff) is used. */
+	private applyFixedWorldFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
+		try {
+			if (!fx || !fx.f) return;
+			const g: any = ig.game;
+			if (!g || !g.effects || !g.effects.dust) return;
+			if (fx.key === 'dustMedium') {
+				try { g.effects.dust.spawnFixed('medium', fx.f.x, fx.f.y, fx.f.z); } catch (_) { /* cosmetic */ }
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (boss attack camera sync): resolve a KEY_SPLINES function back to
+	 * its registry NAME so it can cross the wire (functions can't). */
+	private cameraTransitionName(tr: any): string {
+		try {
+			const reg: any = (window as any).KEY_SPLINES || (ig as any).KEY_SPLINES;
+			if (reg && tr) {
+				for (const k in reg) if (reg[k] === tr) return k;
+			}
+		} catch (_) { /* fall through */ }
+		return 'EASE_IN_OUT';
+	}
+
+	/** HOST side: a REAL enemy action ran FOCUS_CAMERA — relay it so member
+	 * puppets push the same camera target (the drill-boss's Bombing/IcePunch/
+	 * RegenShield camera pull). */
+	public broadcastEnemyCamera(ent: any, step: any, kind: string): void {
+		try {
+			if (!ent || !step || (kind !== 'focus' && kind !== 'reset')) return;
+			if (!this.main.host) return;                       // only the instance host owns shared enemy actions
+			if (!this.main.connection || !this.main.connection.isOpen()) return;
+			if (typeof (this.main as any).isSoloInstance === 'function' && (this.main as any).isSoloInstance()) return;
+			if (typeof ent.uid !== 'number' || ent.uid <= 0) return;
+			const p: any = {
+				ox: (typeof step.offsetX === 'number' && isFinite(step.offsetX)) ? step.offsetX : 0,
+				oy: (typeof step.offsetY === 'number' && isFinite(step.offsetY)) ? step.offsetY : 0,
+				// Engine camera steps accept either a SPEED_OPTIONS name string or a
+				// raw number — ship whichever the baked step actually holds.
+				sp: (typeof step.speed === 'number' && isFinite(step.speed)) ? step.speed
+					: ((typeof step.speed === 'string' && step.speed) ? step.speed : 0),
+				tr: this.cameraTransitionName(step.transition),
+				zoom: (typeof step.zoom === 'number' && isFinite(step.zoom)) ? step.zoom : 1,
+				ft: (typeof step.focusType === 'number') ? step.focusType : 0,
+			};
+			const conn: any = this.main.connection;
+			if (typeof conn.enemyFx === 'function') conn.enemyFx({ uid: ent.uid, sheet: '__mpCam', key: kind, f: null, p });
+		} catch (_) { /* camera relay must never break the action */ }
+	}
+
+	/** MEMBER side: replay the host enemy's FOCUS_CAMERA / RESET_CAMERA on the
+	 * matching puppet. Focus pushes a fresh EntityTarget handle (replacing any
+	 * previous relayed handle for that uid, exactly like the host's own push);
+	 * reset removes the relayed handle(s) with the host's speed/transition. */
+	private applyEnemyCamera(uid: number, kind: string, p: any): void {
+		try {
+			if (this.main.host) return; // host owns its camera natively
+			const e: any = this.puppets[uid];
+			if (!e || e._killed || !e.coll) return;
+			const cam: any = (ig as any).camera;
+			const CT: any = (ig as any).Camera;
+			if (!cam || !CT || typeof cam.pushTarget !== 'function') return;
+			const sp: any = (typeof p.sp === 'number' && isFinite(p.sp)) ? p.sp
+				: ((typeof p.sp === 'string' && p.sp) ? p.sp : 0);
+			const reg: any = (window as any).KEY_SPLINES || (ig as any).KEY_SPLINES;
+			const tr = (reg && typeof p.tr === 'string' && reg[p.tr]) ? reg[p.tr]
+				: (reg && reg.EASE_IN_OUT) || undefined;
+			if (kind === 'reset') {
+				const list = this._mpEnemyCamHandles[uid];
+				if (list && list.length) {
+					for (let i = list.length; i--;) {
+						try { cam.removeTarget(list[i], sp, tr); } catch (_) { /* best-effort */ }
+					}
+					delete this._mpEnemyCamHandles[uid];
+				}
+				return;
+			}
+			if (kind !== 'focus') return;
+			// Replace any older relayed focus first — the host's action always
+			// pushes exactly one fresh target per FOCUS_CAMERA step.
+			const old = this._mpEnemyCamHandles[uid];
+			if (old && old.length) {
+				for (let i = old.length; i--;) {
+					try { cam.removeTarget(old[i], 'IMMEDIATELY'); } catch (_) { /* best-effort */ }
+				}
+			}
+			const ox = (typeof p.ox === 'number' && isFinite(p.ox)) ? p.ox : 0;
+			const oy = (typeof p.oy === 'number' && isFinite(p.oy)) ? p.oy : 0;
+			const zoom = (typeof p.zoom === 'number' && isFinite(p.zoom)) ? p.zoom : 1;
+			let target: any = null;
+			try {
+				target = new CT.EntityTarget(e);
+			} catch (_) {
+				try { target = new CT.PosTarget({ x: e.coll.pos.x + e.coll.size.x / 2, y: e.coll.pos.y + e.coll.size.y / 2 }); } catch (_) { return; }
+			}
+			const handle: any = new CT.TargetHandle(target, ox, oy);
+			try { handle.setZoom(zoom); } catch (_) { /* zoom is cosmetic */ }
+			cam.pushTarget(handle, sp, tr);
+		try { handle._mpCamExpiresAt = Date.now() + 8000; } catch (_) { /* self-heal is best-effort */ }
+			const list = (this._mpEnemyCamHandles[uid] = this._mpEnemyCamHandles[uid] || []);
+			list.push(handle);
+		} catch (_) { /* a camera replay must never break the frame */ }
+	}
+
+	/** Release every relayed enemy camera target (map change / puppet reap). */
+	private clearEnemyCamHandles(): void {
+		try {
+			const cam: any = (ig as any).camera;
+			for (const uidStr in this._mpEnemyCamHandles) {
+				const list = this._mpEnemyCamHandles[uidStr as any];
+				if (!list || !list.length) continue;
+				for (let i = list.length; i--;) {
+					try { if (cam && typeof cam.removeTarget === 'function') cam.removeTarget(list[i], 'IMMEDIATELY'); } catch (_) { /* ignore */ }
+				}
+				delete this._mpEnemyCamHandles[uidStr as any];
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Drop relayed camera handles whose puppet was reaped/killed mid-focus, and
+	 * self-heal any focus whose RESET_CAMERA relay was lost (8s hard cap — every
+	 * real boss focus is followed by a reset within a few seconds). */
+	private pruneEnemyCamHandles(): void {
+		try {
+			const cam: any = (ig as any).camera;
+			const now = Date.now();
+			for (const uidStr in this._mpEnemyCamHandles) {
+				const uid = Number(uidStr);
+				const e = this.puppets[uid];
+				const list = this._mpEnemyCamHandles[uidStr as any];
+				if (!list) { delete this._mpEnemyCamHandles[uidStr as any]; continue; }
+				for (let i = list.length; i--;) {
+					const h = list[i];
+					const expired = !!(h && typeof h._mpCamExpiresAt === 'number' && now > h._mpCamExpiresAt);
+					if ((e && !e._killed) && !expired) continue;
+					try { if (cam && typeof cam.removeTarget === 'function') cam.removeTarget(h, 'IMMEDIATELY'); } catch (_) { /* ignore */ }
+					list.splice(i, 1);
+				}
+				if (!list.length) delete this._mpEnemyCamHandles[uidStr as any];
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (drill-boss intro): relayed from cutsceneRelay when the first player
+	 * triggers the barrier. Teleport ONCE to the triggerer, raise the local barrier,
+	 * and run a lightweight PARALLEL event with only the camera pull + the boss's
+	 * walking rumble steps (never the mobility block, boss movement or BGM pause). */
+	public applyDrillBossIntro(p: [number, number, number]): void {
+		try {
+			if (this._mpDrillIntroOnce) return;
+			this._mpDrillIntroOnce = true;
+			const g: any = ig.game;
+			const pl: any = g && g.playerEntity;
+			if (pl && pl.coll && Array.isArray(p) && p.length >= 3) {
+				try { pl.setPos(p[0], p[1], p[2]); } catch (_) { /* teleport is best-effort */ }
+			}
+			// The triggerer's event already relayed map.barrierUp through the spawnVar
+			// relay; write it directly here too so the barrier is up on the very frame
+			// we land (a dropped spawnVar packet must not leave the door open).
+			try {
+				const vars: any = (ig as any).vars;
+				const mapObj: any = vars && vars.storage && vars.storage.map;
+				if (mapObj && typeof mapObj === 'object') mapObj.barrierUp = true;
+				if (g && typeof g.varsChangedDeferred === 'function') g.varsChangedDeferred();
+			} catch (_) { /* barrier spawn is also covered by the spawnVar relay */ }
+			const ev = this.buildDrillBossIntroEvent();
+			if (ev) {
+				try {
+					const CS: any = (sc as any).Cutscene;
+					const ET: any = (ig as any).EVENT_TYPE;
+					if (CS && typeof CS.startEvent === 'function' && ET) {
+						CS.startEvent(ET.PARALLEL, ev);
+					} else if (g && g.events && typeof g.events.callEvent === 'function' && ET) {
+						g.events.callEvent(ev, ET.PARALLEL);
+					}
+				} catch (_) { /* the camera/rumble replay is cosmetic */ }
+			}
+		} catch (_) { /* never break the relay */ }
+	}
+
+	/** Filtered clone of cold-dng.g.boss's Intro event: barrier var + the two
+	 * forward camera pulls + the timed rumble steps only. */
+	private buildDrillBossIntroEvent(): any {
+		try {
+			const EventCtor: any = (ig as any).Event;
+			if (!EventCtor) return null;
+			const steps: any[] = [
+				{ changeType: 'set', type: 'CHANGE_VAR_BOOL', varName: 'map.barrierUp', value: true },
+				{ pos: { x: 520, y: 1184 }, speed: 'FAST', transition: 'EASE_IN_OUT', wait: true, waitSkip: 0, zoom: 1, type: 'SET_CAMERA_POS' },
+				{ pos: { x: 520, y: 936 }, speed: 'NORMAL', transition: 'EASE_IN_OUT', wait: true, waitSkip: 0, zoom: 1, type: 'SET_CAMERA_POS' },
+				{ ignoreSlowDown: false, type: 'WAIT', time: 0.5 },
+				{ speed: 'NORMAL', transition: 'EASE_IN_OUT', wait: false, waitSkip: 0, type: 'RESET_CAMERA' },
+				// The boss's walk-in rumble sequence (HORIZONTAL shakes with the same
+				// power/speed/timing as the original DO_ACTION; movement steps removed).
+				{ rumbleType: 'HORIZONTAL', name: '', duration: 0.3, power: 'MEDIUM', speed: 'FASTER', fade: false, type: 'RUMBLE_SCREEN' },
+				{ ignoreSlowDown: false, type: 'WAIT', time: 2.4 },
+				{ rumbleType: 'HORIZONTAL', name: '', duration: 0.4, power: 'MEDIUM', speed: 'FASTER', fade: false, type: 'RUMBLE_SCREEN' },
+				{ ignoreSlowDown: false, type: 'WAIT', time: 1.7 },
+				{ rumbleType: 'HORIZONTAL', name: '', duration: 0.4, power: 'STRONG', speed: 'FAST', fade: false, type: 'RUMBLE_SCREEN' },
+				{ ignoreSlowDown: false, type: 'WAIT', time: 1.0 },
+				{ rumbleType: 'HORIZONTAL', name: '', duration: 0.4, power: 'STRONG', speed: 'FASTER', fade: false, type: 'RUMBLE_SCREEN' },
+			];
+			return new EventCtor({ name: 'mpDrillBossIntro', steps });
+		} catch (_) { return null; }
+	}
+
 	public broadcastEnemyCounterDone(group: string, preVar: string, postVar: string): void {
 		try {
 			if (!this.main.connection || !this.main.connection.isOpen()) return;
@@ -8840,7 +10847,14 @@ export class NetSync {
 				const e: any = entities[i];
 				if (!(e instanceof Bomb) || e._killed || !e.coll) continue;
 				if (e._mpBombCopy) continue;
-				if (!(e.timer > 0) && !e.heatMode) continue;   // only launched bombs
+				if (!(e.timer > 0) && !e.heatMode) {
+				// 1.75.x (drill-boss bombs): RAIN_BOMB drops inert, panel-less bombs
+				// (timer 0) that only start when a player's ball hits them — they were
+				// invisible to members until that hit. Stream the HOST's inert boss
+				// bombs so members see the raining bombs and can hit/heat them via the
+				// existing bombInteract forwarding.
+				if (!this.main.host || (this.mapName !== 'cold-dng/g/boss' && this.mapName !== 'cold-dng.g.boss') || e.panel || !e.noHeatFocus) continue;
+			}
 				const vel = e.coll.vel || { x: 0, y: 0, z: 0 };
 				list.push({
 					i: e.uid,
@@ -8864,6 +10878,44 @@ export class NetSync {
 			const conn: any = this.main.connection;
 			if (typeof conn.bombExplode === 'function') conn.bombExplode({ map, i: uid, pmi, x: Math.round(x), y: Math.round(y), z: Math.round(z) });
 		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (drill-boss bomb landing dust): a HOST-owned boss bomb touched the
+	 * ground hard enough to spawn the vanilla dust puff. Relay it through the
+	 * enemyFx wire as a fixed world effect on the boss uid so members replay the
+	 * same `dust/medium` puff (no protocol change). */
+	public relayBombLandingDust(bomb: any, impact: any): void {
+		try {
+			if (!this.main.host) return;                 // boss bombs exist on the host only
+			if (!bomb || bomb._killed || !bomb.coll) return;
+			if (this.mapName !== 'cold-dng/g/boss' && this.mapName !== 'cold-dng.g.boss') return;
+			if (bomb.panel || typeof impact !== 'number' || !(impact < -50)) return; // same gate as vanilla onTouchGround
+			if (!this.main.connection || !this.main.connection.isOpen()) return;
+			// Find the boss uid to anchor the fixed-effect packet (server enemyFx
+			// rejects uid 0).
+			let bossUid = 0;
+			try {
+				const Enemy: any = (ig.ENTITY as any).Enemy;
+				const list: any[] = (ig.game as any).entities || [];
+				for (const e of list) {
+					if (e && !e._killed && e instanceof Enemy && !e._mpMirror && !e._mpPuppet
+						&& (e.name === 'boss' || (e.enemyType && e.enemyType.name === 'boss-driller'))
+						&& typeof e.uid === 'number' && e.uid > 0) { bossUid = e.uid; break; }
+				}
+			} catch (_) { /* fall through */ }
+			if (!bossUid) return;
+			let cx = 0, cy = 0, cz = 0;
+			try {
+				const c = bomb.coll;
+				cx = Math.round(c.pos.x + (c.size ? c.size.x / 2 : 0));
+				cy = Math.round(c.pos.y + (c.size ? c.size.y / 2 : 0));
+				cz = Math.round(c.pos.z);
+			} catch (_) { return; }
+			const conn: any = this.main.connection;
+			if (typeof conn.enemyFx === 'function') {
+				conn.enemyFx({ uid: bossUid, sheet: '__mpFx', key: 'dustMedium', f: { x: cx, y: cy, z: cz }, p: {} });
+			}
+		} catch (_) { /* dust is cosmetic */ }
 	}
 
 	/** 1.73.x (bomb sync, receiver): drive the visual bomb copy (dead-reckon, same
@@ -8910,7 +10962,17 @@ export class NetSync {
 				e._mpProjBaseAt = now;
 				// Last-second ticking + heat visuals (visual only — the copy never explodes itself).
 				const t = typeof s.t === 'number' ? s.t : 0;
-				if (!e._mpLastSec && t > 0 && t <= 0.75) {
+// 1.75.x (drill-boss bombs): an inert bomb turned active on the host — switch the
+// copy from its dropped "off" frame to the ticking anim + glow.
+if (!e._mpBombTicking && t > 0) {
+e._mpBombTicking = true;
+try {
+e.setCurrentAnim('ticking');
+if (e.fxHandle) { try { e.fxHandle.stop(); } catch (_) { /* ignore */ } }
+e.fxHandle = e.effects.bomb.spawnOnTarget('active', e, { duration: -1 });
+} catch (_) { /* ignore */ }
+}
+if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					e._mpLastSec = true;
 					try {
 						e.setCurrentAnim('tickingEnd');
@@ -8991,8 +11053,11 @@ export class NetSync {
 			e.heatMode = false;
 			e._mpBombPanelMi = (typeof s.pmi === 'number') ? s.pmi : 0;
 			e._mpSnapNext = true;
-			try { e.setCurrentAnim('ticking'); } catch (_) { /* ignore */ }
-			try { e.effects.bomb.spawnOnTarget('active', e, { duration: -1 }); } catch (_) { /* ignore */ }
+			try { e.setCurrentAnim(typeof s.t === 'number' && s.t > 0 ? 'ticking' : 'off'); } catch (_) { /* ignore */ }
+		e._mpBombTicking = !!(typeof s.t === 'number' && s.t > 0);
+		e._mpLastSec = false;
+		e._mpHeatFx = false;
+		if (typeof s.t === 'number' && s.t > 0) { try { e.effects.bomb.spawnOnTarget('active', e, { duration: -1 }); } catch (_) { /* ignore */ } }
 			this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z });
 			return e;
 		} catch (_) { return null; }
@@ -9060,10 +11125,13 @@ export class NetSync {
 				if (e && !e._killed && Bomb && e instanceof Bomb && !e._mpBombCopy && e.uid === data.i) { bomb = e; break; }
 			}
 			if (!bomb) return;
+		const dir = { x: (typeof data.dirx === 'number' ? data.dirx : 0), y: (typeof data.diry === 'number' ? data.diry : 1) };
+		const owner = ((ig.game as any).playerEntity && !(ig.game as any).playerEntity._killed)
+			? (ig.game as any).playerEntity : bomb.combatant;
 			if (data.kind === 'heat') {
-				try { bomb.enterHeatMode({ x: (typeof data.dirx === 'number' ? data.dirx : 0), y: (typeof data.diry === 'number' ? data.diry : 1) }, bomb.combatant); } catch (_) { /* ignore */ }
+				try { bomb.enterHeatMode(dir, owner); } catch (_) { /* ignore */ }
 			} else {
-				try { bomb.explode(); } catch (_) { /* ignore */ }
+				try { if (!bomb.timer && !bomb.heatMode) { bomb.start(dir, owner); } else { bomb.explode(); } } catch (_) { /* ignore */ }
 			}
 		} catch (_) { /* never break sync */ }
 	}
@@ -9178,20 +11246,194 @@ export class NetSync {
 		} catch (_) { /* visuals must never break sync */ }
 	}
 
-	// ---- round 16 (issue 4): party-size monster stat scaling (HOST side only) ----
+	/** 1.76.x (element-mode walk aura on mirrors): vanilla draws the
+	 * <element>Aura particle loop (sheet combat.mode, group "modeAura") under
+	 * the LOCAL player's feet while they move / aim / guard in a non-neutral
+	 * element (Player.update calls sc.combat.showModeAura / clearModeAura
+	 * every frame). Remote mirrors never run that logic — their stand-in model
+	 * has no currentElementMode — so the walk particles were invisible to
+	 * everyone but the owner. The owner's element already streams in
+	 * playerState (`em`, cached as _mpLastEm), so this replicates the aura
+	 * LOCALLY on every client: no protocol change, no relay (the mirror's
+	 * _mpMirror flag keeps the spawnOnTarget enemy-relay gate closed), and the
+	 * engine's own showModeAura is idempotent — its internal effect-id guard
+	 * skips re-spawning while the matching loop already runs, so per-frame
+	 * calls cost one getFirstEffect scan. Movement is measured from the
+	 * mirror's rendered position deltas (the stream lerp does not maintain
+	 * coll.accelDir) with a ~250ms hysteresis so stream jitter can't blink the
+	 * loop; the aura clears within one hysteresis window of the owner
+	 * stopping / hitting neutral / the mirror fading out. */
+	private updateMirrorModeAura(): void {
+		try {
+			const combat: any = (sc as any).combat;
+			const et: any = (ig as any).EffectTools;
+			if (!combat || typeof combat.showModeAura !== 'function'
+				|| typeof combat.clearModeAura !== 'function'
+				|| !et || typeof et.getFirstEffect !== 'function') return;
+			const nowMs = Date.now();
+			for (const name in this.main.players) {
+				const entry: any = this.main.players[name];
+				if (!entry) continue;
+				const e: any = entry.entity;
+				if (!e || e._killed || !e.coll) continue;
+				const em: number = (typeof e._mpLastEm === 'number') ? e._mpLastEm : 0;
+				if (!(em >= 1 && em <= 4)) {
+					// Neutral or unknown element: end any leftover loop right away.
+					if (et.getFirstEffect(e, 'modeAura')) combat.clearModeAura(e);
+					e._mpAuraMovedAt = 0;
+					continue;
+				}
+				const px = e.coll.pos.x, py = e.coll.pos.y;
+				const lp: any = e._mpAuraPos;
+				if (!lp) {
+					e._mpAuraPos = { x: px, y: py };
+				} else {
+					const dx = px - lp.x, dy = py - lp.y;
+					// ~0.5px/frame: low enough for a 144Hz display + slow walk
+					// (~0.55px/frame), high enough that a converged lerp reads 0.
+					if (dx * dx + dy * dy > 0.25) {
+						e._mpAuraPos = { x: px, y: py };
+						e._mpAuraMovedAt = nowMs;
+					}
+				}
+				const moving = nowMs - (e._mpAuraMovedAt || 0) < 250;
+				// Vanilla also keeps the aura while aiming/charging (state != 0)
+				// even standing still — _mpCharging is that state's only stream.
+				const active = moving || !!e._mpCharging;
+				// Suppressed while the mirror is faded out (cutscene ghost, door
+				// transition, story video): reuse the fade pass's target-alpha cache.
+				const faded = this.inCutscene || !!entry._mpCutscene || !!e._mpDying
+					|| (this._mpMirrorFadeCache.has(e) && (this._mpMirrorFadeCache.get(e) as any).alpha < 1);
+				if (active && !faded) combat.showModeAura(e, em);
+				else if (et.getFirstEffect(e, 'modeAura')) combat.clearModeAura(e);
+			}
+		} catch (_) { /* visuals must never break sync */ }
+	}
+
+	/** 1.76.x (jump-panel FX on mirrors): vanilla jump panels (ig.ENTITY.
+	 * JumpPanel / JumpPanelFar / JumpPanelFloat) fire their visuals from the
+	 * JUMPER'S OWN engine update — ActorEntity.update calls the panel's
+	 * onTopEntityJump/onTopEntityJumpFar (Float panels: collideWith) only for
+	 * an entity that physically pushes against the panel while grounded.
+	 * Remote mirrors never run that physics (their position is stream-driven),
+	 * so a bouncing teammate launched silently on every observer's screen: no
+	 * jumpTrail streak on the jumper, no jumpButtom ring on the panel, no glow
+	 * blink. The mirror's streamed z rises through the launch, so the ascent
+	 * is detected LOCALLY — no protocol change — and the panel's own FX are
+	 * replayed through the panel entity (identical keys / durations). The
+	 * sheet-'puzzle' spawnOnTarget relay gates stay closed (panels are not
+	 * Enemies; the jumper target carries _mpMirror), so nothing re-broadcasts.
+	 *
+	 * Detection: a FLAT frame (|dz| below the noise floor) refreshes the
+	 * last-grounded snapshot (position + time); a later frame with a vertical
+	 * velocity over ~110px/s within 600ms of that snapshot is a launch (panel
+	 * launches are 155-490px/s; slopes/stairs/elevators stay well under
+	 * 110). The panel search runs against the GROUND snapshot, not the
+	 * current position — Far panels fling the player at up to 670px/s
+	 * horizontally, so by detection time the mirror has long left the panel,
+	 * but the last flat spot is exactly where the bounce happened. A 900ms
+	 * per-mirror cooldown absorbs the lerp ramp so one bounce replays once. */
+	private updateMirrorJumpPanelFx(): void {
+		try {
+			const ENT: any = (ig as any).ENTITY;
+			const PanelCtor: any = ENT && ENT.JumpPanel;
+			const FarCtor: any = ENT && ENT.JumpPanelFar;
+			const FloatCtor: any = ENT && ENT.JumpPanelFloat;
+			if (!PanelCtor && !FarCtor && !FloatCtor) return;
+			const dt: number = Math.max(ig.system.tick, 1 / 240);
+			const nowMs = Date.now();
+			for (const name in this.main.players) {
+				const entry: any = this.main.players[name];
+				if (!entry) continue;
+				const e: any = entry.entity;
+				if (!e || e._killed || !e.coll) continue;
+				const cpm: any = e.coll.pos;
+				const z: number = (typeof cpm.zProtected === 'number') ? cpm.zProtected : cpm.z;
+				const prev: number = (typeof e._mpJpPrevZ === 'number') ? e._mpJpPrevZ : z;
+				e._mpJpPrevZ = z;
+				const dz = z - prev;
+				if (Math.abs(dz) <= 0.5 * dt * 60) {
+					// Flat frame: remember where/when the mirror last stood grounded.
+					e._mpJpFlatX = cpm.x;
+					e._mpJpFlatY = cpm.y;
+					e._mpJpFlatZ = z;
+					e._mpJpFlatAt = nowMs;
+					continue;
+				}
+				const launched = dz / dt > 110
+					&& typeof e._mpJpFlatAt === 'number' && nowMs - e._mpJpFlatAt < 600
+					&& nowMs - (e._mpJpLastFire || 0) > 900;
+				if (!launched) continue;
+				// Rare event — a full entity scan around the last-grounded spot
+				// is fine here.
+				const refX: number = (typeof e._mpJpFlatX === 'number') ? e._mpJpFlatX : cpm.x;
+				const refY: number = (typeof e._mpJpFlatY === 'number') ? e._mpJpFlatY : cpm.y;
+				const refZ: number = (typeof e._mpJpFlatZ === 'number') ? e._mpJpFlatZ : z;
+				const ents: any[] = (ig.game as any).entities || [];
+				let panel: any = null;
+				let kind = 0; // 1 = JumpPanel, 2 = Far, 3 = Float
+				for (let i = 0; i < ents.length; i++) {
+					const p: any = ents[i];
+					if (!p || p._killed || !p.coll || !p.effects) continue;
+					let k = 0;
+					if (PanelCtor && p instanceof PanelCtor) k = 1;
+					else if (FarCtor && p instanceof FarCtor) k = 2;
+					else if (FloatCtor && p instanceof FloatCtor) k = 3;
+					if (!k) continue;
+					const pc: any = p.coll;
+					const margin = Math.max(pc.size.x, pc.size.y) / 2 + 40;
+					if (Math.abs(refX + e.coll.size.x / 2 - (pc.pos.x + pc.size.x / 2)) > margin) continue;
+					if (Math.abs(refY + e.coll.size.y / 2 - (pc.pos.y + pc.size.y / 2)) > margin) continue;
+					if (Math.abs(refZ - pc.pos.z) > 24) continue;
+					panel = p;
+					kind = k;
+					break;
+				}
+				if (!panel) continue;
+				e._mpJpLastFire = nowMs;
+				this.replayJumpPanelFx(panel, kind, e);
+			}
+		} catch (_) { /* visuals must never break sync */ }
+	}
+
+	/** 1.76.x: replay a jump panel's activation visuals for a remote jumper —
+	 * exactly the engine's own spawn calls minus the physics (the mirror's
+	 * motion is already stream-driven). Float panels have no glow anim switch
+	 * in their collideWith, so they are skipped for the blink like vanilla. */
+	private replayJumpPanelFx(panel: any, kind: number, jumper: any): void {
+		try {
+			if (!panel || panel._killed || !panel.effects || typeof panel.effects.spawnOnTarget !== 'function') return;
+			const dur = (panel.jumpHeightData && typeof panel.jumpHeightData.effectDuration === 'number')
+				? panel.jumpHeightData.effectDuration
+				: ((panel.jumpDistance && typeof panel.jumpDistance.effectDuration === 'number') ? panel.jumpDistance.effectDuration : 0.3);
+			if (kind === 1) panel.effects.spawnOnTarget('jumpTrail', jumper, { duration: dur });
+			else panel.effects.spawnOnTarget('jumpTrailFar', jumper, { duration: dur });
+			panel.effects.spawnOnTarget('jumpButtom', panel);
+			if (kind !== 3 && typeof panel.setCurrentAnim === 'function') {
+				try { panel.setCurrentAnim('glow', true, panel.isOn ? 'normal' : 'off', true); } catch (_) { /* anim is cosmetic */ }
+			}
+		} catch (_) { /* visuals must never break sync */ }
+	}
+
+	// ---- round 16 (issue 4): monster stat scaling (HOST side only) ----
+	// 1.75.x: the base is the ROOM's player count, not the party roster — see
+	// currentExtraCount / updateRoomScaleWatcher.
 	//
-	// The server sends `hpScale` = the extra max-HP fraction per ADDITIONAL party
-	// member (handshakeResponse, config monsterHpPerPlayer, default 0.7), plus
+	// The server sends `hpScale` = the extra max-HP fraction per ADDITIONAL
+	// player in the room (handshakeResponse, config monsterHpPerPlayer, default
+	// 0.7), plus
 	// attackScale/defenseScale/focusScale (default 0.1), resistFlat/resistPercent
 	// (default 0), and statusScale (elemental-status THRESHOLD, default 0.6).
-	// The HOST scales every enemy it spawns:
-	//   maxHp'     = maxHp * (1 + hpScale * (partySize - 1)) — currentHp likewise
-	//   stat'      = stat * (1 + statScale * (partySize - 1)) for attack/defense/focus
+	// The HOST scales every enemy it spawns (n = players currently in the room):
+	//   maxHp'     = maxHp * (1 + hpScale * (n - 1)) — currentHp likewise
+	//                (1.76.x: BOSS enemies — enemyType.boss — use hpScaleBoss, a
+	//                separate increment, config monsterBossHpPerPlayer default 0.9)
+	//   stat'      = stat * (1 + statScale * (n - 1)) for attack/defense/focus
 	//   resistance R = 1 - elemFactor; R' = (R + flat*(n-1)) * (positive ? 1+pct*(n-1)
 	//   : 1) — the percentage boost never touches a weakness.
-	//   statusInflict' = statusInflict / (1 + statusScale * (partySize - 1)) — charge
+	//   statusInflict' = statusInflict / (1 + statusScale * (n - 1)) — charge
 	//   gain is linear in statusInflict, so every elemental status bar needs exactly
-	//   1 + statusScale * (partySize - 1) times the solo hit count to fill.
+	//   1 + statusScale * (n - 1) times the solo hit count to fill.
 	// Members NEVER scale — their puppets are locked mirrors of host enemies, and the
 	// host streams the authoritative (already-scaled) HP via the entityState block
 	// (`m` = maxHp, `h` = currentHp) and elemental status charge via `st`.
@@ -9201,6 +11443,14 @@ export class NetSync {
 		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.7;
 		v = Math.max(0, Math.min(10, v));
 		this._mpHpScale = v;
+	}
+
+	/** Store the server-provided per-extra-member BOSS-only HP fraction
+	 * (clamped [0, 10]). */
+	public setHpScaleBoss(f: number): void {
+		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.9;
+		v = Math.max(0, Math.min(10, v));
+		this._mpHpScaleBoss = v;
 	}
 
 	/** Store the server-provided per-extra-member break-threshold fraction
@@ -9278,38 +11528,54 @@ export class NetSync {
 		}
 	}
 
-	/** Extra party-member count beyond the first (0 when solo). partySize counts
-	 * every party member INCLUDING native bots (bots are party members on the
-	 * server and fight too). */
+	/** 1.75.x (room-size monster scaling, user directive): scaling keys on the
+	 * number of players sharing THIS ROOM — our current map inside the instance —
+	 * NOT the party roster (and never bots). playerMapByName tracks every OTHER
+	 * instance member's current (sub-)map and never contains ourselves, so the
+	 * map-match count IS the extra-player count (0 = alone in the room -> no
+	 * scaling). A party member fighting on ANOTHER map no longer buffs our
+	 * enemies; a teammate standing next to us does. */
 	private currentExtraCount(): number {
 		try {
-			const pm = this.main.partyMembers;
-			const bots = this.main.partyBots;
-			const size = (pm && pm.length || 0) + (bots && bots.length || 0);
-			return size <= 1 ? 0 : size - 1;
+			const map = this.mapName || ((ig.game && (ig.game as any).mapName) || '');
+			if (!map) return 0;
+			const pmap: any = (this.main as any).playerMapByName;
+			if (!pmap) return 0;
+			let n = 0;
+			for (const name in pmap) { if (pmap[name] === map) n++; }
+			return n;
 		} catch (_) { return 0; }
 	}
 
-	/** Generic party-size multiplier = 1 + perPlayer * extra (1 when solo). */
+	/** Generic room-size multiplier = 1 + perPlayer * extra (1 when alone). */
 	private currentStatMultiplier(perPlayer: number): number {
 		const extra = this.currentExtraCount();
 		return extra <= 0 ? 1 : 1 + perPlayer * extra;
 	}
 
-	/** The HOST's current party-size HP multiplier = 1 + hpScale * (partySize - 1).
-	 * No party / size <= 1 -> 1 (no scaling). */
-	private currentHpMultiplier(): number {
-		return this.currentStatMultiplier(this._mpHpScale);
+	/** 1.76.x: true for boss enemies (enemyType.boss — the same flag the engine's
+	 * big HP bar and the manualKill defeat chain key on). */
+	private isBossEnemy(e: any): boolean {
+		try { return !!(e && e.enemyType && e.enemyType.boss); } catch (_) { return false; }
+	}
+
+	/** The HOST's current room-size HP multiplier for ONE enemy =
+	 * 1 + hpScale * (playersInRoom - 1); alone in the room -> 1 (no scaling).
+	 * 1.76.x: bosses use their OWN increment (_mpHpScaleBoss), everything else the
+	 * standard one (_mpHpScale). Drives both the spawn scale and the mid-fight
+	 * live rescale, so a boss never mixes the two factors. */
+	private currentHpMultiplierFor(e: any): number {
+		return this.currentStatMultiplier(this.isBossEnemy(e) ? this._mpHpScaleBoss : this._mpHpScale);
 	}
 
 	/** The HOST's current break-threshold multiplier = 1 + breakScale *
-	 * (partySize - 1). Solo / no party -> 1 (no scaling). */
+	 * (playersInRoom - 1). Alone in the room -> 1 (no scaling). */
 	private currentBreakMultiplier(): number {
 		return this.currentStatMultiplier(this._mpBreakScale);
 	}
 
 	/** The HOST's current elemental-status threshold multiplier = 1 + statusScale *
-	 * (partySize - 1). Solo / no party -> 1 (no scaling). */
+	 * (playersInRoom - 1). Alone in the room -> 1 (no scaling). */
 	private currentStatusThresholdMultiplier(): number {
 		return this.currentStatMultiplier(this._mpStatusScale);
 	}
@@ -9338,9 +11604,12 @@ export class NetSync {
 		return 1 - r;
 	}
 
-	/** Multiply a HIT (hit-count break) tracker's threshold by `mult`. Leaves the
-	 * accumulated `current` untouched, so break progress recedes/grows
-	 * proportionally when the party size changes. */
+	/** Multiply a HIT (hit-count break) tracker's threshold by `mult`. 1.75.x:
+	 * the accumulated `current` scales by the SAME ratio — the break bar's visual
+	 * fraction (weakness = current/target) survives a room-size change exactly
+	 * like the HP bar's current/max fraction does, while each future hit
+	 * contributes proportionally less/more toward the new threshold. At spawn
+	 * `current` is 0, so the spawn-time call is unaffected. */
 	private scaleBreakTracker(tr: any, mult: number): void {
 		try {
 			if (!tr || mult === 1) return;
@@ -9350,6 +11619,7 @@ export class NetSync {
 					if (typeof tr.hpBreakTargets[i] === 'number') tr.hpBreakTargets[i] = tr.hpBreakTargets[i] * mult;
 				}
 			}
+			if (typeof tr.current === 'number') tr.current = tr.current * mult;
 		} catch (_) { /* never break */ }
 	}
 
@@ -9392,7 +11662,8 @@ export class NetSync {
 			if (typeof e._mpStatusScaled !== 'number') e._mpStatusScaled = statusT;
 			const maxHp = (typeof p.getStat === 'function') ? p.getStat('hp') : (p.baseParams && p.baseParams.hp);
 			if (typeof maxHp !== 'number' || maxHp <= 0) { e._mpHpScaled = 1; return; }
-			const mult = this.currentHpMultiplier();
+			// 1.76.x: bosses scale by their own increment (hpScaleBoss).
+			const mult = this.currentHpMultiplierFor(e);
 			const atkM = this.currentStatMultiplier(this._mpAttackScale);
 			const defM = this.currentStatMultiplier(this._mpDefenseScale);
 			const focM = this.currentStatMultiplier(this._mpFocusScale);
@@ -9495,8 +11766,8 @@ export class NetSync {
 		} catch (_) { /* cosmetic */ }
 	}
 
-	/** HOST side: party-size changed mid-fight (join/leave while we're on a map).
-	 * Walk the live host enemies on the current map and proportionally adjust current
+	/** HOST side: the room's player count changed mid-fight (a player entered or
+	 * left our map). Walk the live host enemies on the current map and proportionally adjust current
 	 * HP + max HP from the stored old factor (_mpHpScaled) to the new one
 	 * (newHp = hp * newFactor / oldFactor). Keeps hp <= new max, never below 1 unless
 	 * already dead. Attack/defense/focus rescale by the same ratio from the stored
@@ -9507,7 +11778,6 @@ export class NetSync {
 	public rescaleLiveEnemies(): void {
 		try {
 			if (!this.main.host) return;
-			const mult = this.currentHpMultiplier();
 			const atkM = this.currentStatMultiplier(this._mpAttackScale);
 			const defM = this.currentStatMultiplier(this._mpDefenseScale);
 			const focM = this.currentStatMultiplier(this._mpFocusScale);
@@ -9523,6 +11793,9 @@ export class NetSync {
 			for (let i = 0; i < list.length; i++) {
 				const e: any = list[i];
 				if (!(e instanceof Enemy) || e._mpMirror || e._killed || !e.params) continue;
+				// 1.76.x: per-entity HP factor — bosses carry their own increment
+				// (hpScaleBoss), so the ratio transition stays within one scheme.
+				const mult = this.currentHpMultiplierFor(e);
 				const p: any = e.params;
 				if (typeof p.currentHp === 'number' && p.currentHp <= 0) continue; // already dead
 				const oldF = e._mpHpScaled;
@@ -9572,7 +11845,7 @@ export class NetSync {
 				}
 				if (statusChanged) e._mpStatusScaled = statusT;
 				// Element-mode param copies follow the same adjustments so a mode
-				// switch after the party change keeps every scaled value.
+				// switch after the room-size change keeps every scaled value.
 				if (e.elementModes && e.elementModes.modes && (hpChanged || statsChanged || statusChanged)) {
 					for (const k in e.elementModes.modes) {
 						const md = e.elementModes.modes[k];
@@ -9604,6 +11877,30 @@ export class NetSync {
 					e._mpBreakScaled = breakM;
 				}
 				e._mpStatScaled = { atk: atkM, def: defM, foc: focM, flat: flatAmt, pct: pctAmt };
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** 1.75.x (room-size scaling): the room's player count as of the last tick
+	 * (-1 = not measured yet — the first measure must not fire a rescale; spawn
+	 * scaling already uses the live count). */
+	private _mpRoomExtra = -1;
+
+	/** 1.75.x (room-size scaling): per-tick watcher. When the room's player count
+	 * changes mid-map (a player entered or left the room), the HOST rescales
+	 * every live enemy (rescaleLiveEnemies — proportional max/current HP, stats,
+	 * statusInflict and break thresholds+accumulators, so every bar keeps its
+	 * visual fraction while the enemy gets tankier or frailer). Member puppets
+	 * mirror the host's streamed values, so only the host acts. */
+	private updateRoomScaleWatcher(): void {
+		try {
+			const extra = this.currentExtraCount();
+			if (extra === this._mpRoomExtra) return;
+			const had = this._mpRoomExtra;
+			this._mpRoomExtra = extra;
+			if (had >= 0 && this.main.host) {
+				console.log('[netsync] room player count changed ' + had + ' -> ' + extra + ' extra — rescaling live enemies');
+				this.rescaleLiveEnemies();
 			}
 		} catch (_) { /* never break the frame */ }
 	}
@@ -9685,7 +11982,7 @@ export class NetSync {
 			// NOTE: do NOT skip `_hidden` here — a host enemy that burrows/phases must stay
 			// in the block or members would reap (kill) its puppet and lose the adopted map
 			// enemy. We keep streaming it (frozen in place) so the puppet survives.
-			if (e._mpMirror || e._killed || !e.coll) continue;
+			if (e._mpMirror || e._mpPuppet || e._killed || !e.coll) continue;
 			// ROUND 73 (fix 2c — autumn path-3 ghost enemies): an enemy that was never
 			// FULLY initialized on the host must not enter the block. The engine's
 			// spawnEntity returns null BEFORE show() when an entity's spawnCondition is
@@ -9742,7 +12039,7 @@ export class NetSync {
 		for (let i = 0; i < list.length; i++) {
 			const e: any = list[i];
 			if (!(e instanceof Enemy)) continue;
-			if (e._mpMirror || e._killed || !e.coll) continue;
+			if (e._mpMirror || e._mpPuppet || e._killed || !e.coll) continue;
 			// ROUND 73 (fix 2c): never-initialized zombies stay out of this stream too
 			// (see the base stream's comment — same _hidden-undefined / !params test).
 			if (e._hidden === undefined || !e.params) {
@@ -9821,6 +12118,14 @@ export class NetSync {
 			// ROUND 66: active shields (poise/state guards) — the puppet's native
 			// isShielded needs them to reduce the member's damage exactly like the host.
 			sh: this.encodeEnemyShields(e),
+			// 1.75.x (drill-boss chest armor): shieldHp actor attribute, present only
+			// when the enemy actually owns a `shield` animation part.
+			shp: this.readEnemyShieldHp(e),
+			// ROUND 139: ship the manualKill var name (bosses only; undefined drops out
+			// of the JSON). A typed-fallback puppet has no map settings of its own, so
+			// without this its stageBossDefeatCinematic no-ops and the boss vanishes on
+			// the member instead of playing the scripted defeat cinematic.
+			mk: (typeof e.manualKill === 'string' && e.manualKill && e.manualKill.length <= 96) ? e.manualKill : undefined,
 		};
 		const prev = deltaMap.get(e.uid);
 		// ROUND 61 (fix A): a burrowed/phased/hidden enemy (hillkat earthIn/earthOut) can
@@ -10157,6 +12462,9 @@ export class NetSync {
 					|| JSON.stringify(x.ef || null) !== JSON.stringify(y.ef || null)) return true;
 			}
 		}
+		// 1.75.x (drill-boss chest armor): a plate tier change ships even when the
+		// boss otherwise holds still.
+		if ((a.shp === undefined ? -1 : a.shp) !== (b.shp === undefined ? -1 : b.shp)) return true;
 		return false;
 	}
 
@@ -10227,6 +12535,24 @@ export class NetSync {
 				out.push(snap);
 			}
 			return out.length ? out : undefined;
+		} catch (_) { return undefined; }
+	}
+
+	/** 1.75.x (drill-boss chest armor): the host enemy's shieldHp attribute,
+	 * shipped only for enemies that actually own a `shield` animation part (so a
+	 * plain 0 never reaches unrelated enemies). */
+	private readEnemyShieldHp(e: any): number | undefined {
+		try {
+			if (!e || !e.coll || !Array.isArray(e.coll.subColls)) return undefined;
+			let hasShieldPart = false;
+			const subs: any[] = e.coll.subColls;
+			for (let i = subs.length; i--;) {
+				const ent: any = subs[i] && subs[i].entity;
+				if (ent && ent.partName === 'shield') { hasShieldPart = true; break; }
+			}
+			if (!hasShieldPart || typeof e.getAttribute !== 'function') return undefined;
+			const v = Number(e.getAttribute('shieldHp'));
+			return isFinite(v) ? Math.max(0, Math.min(99, Math.round(v))) : undefined;
 		} catch (_) { return undefined; }
 	}
 
@@ -11204,6 +13530,7 @@ export class NetSync {
 				const e: any = entities[i];
 				if (!(e instanceof Enemy) || e._killed || e._mpMirror || !e.coll) continue;
 				if (!e._mpCutsceneSpawned) continue;
+				if (e._hidden) continue; // 1.75.x: never stream still-dormant quest wave entities
 				if (list.length >= 64) break;
 				const face = e.face || { x: 0, y: 1 };
 				list.push({
@@ -11217,6 +13544,10 @@ export class NetSync {
 					a: typeof e.currentAnim === 'string' ? e.currentAnim : '',
 					h: e.params ? e.params.currentHp : 0,
 					m: e.params && e.params.getStat ? e.params.getStat('hp') : 0,
+					// 1.75.x: per-player quest waves carry their mapId + q=1 so the HOST
+					// can also render them as csPuppets (deduped against its own copy).
+					mi: e.mapId || 0,
+					q: this.isLocalQuestWaveEnemy(e) ? 1 : 0,
 				});
 			}
 			if (!list.length) return;
@@ -11234,14 +13565,26 @@ export class NetSync {
 	private applyCutsceneEntity(from: string, data: { map: string, list: any[] }): void {
 		try {
 			if (!from || from === this.main.name) return;      // skip own echo
-			if (this.main.host) return;                       // host renders real enemies
 			if (!data || !Array.isArray(data.list)) return;
 			if (!data.map || data.map !== this.mapName) return; // stream for a map we left
+			const isHost = this.main.host;
+			// 1.75.x: the HOST renders its own real enemies, so ordinary cutscene
+			// entities are skipped there — but per-player quest waves (q=1) only exist
+			// on the member that triggered them, so the host renders those as csPuppets
+			// (deduped by mapId against a visible real copy of its own).
+			let list = data.list;
+			if (isHost) {
+				list = list.filter((s: any) => s && s.q === 1);
+				if (!list.length) return;
+			}
 			const now = Date.now();
 			this._mpCsOwnerSeen[from] = now;
 			const seen: { [key: string]: boolean } = Object.create(null);
-			for (const s of data.list) {
+			for (const s of list) {
 				if (!s || typeof s.uid !== 'number') continue;
+				// Host dedupe: if the host is ALSO running this quest encounter it
+				// already renders the same mapId as a real enemy — skip the cs copy.
+				if (isHost && s.mi && this.hostHasVisibleMapEnemy(s.mi)) continue;
 				const key = 'cs' + s.uid;
 				seen[key] = true;
 				let e: any = this.csPuppets[key];
@@ -11993,6 +14336,64 @@ export class NetSync {
 		} catch (_) { return false; }
 	}
 
+	/** 1.75.x (parkour-crash guard): the engine's TimersModel returns `null` for
+	 * `timers.<name>.remainingTime` when the timer does not exist, and VarCondition
+	 * coerces `null <= 0` to TRUE — so on a client that never started a local
+	 * timer, every timer-expiry EventTrigger (e.g. bergen-trail parkourFail) fires
+	 * immediately once the RUNNER's tmp/map vars are synced in. That remote reset
+	 * is then relayed back to the runner, whose parkourStart EventTrigger restarts
+	 * (startCondition tmp.parkourUpFirst is still true, path just got reset to 0)
+	 * and hits `roundBergenTimer is already in use` on ADD_TIMER. Treat a missing
+	 * timer as "not expired" (Infinity) — `remainingTimeNotNull` keeps its explicit
+	 * missing=0 contract, and no game data uses bare remainingTime as a value. */
+	private installTimerMissingGuard(): void {
+		try {
+			if (this._mpTimerMissingGuardInstalled) return;
+			const timers: any = (sc as any).timers;
+			if (!timers || typeof timers.getRemainingTimerTime !== 'function') return;
+			this._mpTimerMissingGuardInstalled = true;
+			const orig = timers.getRemainingTimerTime;
+			timers.getRemainingTimerTime = function (this: any, name: any, notNull?: any): any {
+				const m = (window as any).__mpMain;
+				const mp = !!(m && m.connection
+					&& typeof m.connection.isOpen === 'function' && m.connection.isOpen());
+				if (mp && !notNull && this && this.timers && !this.timers[name]) {
+					return Number.POSITIVE_INFINITY; // missing != expired (mp sync world only)
+				}
+				return orig.call(this, name, notNull);
+			};
+			console.log('[netsync] missing-timer remainingTime guard installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (parkour-crash guard, safety net): while connected, a duplicate
+	 * ADD_TIMER is the result of a synced-var restart racing a timer that already
+	 * exists (two runners, or a stale rollback packet). Vanilla throws "Timer with
+	 * name X is already in use!" and kills the game; keeping the existing timer is
+	 * always the survivable choice. Solo/offline keeps the engine's throw. */
+	private installTimerDuplicateGuard(): void {
+		try {
+			if (this._mpTimerDupGuardInstalled) return;
+			const timers: any = (sc as any).timers;
+			if (!timers || typeof timers.addTimer !== 'function') return;
+			this._mpTimerDupGuardInstalled = true;
+			const orig = timers.addTimer;
+			timers.addTimer = function (this: any, name: any) {
+				try {
+					const m = (window as any).__mpMain;
+					const mp = !!(m && m.connection
+						&& typeof m.connection.isOpen === 'function' && m.connection.isOpen());
+					if (mp && this && this.timers && this.timers[name]) {
+						console.warn('[netsync] duplicate ADD_TIMER suppressed (mp): ' + String(name));
+						return undefined;
+					}
+				} catch (_) { /* fall through to native throw */ }
+				return orig.apply(this, arguments as any);
+			};
+			console.log('[netsync] duplicate ADD_TIMER guard installed');
+		} catch (_) { /* ignore */ }
+	}
+
 	/** ROUND 133: wrap ig.vars writers so a local write to a CHEST-spawn-driving map/tmp
 	 * var is queued for relay. Installed once; idempotent via _mpSpawnVarHookInstalled. */
 	private installSpawnVarHook(): void {
@@ -12013,6 +14414,63 @@ export class NetSync {
 				};
 			}
 			console.log('[netsync] spawn-var relay hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (boss-phase quick revive): wrap EnemyType.resolveHpBreak so the HOST
+	 * notices the exact frame a boss crosses an hpBreak threshold (the engine's phase
+	 * split — the same thresholds the boss HP bar shows). Installed once per process;
+	 * the hook re-resolves the live NetSync through __mpMain so a reconnect's fresh
+	 * instance is honoured. */
+	private installBossPhaseHook(): void {
+		try {
+			const ET: any = (sc as any).EnemyType;
+			if (!ET || !ET.prototype || typeof ET.prototype.resolveHpBreak !== 'function'
+				|| ET.prototype._mpHpBreakWrapped) return;
+			ET.prototype._mpHpBreakWrapped = true;
+			const orig = ET.prototype.resolveHpBreak;
+			ET.prototype.resolveHpBreak = function (this: any, ...args: any[]) {
+				const enemy: any = args && args[1];
+				const before = (enemy && typeof enemy.hpBreakReached === 'number') ? enemy.hpBreakReached : -1;
+				const result = orig.apply(this, args);
+				try {
+					if (enemy && enemy.enemyType && enemy.enemyType.boss
+						&& typeof enemy.hpBreakReached === 'number' && enemy.hpBreakReached > before) {
+						const m = (window as any).__mpMain;
+						const ns = m && m.netSync;
+						if (ns && typeof ns.onBossPhaseBreak === 'function') {
+							ns.onBossPhaseBreak(enemy);
+						}
+					}
+				} catch (_) { /* never break the damage pipeline */ }
+				return result;
+			};
+			console.log('[netsync] boss hpBreak phase hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (boss-phase quick revive): wrap sc.Cutscene.startCombatCutscene so the
+	 * HOST also notices event-driven boss phase transitions. Boss fights like
+	 * tree-dng/f4 swap phases through COMBAT_CUTSCENE EventTriggers (whale <-> ape) —
+	 * those cross no hpBreak, so resolveHpBreak alone would miss them. Installed once
+	 * per process; re-resolves the live NetSync through __mpMain. */
+	private installCombatCutsceneHook(): void {
+		try {
+			const CS: any = (sc as any).Cutscene;
+			if (!CS || typeof CS.startCombatCutscene !== 'function' || CS._mpCombatCutsceneWrapped) return;
+			CS._mpCombatCutsceneWrapped = true;
+			const orig = CS.startCombatCutscene;
+			CS.startCombatCutscene = function (this: any, ...args: any[]) {
+				try {
+					const m = (window as any).__mpMain;
+					const ns = m && m.netSync;
+					if (ns && typeof ns.onBossCombatCutscene === 'function') {
+						try { ns.onBossCombatCutscene(); } catch (_) { /* ignore */ }
+					}
+				} catch (_) { /* never break the engine */ }
+				return orig.apply(this, args);
+			};
+			console.log('[netsync] combat-cutscene phase hook installed');
 		} catch (_) { /* ignore */ }
 	}
 
@@ -12038,11 +14496,175 @@ export class NetSync {
 		return null;
 	}
 
+	/** 1.75.x: parkour anchor progress is strictly PER-PLAYER. The standard parkour
+	 * marker vars (tmp.parkourPath / tmp.parkourUp / map.parkourDone / map.showFirstMarker
+	 * / map.parkourPath) must never cross clients — otherwise every teammate's marker
+	 * spawnConditions follow the runner's progress and the relayed rollback can even
+	 * restart the runner's own trigger (the roundBergenTimer crash). These are the
+	 * exact keys used by the four parkour maps (arena/autumn, autumn/path-7-1,
+	 * bergen-trail/path-5, templates/parkour). */
+	private isParkourMarkerVar(bucket: string, key: string): boolean {
+		if (!bucket || !key) return false;
+		if (bucket === 'tmp') {
+			return key === 'parkourPath' || key === 'parkourUp' || key === 'parkourUpFirst' || key === 'parkourDone';
+		}
+		if (bucket.indexOf('maps.') === 0) {
+			return key === 'parkourPath' || key === 'parkourDone' || key === 'showFirstMarker';
+		}
+		return false;
+	}
+
+	/** 1.75.x (per-player ground pickups): true when a conditional world entity is a
+	 * PROP whose interaction grants an ITEM directly (DROP_ITEM_ENTITY) — the laser
+	 * pickaxe / TNT / mining-docs props in Temple Mine and the stone key in the
+	 * jungle. Reads the RAW map settings (entity.settings) and falls back to the
+	 * runtime PropInteract event steps. */
+	private isGroundPickupEntity(e: any): boolean {
+		try {
+			if (!e) return false;
+			const list: any[] = [];
+			const s = e.settings;
+			if (s) {
+				if (s.interact) list.push(s.interact);
+				if (Array.isArray(s.condAnims)) {
+					for (const c of s.condAnims) if (c && c.interact) list.push(c.interact);
+				}
+			}
+			const rt = e.interact && e.interact.event;
+			if (rt && Array.isArray(rt.steps)) list.push({ event: rt.steps });
+			for (const ia of list) {
+				const ev = ia && ia.event;
+				if (!Array.isArray(ev)) continue;
+				for (const st of ev) {
+					if (st && st.type === 'DROP_ITEM_ENTITY') return true;
+				}
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** First DROP_ITEM_ENTITY item id from a ground-pickup entity's raw settings
+	 * (used for the poisoned-var self-heal on map entry). */
+	private getGroundPickupItemId(e: any): number {
+		try {
+			if (!e) return 0;
+			const s = e.settings;
+			const list: any[] = [];
+			if (s) {
+				if (s.interact) list.push(s.interact);
+				if (Array.isArray(s.condAnims)) {
+					for (const c of s.condAnims) if (c && c.interact) list.push(c.interact);
+				}
+			}
+			for (const ia of list) {
+				const ev = ia && ia.event;
+				if (!Array.isArray(ev)) continue;
+				for (const st of ev) {
+					if (st && st.type === 'DROP_ITEM_ENTITY') {
+						const id = Number(st.item);
+						if (isFinite(id) && id > 0) return id;
+					}
+				}
+			}
+		} catch (_) { /* ignore */ }
+		return 0;
+	}
+
+	/** The CHANGE_VAR_BOOL(true) var written by a ground-pickup Prop's interact
+	 * event (resolved to bucket/key). Only THIS var is mapped to the granted item
+	 * for the poisoned-var self-heal — never any other condition var the Prop may
+	 * also reference. */
+	private getGroundPickupTakenVar(e: any): { b: string, k: string } | null {
+		try {
+			if (!e) return null;
+			const s = e.settings;
+			const list: any[] = [];
+			if (s) {
+				if (s.interact) list.push(s.interact);
+				if (Array.isArray(s.condAnims)) {
+					for (const c of s.condAnims) if (c && c.interact) list.push(c.interact);
+				}
+			}
+			for (const ia of list) {
+				const ev = ia && ia.event;
+				if (!Array.isArray(ev)) continue;
+				for (const st of ev) {
+					if (st && st.type === 'CHANGE_VAR_BOOL' && st.value === true
+						&& typeof st.varName === 'string' && st.varName) {
+						return this.resolveSpawnVar(st.varName);
+					}
+				}
+			}
+		} catch (_) { /* ignore */ }
+		return null;
+	}
+
+	/** Known per-player ground-pickup var names (Temple Mine + the jungle stone
+	 * key + lab-entrance key-device). Used as a belt-and-braces skip even when the
+	 * relay bucket names a map that isn't loaded here. */
+	private isKnownPerPlayerPickupKey(key: string): boolean {
+		return key === 'pickaxeTaken' || key === 'dynamiteTaken' || key === 'dokuTaken'
+			|| key === 'tntTaken' || key === 'keyTaken' || key === 'deviceTaken';
+	}
+
+	/** True when bucket/key belongs to a per-player ground-pickup Prop on THIS map
+	 * (or is one of the known pickup keys). Public so storySync's side-quest var
+	 * relay can apply the exact same per-player filter. */
+	public isLocalPickupVar(bucket: string, key: string): boolean {
+		try {
+			if (!bucket || !key) return false;
+			if (this.isKnownPerPlayerPickupKey(key)) return true;
+			if ((this._mpLocalPickupVarSetMap || '') !== (this.mapName || '')) this.rebuildSpawnVarSet();
+			return !!this._mpLocalPickupVarSet[bucket + '|' + key];
+		} catch (_) { return false; }
+	}
+
+	/** 1.75.x (poisoned-var self-heal): on every map entry, if a ground-pickup var
+	 * is true but the LOCAL player doesn't own its KEY item, the old relay poisoned
+	 * this save — clear the var so the item respawns. Writes straight into
+	 * vars.storage.map (bypassing the hooked vars API) so the correction is never
+	 * re-relayed to anyone else. KEY items are permanent, so a legitimately picked
+	 * prop always passes the hasItem check. */
+	private correctLocalPickupVars(): void {
+		try {
+			if ((this._mpLocalPickupVarSetMap || '') !== (this.mapName || '')) this.rebuildSpawnVarSet();
+			const vars: any = (ig as any).vars;
+			const pm: any = (sc as any).model && (sc as any).model.player;
+			const inv: any = (sc as any).inventory;
+			const mapObj = vars && vars.storage && vars.storage.map;
+			if (!mapObj || !pm || typeof pm.hasItem !== 'function') return;
+			// Dynamic mapping first; known fallbacks guarantee Temple Mine / jungle
+			// pickups self-heal even if the raw settings scan ever fails.
+			const known: { [k: string]: number } = {
+				pickaxeTaken: 238, dynamiteTaken: 239, dokuTaken: 240, tntTaken: 239, keyTaken: 427,
+			};
+			const candidates: { [k: string]: number } = Object.assign({}, known, this._mpLocalPickupItems);
+			let changed = false;
+			for (const key in candidates) {
+				const item = candidates[key];
+				if (!(item > 0) || mapObj[key] !== true) continue;
+				if (pm.hasItem(item)) continue;
+				if (!inv || typeof inv.getItem !== 'function') continue;
+				const data: any = inv.getItem(item);
+				if (!data || data.type !== (sc as any).ITEMS_TYPES.KEY) continue; // only permanent KEY items self-heal
+				mapObj[key] = false;
+				changed = true;
+				try { console.warn('[netsync] healed per-player pickup var map.' + key + ' (item ' + item + ' not owned)'); } catch (_) { /* ignore */ }
+			}
+			if (changed) {
+				try { (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			}
+		} catch (_) { /* never break map entry */ }
+	}
+
 	/** Rebuild the resolved set of map/tmp vars that gate a CHEST conditionalEntity on
 	 * the current map (reads each chest's condition.vars). Rebuilt per map. */
 	private rebuildSpawnVarSet(): void {
 		this._mpSpawnVarSet = Object.create(null);
+		this._mpLocalPickupVarSet = Object.create(null);
+		this._mpLocalPickupItems = Object.create(null);
 		this._mpSpawnVarSetMap = this.mapName || '';
+		this._mpLocalPickupVarSetMap = this.mapName || '';
 		try {
 			const game: any = ig.game;
 			const Enemy: any = (ig.ENTITY as any).Enemy;
@@ -12052,14 +14674,29 @@ export class NetSync {
 			// the host's enemy stream already spawns those as puppets on members, so
 			// relaying their spawn var would double-spawn. This makes ANY quest whose
 			// world spawn is gated on a host-side map/tmp var appear for every member.
+			// 1.75.x: ground-item pickup Props are the exception — their taken-var is
+			// strictly per-player (each player must pick the item up themselves).
 			for (let i = 0; i < cond.length; i++) {
 				const ce: any = cond[i];
 				if (!ce || !ce.entity) continue;
 				if (Enemy && ce.entity instanceof Enemy) continue; // enemy stream handles these
+				const pickup = this.isGroundPickupEntity(ce.entity);
+				const pickupItem = pickup ? this.getGroundPickupItemId(ce.entity) : 0;
+				const pickupVar = pickup ? this.getGroundPickupTakenVar(ce.entity) : null;
 				const cv: any[] = (ce.condition && ce.condition.vars) || [];
 				for (let j = 0; j < cv.length; j++) {
 					const rk = this.resolveSpawnVar(cv[j]);
-					if (rk && rk.k && rk.k.indexOf('.') === -1) this._mpSpawnVarSet[rk.b + '|' + rk.k] = true;
+					if (!rk || !rk.k || rk.k.indexOf('.') !== -1) continue;
+					if (this.isParkourMarkerVar(rk.b, rk.k)) continue; // per-player parkour markers stay local
+					if (pickup) {
+						this._mpLocalPickupVarSet[rk.b + '|' + rk.k] = true;
+						if (pickupItem > 0 && pickupVar && rk.b === pickupVar.b && rk.k === pickupVar.k
+							&& rk.b.indexOf('maps.') === 0) {
+							this._mpLocalPickupItems[rk.k] = pickupItem;
+						}
+						continue;
+					}
+					this._mpSpawnVarSet[rk.b + '|' + rk.k] = true;
 				}
 			}
 		} catch (_) { /* ignore */ }
@@ -12076,6 +14713,9 @@ export class NetSync {
 			const rk = this.resolveSpawnVar(path);
 			if (!rk || !rk.k || rk.k.indexOf('.') !== -1) return;
 			if (rk.k.indexOf('chest_') === 0) return;                 // per-player chest-opened — never relay
+			if (this.isParkourMarkerVar(rk.b, rk.k)) return;          // parkour markers are per-player
+			if (this.isLocalPickupVar(rk.b, rk.k)) return;            // ground-item pickups are per-player
+			if (this.isKeyLockedPerPlayerVar(rk.b, rk.k)) return;      // key walls/pillars unlock per-player
 			if (!this._mpSpawnVarSet[rk.b + '|' + rk.k]) return;
 			const vars: any = (ig as any).vars;
 			if (!vars || typeof vars.get !== 'function') return;
@@ -12108,6 +14748,9 @@ export class NetSync {
 			if (!this.main.connection || !this.main.connection.isOpen()) return;
 			const rk = this.resolveSpawnVar(path);
 			if (!rk || !rk.k || rk.k.indexOf('.') !== -1) return;
+			if (this.isParkourMarkerVar(rk.b, rk.k)) return; // parkour markers are per-player
+			if (this.isLocalPickupVar(rk.b, rk.k)) return;   // ground-item pickups are per-player
+			if (this.isKeyLockedPerPlayerVar(rk.b, rk.k)) return; // key walls/pillars unlock per-player
 			const vars: any = (ig as any).vars;
 			if (!vars || typeof vars.get !== 'function') return;
 			const v = vars.get(path); // engine accessor resolves map.X to the slash-keyed bucket
@@ -12153,6 +14796,9 @@ export class NetSync {
 			for (const e of data.list) {
 				if (!e || typeof e.b !== 'string' || typeof e.k !== 'string' || !e.k) continue;
 				if (e.k.indexOf('chest_') === 0) continue;
+				if (this.isParkourMarkerVar(e.b, e.k)) continue; // never apply a peer's parkour marker state
+				if (this.isLocalPickupVar(e.b, e.k)) continue;   // never apply a peer's ground-pickup state
+				if (this.isKeyLockedPerPlayerVar(e.b, e.k)) continue; // never apply a peer's key-lock unlock state
 				const tv = typeof e.v;
 				if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') continue;
 				let obj: any = null;
@@ -12475,11 +15121,26 @@ export class NetSync {
 	private checkOwnDeath(): void {
 		const p: any = ig.game.playerEntity;
 		if (!p || !p.params) return;
+		// 1.75.x (boss-phase quick revive): the host crossed a boss phase threshold /
+		// started a phase combat cutscene (or relayed that it did). Consume FIRST —
+		// phase cutscenes flip nativeOwnsDeath() on, but a player already in OUR
+		// soft-death state must still come back immediately, not wait out the
+		// countdown behind the cutscene gate.
+		if (this._mpDead && this._mpBossPhaseReviveAt) {
+			const phaseUntil = this._mpBossPhaseReviveAt;
+			this._mpBossPhaseReviveAt = 0;
+			if (Date.now() < phaseUntil && !this._mpCheckpointReloading && !p._killed) {
+				console.log('[multiplayer] boss phase transition — immediate soft revive');
+				this.respawn(p);
+				return;
+			}
+		}
 		// ROUND 103: story PVP/arena/cutscene owns player death. Let the native
 		// defeat flow run and clear any multiplayer soft-death state a switch into
 		// one of those states could leave behind.
 		if (this.nativeOwnsDeath()) {
 			this._mpAllDeadAt = 0;
+			this._mpBossPhaseReviveAt = 0; // native death flow owns revival in cutscene/arena
 			if (this._mpDead) {
 				try { this.respawn(p, true); } catch (_) { /* ignore */ }
 			}
@@ -12688,6 +15349,8 @@ export class NetSync {
 		this._mpDead = true;
 		this._mpDeadAt = Date.now();
 		this._mpAllDeadAt = 0;
+		// NOTE: _mpBossPhaseReviveAt is intentionally NOT cleared here — a phase
+		// break detected an instant before the death flag caught up still revives.
 		this._mpCheckpointReloading = false;
 		this._mpCheckpointReloadAt = 0;
 		this._mpCheckpointForced = false;
@@ -13325,7 +15988,7 @@ export class NetSync {
 			const last = this._leakWarnAt[k] || 0;
 			if (Date.now() - last < 300000) return;
 			this._leakWarnAt[k] = Date.now();
-			console.warn('[leak] GROWTH ' + k + ': ' + base + ' -> ' + cur + ' on ' + s.map + ' — paste __mpLeakReport() if fps drops');
+			this.mpConsoleWarn('[leak] GROWTH ' + k + ': ' + base + ' -> ' + cur + ' on ' + s.map + ' — paste __mpLeakReport() if fps drops');
 		};
 		warn('entities', s.total, b.total, 1.5, 30);
 		warn('effects', (s.by.effect || 0), (b.by.effect || 0), 2, 10);
@@ -13421,6 +16084,89 @@ export class NetSync {
 		return false;
 	}
 
+	/** 1.75.x (boss-phase quick revive): called by the resolveHpBreak hook the exact
+	 * frame a boss crosses an hpBreak threshold. Host-only: it arms its own soft
+	 * revival (the host can be dead while a member lands the phase-breaking hit) and
+	 * relays the event to the instance so soft-dead members revive too. Throttled so
+	 * a single hit crossing several thresholds only emits one relay. */
+	public onBossPhaseBreak(enemy: any): void {
+		try {
+			if (!this.main || !this.main.host) return;
+			const now = Date.now();
+			if (now - this._mpBossPhaseRelayAt < 750) return;
+			this._mpBossPhaseRelayAt = now;
+			const map = (ig.game && ig.game.mapName) || this.mapName || '';
+			const uid = (enemy && typeof enemy.uid === 'number') ? enemy.uid : 0;
+			// A player already in OUR soft-death state must still revive behind a
+			// phase cutscene; only skip when ALIVE and native-owned (no soft death).
+			if (!this._mpCheckpointReloading && (this._mpDead || !this.nativeOwnsDeath())) {
+				this._mpBossPhaseReviveAt = now + 2000; // 2s grace covers an in-flight death flag
+			}
+			const conn: any = this.main.connection;
+			if (conn && typeof conn.sendBossPhase === 'function') {
+				try { conn.sendBossPhase(map, uid); } catch (_) { /* ignore */ }
+			}
+			console.log('[netsync] boss phase break detected (uid=' + uid
+				+ ', break=' + (enemy && enemy.hpBreakReached) + ')' + (this._mpDead ? ' — reviving soft-dead player' : ''));
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.75.x (boss-phase quick revive): a COMBAT_CUTSCENE just started while a boss
+	 * entity is present — an event-driven phase transition (whale <-> ape and
+	 * friends). Same revive + relay path as an hpBreak phase; uid 0 = transition
+	 * came from a cutscene, not a specific enemy's hpBreak. */
+	public onBossCombatCutscene(): void {
+		try {
+			if (!this.main || !this.main.host) return;
+			if (this._mpCheckpointReloading) return;
+			if (!this._mpDead && this.nativeOwnsDeath()) return;
+			if (!this.bossBattleActive() && !this.anyBossEntityPresent()) return;
+			const now = Date.now();
+			if (now - this._mpBossPhaseRelayAt < 750) return;
+			this._mpBossPhaseRelayAt = now;
+			this._mpBossPhaseReviveAt = now + 2000;
+			const map = (ig.game && ig.game.mapName) || this.mapName || '';
+			const conn: any = this.main.connection;
+			if (conn && typeof conn.sendBossPhase === 'function') {
+				try { conn.sendBossPhase(map, 0); } catch (_) { /* ignore */ }
+			}
+			console.log('[netsync] boss combat cutscene (phase transition) started'
+				+ (this._mpDead ? ' — reviving soft-dead player' : ''));
+		} catch (_) { /* ignore */ }
+	}
+
+	/** True while any not-yet-killed boss entity exists on the map (including a
+	 * boss whose defeat already triggered the phase cutscene — params defeated but
+	 * the entity is not killed yet). */
+	private anyBossEntityPresent(): boolean {
+		try {
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const list = ig.game && ig.game.entities;
+			if (!Enemy || !list) return false;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (e instanceof Enemy && !e._killed && e.enemyType && e.enemyType.boss) return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** 1.75.x (boss-phase quick revive): host relay from the instance — arm the
+	 * local revive flag. Only the current map consumes it, so a stale event from a
+	 * map we already left can never resurrect us somewhere else. */
+	public applyBossPhase(data: any): void {
+		try {
+			if (!data || typeof data.map !== 'string' || !data.map) return;
+			if (data.map !== this.mapName) return;
+			if (this._mpCheckpointReloading) return;
+			// A player already in OUR soft-death state must revive even when the
+			// phase cutscene already flipped nativeOwnsDeath() on.
+			if (!this._mpDead && this.nativeOwnsDeath()) return;
+			this._mpBossPhaseReviveAt = Date.now() + 2000;
+			console.log('[netsync] boss phase relay received (uid=' + (data.uid || 0) + ') — immediate soft revive');
+		} catch (_) { /* ignore */ }
+	}
+
 	/** Soft-death revive countdown in milliseconds. Out of combat keeps the
 	 * built-in ~3s quick revive; in combat it is the server-configured normal or
 	 * boss duration (defaults 30s / 30s). */
@@ -13440,6 +16186,7 @@ export class NetSync {
 	private respawn(p: any, keepPos?: boolean): void {
 		this._mpDead = false;
 		this._mpAllDeadAt = 0;
+		this._mpBossPhaseReviveAt = 0;
 		this._mpCheckpointReloading = false;
 		this._mpCheckpointReloadAt = 0;
 		this._mpCheckpointForced = false;
@@ -13702,6 +16449,7 @@ export class NetSync {
 					// off-map, so also clear any stale name tag that a missed leave event
 					// would otherwise leave floating.
 					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
+					try { const ap = this.main.players[player]; if (ap) (ap as any)._mpAimLine = false; } catch (_) { /* ignore */ }
 					return;
 				}
 				knownOnMap = true;
@@ -13718,6 +16466,7 @@ export class NetSync {
 				const ready = !!(this.main as any).playersRosterReady;
 				if (ready || Object.keys(onMap).length > 0) {
 					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
+					try { const ap = this.main.players[player]; if (ap) (ap as any)._mpAimLine = false; } catch (_) { /* ignore */ }
 					return;
 				}
 			}
@@ -13731,6 +16480,8 @@ export class NetSync {
 			// ROUND: mark the roster entry soft-dead so the off-screen teammate arrow
 			// (teammateIndicators) stops pointing at the corpse's last known position.
 			try { if (pl) (pl as any)._mpSoftDead = true; } catch (_) { /* ignore */ }
+			// A dead player's aim line fades out immediately (the mirror is gone).
+			try { if (pl) (pl as any)._mpAimLine = false; } catch (_) { /* ignore */ }
 			if (pl && pl.entity && !(pl.entity as any)._killed) {
 				const entD: any = pl.entity;
 				// Fix 3: clear pending interpolation targets so the corpse never drifts
@@ -13885,7 +16636,12 @@ export class NetSync {
 				pl.position = { x: s.pos.x, y: s.pos.y, z: s.pos.z }; // keep the safety-net spawn pos fresh
 			}
 			if (s.face && ent.face) { ent.face.xProtected = s.face.x; ent.face.yProtected = s.face.y; }
-			if (s.anim && ent._mpLastAnim !== s.anim) {
+			// 1.76.x (barrier denial FX): while a hover drag-back replay is live for this
+			// mirror, the stream's anim/extern replay is suppressed — the owner's action
+			// state can stream a stale walk anim ('run') mid-drag and clobber the pinned
+			// hover pose. updateMirrorHoverFx releases the pin on landing.
+			const inHoverReplay = !!this._mpMirrorHovers[player];
+			if (s.anim && !inHoverReplay && ent._mpLastAnim !== s.anim) {
 				ent._mpLastAnim = s.anim;
 				ent.currentAnim = { protected: s.anim };
 				this.playAnim(ent, s.anim);
@@ -13902,7 +16658,8 @@ export class NetSync {
 			}
 			// 1.71.0: extern-anim relay (sit/pose). Applies only while the owner's
 			// currentAnim is an OBJECT (no normal string anim is streamed then).
-			if (typeof s.xa === 'string') {
+			// 1.76.x: skipped while a hover replay is live (same clobber guard as anim).
+			if (typeof s.xa === 'string' && !inHoverReplay) {
 				const key = s.xa + '/' + (s.xf || '');
 				if (s.xa && s.xf && ent._mpLastExtern !== key) {
 					ent._mpLastExtern = key;
@@ -13968,6 +16725,29 @@ export class NetSync {
 				try { if (fresh.entity && Array.isArray(s.st)) this.applySyncedStatus(fresh.entity, s.st); } catch (_) { /* ignore */ }
 			}
 		}
+		// 1.75.x: teammate aim line. Stash on the roster entry so it survives mirror
+		// respawns; the receiver-side renderer (aimLineIndicators) reads it live.
+		// ax/ay + cax/cay/caz ride the same packet as the al edge, so a fresh mirror
+		// gets its direction and anchor on the very first state after spawning.
+		try {
+			const aimPl = this.main.players[player];
+			if (aimPl) {
+				(aimPl as any)._mpAimLine = !!s.al;
+				if (typeof s.ax === 'number' && isFinite(s.ax)
+					&& typeof s.ay === 'number' && isFinite(s.ay)) {
+					(aimPl as any)._mpAimDirX = s.ax;
+					(aimPl as any)._mpAimDirY = s.ay;
+				}
+				if (s.al && typeof s.cax === 'number' && isFinite(s.cax)
+					&& typeof s.cay === 'number' && isFinite(s.cay)
+					&& typeof s.caz === 'number' && isFinite(s.caz)) {
+					(aimPl as any)._mpAimAnchorX = s.cax;
+					(aimPl as any)._mpAimAnchorY = s.cay;
+					(aimPl as any)._mpAimAnchorZ = s.caz;
+				}
+			}
+		} catch (_) { /* cosmetic state must never break the packet */ }
+
 		// Party HUD model (top-left HP/SP bars read the MODEL, not the mirror).
 		const model: any = (sc as any).party && (sc as any).party.models && (sc as any).party.models[player];
 		if (model && model.params) {
@@ -14112,8 +16892,16 @@ export class NetSync {
 		// ensurePuppet's adoption lookup is O(1) instead of re-scanning all ~550 entities
 		// for every unadopted enemy in the block (that was the member-side frame hitch).
 		let mapEnemyIdx: { [mapId: number]: any } | null = null;
+		let localQuestIds: { [mapId: number]: boolean } | null = null;
 		for (const s of list) {
 			if (!s || typeof s.i !== 'number') continue;
+			// 1.75.x (per-player quest waves): a VISIBLE member-owned tmp.quest_* enemy
+			// must never be re-adopted from the host's hidden copy of the same mapId —
+			// that is what hid the 深度呵护 waves and wedged the timer scene.
+			if (s.mi) {
+				if (!localQuestIds) localQuestIds = this.buildActiveQuestMapIds();
+				if (localQuestIds[s.mi]) continue;
+			}
 			this._mpUidSeen[s.i] = now;
 			// Round 24: only TRUTHY mapIds are stamped — mapId 0 (a stray EnemySpawner
 			// product) is never host-owned and is reaped immediately, never via this stamp.
@@ -14170,7 +16958,10 @@ export class NetSync {
 			// A liveness marker (isFull=false) deliberately skips this: its tg is
 			// unchanged by definition, and the _mpTargetGuarded lock (ensurePuppet)
 			// holds the puppet's target between full blocks anyway.
-			if (isFull) {
+			// 1.76.x (corpse knockback parity): a _mpDying puppet keeps receiving blocks
+			// (its registry entry now survives staging so the corpse glides with the
+			// streamed knockback) — never re-aggro/re-engage a corpse.
+			if (isFull && !e._mpDying) {
 				const tgNow = !!s.tg;
 				e._mpTg = tgNow;
 				const pl: any = ig.game.playerEntity;
@@ -14291,6 +17082,12 @@ export class NetSync {
 						try { if (e.defaultConfig && typeof e.defaultConfig.overwrite === 'function') e.defaultConfig.overwrite('weight', 0); } catch (_) { /* ignore */ }
 					}
 				} catch (err) { try { console.warn('[netsync] puppet switchState failed uid=' + ((e as any)._mpUid || 0), err); } catch (_) { /* ignore */ } }
+				// 1.76.x (false-stagger pre-repair): the puppet's own NATIVE onDamage
+				// chain (member-local hits) reads the raw hitStable field for its
+				// stagger gate — a non-number there staggers on EVERY hit. Repair it
+				// per block (the direct check is a trivial typeof; the write-back only
+				// happens when a config source resolves a number).
+				if (typeof (e as any).hitStable !== 'number') this.mpHitStableWithRepair(e);
 				// ROUND 138 (member-side break-tracker parity): the host scales HIT (hit-count
 				// break) tracker thresholds by the party-size break multiplier
 				// (applyHpScaleOnSpawn / rescaleLiveEnemies), but the member's puppet kept the
@@ -14320,7 +17117,9 @@ export class NetSync {
 						}
 					}
 				} catch (_) { /* never break block apply */ }
-				if (e._mpPassiveSynced !== psvNow) {
+				// 1.76.x: a dying corpse keeps its walk-through IGNORE (playPuppetDeath)
+				// — never flip a corpse back to PASSIVE/solid from the stream.
+				if (e._mpPassiveSynced !== psvNow && !e._mpDying) {
 					e._mpPassiveSynced = psvNow;
 					try {
 						if (psvNow) {
@@ -14358,7 +17157,19 @@ export class NetSync {
 				// 1.74.x: bosses WITHOUT a scripted defeat used to fall through here
 				// (stageBossDefeatCinematic no-ops without a manualKill string) and
 				// lingered at 0 HP until the reap pass — stage their puppet death now.
-				if (e._mpPuppet && s.h <= 0) {
+				// 1.76.x: a _mpDying corpse keeps streaming h<=0 through its death window —
+				// skip the boss-defeat staging entirely (both helpers _mpDying-guard anyway,
+				// but the no-manualKill fallback would log every block).
+				if (e._mpPuppet && s.h <= 0 && !e._mpDying) {
+					// ROUND 139: stamp the host-shipped manualKill var onto the puppet
+					// BEFORE staging. A typed-fallback puppet (map-enemy adoption missed)
+					// carries no map settings of its own, so stageBossDefeatCinematic used
+					// to no-op and the boss simply vanished here (generic 500ms death
+					// instead of the dieExplosion cinematic); the loot then landed only
+					// after the host's cinematic finished — the reported desync.
+					try {
+						if (typeof s.mk === 'string' && s.mk && !(e as any).manualKill) (e as any).manualKill = s.mk;
+					} catch (_) { /* ignore */ }
 					if (!this.stageBossDefeatCinematic(e)) this.stageBossStreamDeath(e);
 				}
 				if (s.m > 0 && e.params.baseParams && e.params.baseParams.hp !== s.m) e.params.baseParams.hp = s.m;
@@ -14473,6 +17284,7 @@ export class NetSync {
 			// host's real enemy reduces it. With the shields attached the puppet's own
 			// damage chain produces the SAME factor/number/poise as the host natively.
 			if (isFull) this.syncPuppetShields(e, s.sh);
+		if (isFull && typeof s.shp === 'number') this.syncBossShieldHp(e, s.shp);
 		}
 		// Round 23: the per-block reap pass is GONE — replaced by the time-based
 		// reapStalePuppets() (run from tick() on a ~500ms accumulator), which uses the
@@ -14494,6 +17306,54 @@ export class NetSync {
 	 * detected and best-effort; the hp-refund in onPreDamageModification is the backstop
 	 * for any hit that still slips through.
 	 */
+	/** 1.75.x (drill-boss chest armor): apply the host's shieldHp attribute and drive
+	 * the `shield` animation part like the host's UpdateShield/RegenShield actions do:
+	 * >=5 shieldA (full), 4 shieldB, 3 shieldC, 2 shieldD, 1 shieldE, <=0 open. */
+	private syncBossShieldHp(e: any, shp: number): void {
+		try {
+			if (!e || typeof shp !== 'number' || !isFinite(shp)) return;
+			const val = Math.max(0, Math.min(99, Math.round(shp)));
+			// Re-apply until the shield part was actually found — the puppet's
+			// subColls can initialize one full block AFTER the first shp arrives.
+			if (e._mpShieldHpSynced === val && e._mpShieldHpApplied) return;
+			e._mpShieldHpSynced = val;
+			try { if (typeof e.setAttribute === 'function') e.setAttribute('shieldHp', val); } catch (_) { /* attrib is cosmetic here */ }
+			// A broken chest must be UNGUARDED immediately, even before the next
+			// host shield-list snapshot removes the `center` PARTS shield — drop any
+			// synced center connection right now so a same-frame member hit on the
+			// shield part computes full damage instead of a 5% guard chip.
+			if (val <= 0 && Array.isArray(e.shieldsConnections)) {
+				try {
+					const conns: any[] = e.shieldsConnections;
+					for (let i = conns.length; i--;) {
+						const c: any = conns[i];
+						const shield: any = c && c.shield;
+						if (!shield || shield.name !== 'center') continue;
+						if (typeof e.removeShield === 'function') e.removeShield(c);
+						else conns.splice(i, 1);
+					}
+				} catch (_) { /* shield-list sync covers the same removal */ }
+			}
+			let anim = 'open';
+			if (val >= 5) anim = 'shieldA';
+			else if (val === 4) anim = 'shieldB';
+			else if (val === 3) anim = 'shieldC';
+			else if (val === 2) anim = 'shieldD';
+			else if (val === 1) anim = 'shieldE';
+			if (!e.coll || !Array.isArray(e.coll.subColls)) return;
+			const subs: any[] = e.coll.subColls;
+			for (let i = subs.length; i--;) {
+				const part: any = subs[i] && subs[i].entity;
+				if (!part || part.partName !== 'shield' || typeof part.setCurrentAnim !== 'function') continue;
+				try {
+					part.setCurrentAnim(anim, true, null, true);
+					part.animationFixed = true; // same as ACTION_STEP.SHOW_PART_ANIMATION
+				e._mpShieldHpApplied = true;
+				} catch (_) { /* plate visual is cosmetic */ }
+				break;
+			}
+		} catch (_) { /* never break the state block */ }
+	}
 	/** ROUND 66 (poise/shield damage sync): reconcile the puppet's synced shield
 	 * connections with the host enemy's streamed list (IEnemySnap.sh). The puppet runs
 	 * no AI, so ADD_SHIELD state guards (the hedgehog's roll-up "full" shield,
@@ -14610,6 +17470,103 @@ export class NetSync {
 			}
 		} catch (_) { /* ignore */ }
 	}
+	/** 1.75.x (per-player quest encounters): true for a MEMBER-side map enemy whose
+	 * spawnCondition is a pure tmp.quest_* wave flag. Conditions that ALSO reference
+	 * quest.* (normal spawner/enemy state gated by quest progress) stay host-owned;
+	 * these positive-only tmp.quest conditions are the per-player wave spawns set by
+	 * the local quest cutscene (tmp.quest_foa2-wave1, tmp.questBall-wave1, ...). */
+	private isLocalQuestWaveEnemy(e: any): boolean {
+		try {
+			if (this.main.host || !e || e._mpMirror) return false;
+			const sc = (e.settings && typeof e.settings.spawnCondition === 'string')
+				? e.settings.spawnCondition
+				: (typeof e.spawnCondition === 'string' ? e.spawnCondition : '');
+			if (!sc || !/tmp\.quest/i.test(sc)) return false;
+			if (/quest\./.test(sc)) return false; // quest-progress-gated entities stay host-owned
+			return true;
+		} catch (_) { return false; }
+	}
+
+	/** Undo the host-puppet treatment for a map enemy that just became a LOCAL quest
+	 * wave spawn: remove it from the puppet pool, restore its real AI + death params,
+	 * unlock the position/anim locks and mark it as an owner-local cutscene enemy so
+	 * reap/block passes leave it alone and cutsceneEntity streams it to teammates. */
+	private releaseLocalQuestPuppet(e: any): void {
+		try {
+			const uid = e._mpUid || 0;
+			if (uid) {
+				delete this.puppets[uid];
+				delete this.lastAnim[uid];
+			}
+			e._mpUid = 0;
+			e._mpPuppet = false;
+			e._mpTg = false;
+			try { delete (e as any).postActionUpdate; } catch (_) { /* restore the prototype AI driver */ }
+			try {
+				if (e._mpTargetGuarded) {
+					if (typeof e._mpOrigSetTarget === 'function') e.setTarget = e._mpOrigSetTarget;
+					e._mpTargetGuarded = false;
+					e._mpOrigSetTarget = null;
+				}
+			} catch (_) { /* best effort */ }
+			try {
+				if (e.params && e.params._mpIsDefeatedPatched) {
+					if (typeof e.params._mpOrigIsDefeated === 'function') {
+						e.params.isDefeated = e.params._mpOrigIsDefeated;
+					}
+					e.params._mpIsDefeatedPatched = false;
+					e.params._mpOrigIsDefeated = null;
+				}
+			} catch (_) { /* best effort */ }
+			try {
+				if (typeof e._mpOrigWeight === 'number' && e.coll) {
+					e.coll.weight = e._mpOrigWeight;
+					if (e.defaultConfig && typeof e.defaultConfig.overwrite === 'function') {
+						e.defaultConfig.overwrite('weight', e._mpOrigWeight);
+					}
+				}
+			} catch (_) { /* weight is gameplay feel only */ }
+			try { this.main.unlockEntity(e); } catch (_) { /* unlock is best effort */ }
+			e._mpCutsceneSpawned = true;
+			if (e._hidden && typeof e.show === 'function') {
+				try { e.show(); } catch (_) { /* the original show already made it visible */ }
+			}
+			console.log('[netsync] local quest wave enemy released from host sync'
+				+ ' (mapId=' + (e.mapId || 0) + ', type=' + (e.enemyName || '') + ')');
+		} catch (_) { /* never break the show path */ }
+	}
+
+	/** Enemy.show hook: a member's tmp.quest_* map enemy just became visible. */
+	public onQuestEnemyShown(e: any): void {
+		try {
+			if (this.main.host) return;
+			if (!e || e._killed || e._mpMirror || e._hidden) return;
+			if (!this.isLocalQuestWaveEnemy(e)) return;
+			if (e._mpPuppet) this.releaseLocalQuestPuppet(e);
+			else if (!e._mpCutsceneSpawned) e._mpCutsceneSpawned = true;
+		} catch (_) { /* never break the show path */ }
+	}
+
+	/** mapIds of currently VISIBLE member-owned quest wave enemies. Snapshots for
+	 * those mapIds are skipped in applyEntityState so the host's (hidden) copy can't
+	 * re-adopt/re-hide the owner's live quest spawns. */
+	private buildActiveQuestMapIds(): { [mapId: number]: boolean } {
+		const out: { [mapId: number]: boolean } = Object.create(null);
+		try {
+			const list = ig.game.entities;
+			const Enemy = (ig.ENTITY as any).Enemy;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (!(e instanceof Enemy) || e._killed || e._mpMirror) continue;
+				// Owner-local cutscene/quest enemies never re-adopt a host snapshot.
+				if ((e._mpCutsceneSpawned || this.isLocalQuestWaveEnemy(e)) && !e._hidden && e.mapId) {
+					out[e.mapId] = true;
+				}
+			}
+		} catch (_) { /* empty set */ }
+		return out;
+	}
+
 	/** Round 23: MEMBER-side stale-puppet reap (replaces the old per-block reap pass
 	 * inside applyEntityState). On a member every live non-mirror enemy must be
 	 * host-owned; anything else is a divergent local ghost and is killed silently
@@ -14771,6 +17728,13 @@ export class NetSync {
 				}
 			} catch (_) { /* ignore */ }
 		}
+		// ROUND 140: stamp the host-shipped manualKill var at ADOPTION time too (not
+		// only at the h<=0 death staging) — promoteToHost reads e.manualKill to carry
+		// the boss's scripted-defeat var across a host-migration respawn, which can
+		// happen long before any death block arrives.
+		try {
+			if (typeof s.mk === 'string' && s.mk && !(e as any).manualKill) (e as any).manualKill = s.mk;
+		} catch (_) { /* ignore */ }
 		e._mpUid = s.i;
 		if (!e._mpPuppet) {
 			e._mpPuppet = true;
@@ -14784,6 +17748,9 @@ export class NetSync {
 			// attack will land. Also overwrite its ActorConfig weight: the engine's
 			// cancelStun/defaultConfig.apply would otherwise restore the original
 			// weight right after the puppet's first local flinch.
+			// 1.75.x: remember the native weight BEFORE zeroing it so a later quest-wave
+			// release can restore it (puppets are weight-0 body-push husks).
+			try { if (typeof (e as any)._mpOrigWeight !== 'number') (e as any)._mpOrigWeight = (e.coll && typeof e.coll.weight === 'number') ? e.coll.weight : 0; } catch (_) { /* ignore */ }
 			try {
 				if (e.coll) e.coll.weight = 0;
 				if (e.defaultConfig && typeof e.defaultConfig.overwrite === 'function') e.defaultConfig.overwrite('weight', 0);
@@ -14810,8 +17777,10 @@ export class NetSync {
 			// clears _mpTg BEFORE calling setTarget(null) on de-aggro, so host authority
 			// still ends combat; and a _killed puppet never holds the lock.
 			if (!e._mpTargetGuarded && e.setTarget) {
-				e._mpTargetGuarded = true;
 				const origSetTarget = e.setTarget.bind(e);
+				// 1.75.x: keep the original around so a quest-wave release can restore it.
+				try { e._mpOrigSetTarget = origSetTarget; } catch (_) { /* best effort */ }
+				e._mpTargetGuarded = true;
 				e.setTarget = function (t: any, fixed?: boolean) {
 					if (!t && e._mpTg && !e._killed) return;
 					return origSetTarget(t, fixed);
@@ -14825,6 +17794,8 @@ export class NetSync {
 			try {
 				if (e.params && !e.params._mpIsDefeatedPatched) {
 					e.params._mpIsDefeatedPatched = true;
+					// 1.75.x: keep the native predicate so a quest-wave release can restore it.
+					try { e.params._mpOrigIsDefeated = e.params.isDefeated; } catch (_) { /* best effort */ }
 					e.params.isDefeated = function () { return false; };
 				}
 			} catch (_) { /* ignore */ }
@@ -14874,7 +17845,8 @@ export class NetSync {
 		const Enemy = (ig.ENTITY as any).Enemy;
 		for (let i = 0; i < list.length; i++) {
 			const e: any = list[i];
-			if (e instanceof Enemy && !e._mpMirror && !e._killed && e.mapId === mapId) return e;
+			if (e instanceof Enemy && !e._mpMirror && !e._killed && !e._mpCutsceneSpawned
+				&& !this.isLocalQuestWaveEnemy(e) && e.mapId === mapId) return e;
 		}
 		return null;
 	}
@@ -14887,7 +17859,8 @@ export class NetSync {
 		const Enemy = (ig.ENTITY as any).Enemy;
 		for (let i = 0; i < list.length; i++) {
 			const e: any = list[i];
-			if (e instanceof Enemy && !e._mpMirror && !e._killed && e.mapId) idx[e.mapId] = e;
+			if (e instanceof Enemy && !e._mpMirror && !e._killed && !e._mpCutsceneSpawned
+				&& !this.isLocalQuestWaveEnemy(e) && e.mapId) idx[e.mapId] = e;
 		}
 		return idx;
 	}
@@ -15037,6 +18010,16 @@ export class NetSync {
 				const baseSettings = ig.merge(
 					{ skipHook: true, mapId, enemyInfo: this.reconstructEnemyInfo(e) },
 					e.settings || {});
+				// ROUND 140: preserve the entity NAME + manualKill var across the respawn.
+				// A typed-fallback puppet carries them as LIVE properties (stamped from the
+				// stream's nm/mk fields) but NOT inside e.settings, so the respawned boss
+				// was nameless — the map's boss-intro cutscene resolves the boss by name
+				// (ig.Event.getEntity) and silently skipped every boss step (no boot anim,
+				// never entering its combat state: "fight stuck in the cutscene").
+				try {
+					if (!(baseSettings as any).name && typeof e.name === 'string' && e.name) (baseSettings as any).name = e.name;
+					if (!(baseSettings as any).manualKill && typeof (e as any).manualKill === 'string' && (e as any).manualKill) (baseSettings as any).manualKill = (e as any).manualKill;
+				} catch (_) { /* ignore */ }
 				// 1.71.0: keep the enemy ASLEEP/passive across the handoff. The
 				// member-side puppet never carried the original settings, so without
 				// this a respawned enemy used the type default (targetOnSpawn / IDLE)
@@ -15068,6 +18051,15 @@ export class NetSync {
 							console.warn('[netsync] promoteToHost respawn LACKED enemyType for ' + type + ' — patching');
 							try { spawned.enemyType = new sc.EnemyType(type); spawned.enemyName = spawned.enemyName || type; } catch (_) { /* ignore */ }
 						}
+						// ROUND 140: re-register the name unconditionally. The old puppet's
+						// removeEntity deletes namedEntities[name] WITHOUT checking which entity
+						// it points at — if this spawn registered before the corpse's deferred
+						// removal ran, the fresh registration would be wiped and every named
+						// cutscene lookup (boss intro) would fail again.
+						try {
+							const ne: any = (ig.game as any).namedEntities;
+							if (ne && typeof spawned.name === 'string' && spawned.name) ne[spawned.name] = spawned;
+						} catch (_) { /* ignore */ }
 						// Restore remaining HP.
 						if (spawned.params && hp > 0) spawned.params.currentHp = hp;
 						// Aggro inheritance (round 8): an ENGAGED puppet's respawned enemy
@@ -15086,6 +18078,15 @@ export class NetSync {
 						console.warn('[netsync] promoteToHost respawn threw for ' + type, err);
 					}
 				});
+				// ROUND 140: unstick any RUNNING cutscene step that captured this puppet
+				// (the boss-intro BattleStart playing locally when the old host dropped).
+				// DO_ACTION(wait:true) / WAIT_UNTIL_ACTION_DONE keep waiting while their
+				// captured _actionEntity.currentAction still equals the captured action,
+				// and kill(true) never clears currentAction — the intro wedged forever and
+				// the respawned boss never received its SET_ENEMY_STATE / DO_ENEMY_ACTION.
+				// Nulling the action makes both step types evaluate "done" next frame;
+				// later steps re-resolve the RESPAWNED boss by name and the intro completes.
+				try { if ((e as any).currentAction) (e as any).currentAction = null; } catch (_) { /* ignore */ }
 				try { e.kill(true); } catch (_) { /* ignore */ }
 				respawning++;
 			} catch (_) { /* ignore */ }

@@ -51,11 +51,13 @@ export class OnThrownBallListener {
 			return;
 		}
 
-		// 1.72.0 (dungeon-key relay): the sender stood on an active KeyPanel and
-	// threw the dungeon key. Resolve a LOCAL KeyPanel of the matching kind and
-	// spawn its key spawner on the mirror, so our own panels/key walls react
-	// to it exactly like the thrower's world did. No matching panel loaded
-	// (we're not on that map) -> nothing to show, skip quietly.
+		// 1.75.x (dungeon-key VISUAL-ONLY sync): teammates SEE the key throw, but the
+	// replayed ball is NEUTRALIZED (neutralizeReplayBall: OTHER party, IGNORE
+	// collision, no attackInfo) so it can never open OUR key walls/doors or flip
+	// switches — key-locked progression stays per-client. Resolve a LOCAL
+	// KeyPanel of the matching kind for the authentic key-ball visuals (trail /
+	// pop effects, 1.5s flight). No matching panel loaded (not on that map) ->
+	// skip quietly.
 	if (ballInfo.ballInfo.indexOf('key:') === 0) {
 		try {
 			const wantMaster = ballInfo.ballInfo === 'key:master';
@@ -77,7 +79,8 @@ export class OnThrownBallListener {
 					? ((entity as any).getCombatantRoot() || entity) : entity;
 				const pos = root.getAlignedPos((ig as any).ENTITY_ALIGN.BOTTOM, Vec3.create());
 				pos.z = pos.z + ((window as any).Constants ? (window as any).Constants.BALL_HEIGHT : 12);
-				spawner.spawn(pos.x, pos.y, pos.z, root, ballInfo.dir);
+				// Visual-only copy: passes through the wall instead of opening it.
+				this.neutralizeReplayBall(spawner.spawn(pos.x, pos.y, pos.z, root, ballInfo.dir));
 				return;
 			}
 		} catch (_) { /* a failed ball replay must never break the frame */ }

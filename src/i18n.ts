@@ -24,6 +24,7 @@ const enDict: { [key: string]: string } = {
     inviteBusy: 'In a cutscene — party invite declined automatically',
     teleportBusy: 'In a cutscene — teleporting unavailable',
     teleportUnlocked: 'You have not unlocked that area yet',
+    teleportInCombat: 'That player is in an encounter/boss fight — cannot teleport now',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: 'Online ',
@@ -99,6 +100,10 @@ const enDict: { [key: string]: string } = {
     optUiScale: 'External UI Scale',
     optUiScaleDesc: 'Scales the mod\'s panels, chat, toasts, tooltips, story banners and teammate arrows. Auto uses the game\'s launch window size as 100% and follows window resizing.',
     uiScaleAuto: 'Auto',
+    optArrowSize: 'Teammate Arrow Size',
+    optArrowSizeDesc: 'Adjusts the size of the off-screen teammate direction arrows. This is applied on top of the external UI scale.',
+    optAimLineOpacity: 'Player Aim Line Opacity',
+    optAimLineOpacityDesc: "Adjusts the opacity of teammates' ranged-charge aim lines. They appear only once the charge has focused into a straight line. 0% hides them.",
 
     // Reserved keys for other agents (multiplayer.ts / netSync.ts) — defined now so
     // they never need to edit i18n.ts again.
@@ -370,6 +375,7 @@ const zhDict: { [key: string]: string } = {
     inviteBusy: '过场动画中，已自动拒绝组队邀请',
     teleportBusy: '过场动画中，无法传送到队友身边',
     teleportUnlocked: '你尚未解锁该区域，无法传送到队友身边',
+    teleportInCombat: '对方正在遭遇战/BOSS战中，无法传送',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: '在线 ',
@@ -445,6 +451,10 @@ const zhDict: { [key: string]: string } = {
     optUiScale: '外部UI缩放',
     optUiScaleDesc: '统一缩放模组的面板、聊天、通知、悬浮提示、剧情横幅和队友方向箭头；自动档以游戏启动时的窗口大小为100%，之后跟随窗口缩放',
     uiScaleAuto: '自动',
+    optArrowSize: '队友箭头大小',
+    optArrowSizeDesc: '单独调整屏幕外队友方向箭头的大小，在外部UI缩放的基础上额外生效',
+    optAimLineOpacity: '玩家瞄准线透明度',
+    optAimLineOpacityDesc: '调整其他玩家远程蓄力攻击蓄满成一条直线时显示的瞄准线透明度；0% 表示不显示',
 
     // Reserved keys for other agents (multiplayer.ts / netSync.ts) — defined now so
     // they never need to edit i18n.ts again.

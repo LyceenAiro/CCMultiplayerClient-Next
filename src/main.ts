@@ -6,6 +6,7 @@ import { installMpUiScale } from './ui/uiScale';
 import { installSaveButtons } from './ui/saveButtons';
 import { installNetBadge } from './ui/netBadge';
 import { installTeammateIndicators } from './ui/teammateIndicators';
+import { installPlayerAimLines } from './ui/aimLineIndicators';
 import { installMapTeamAvatars } from './ui/mapTeamAvatars';
 import { installChatBox } from './ui/chatBox';
 import { installItemUseIndicators } from './ui/itemUseIndicator';
@@ -99,6 +100,10 @@ async function startMultiplayer(): Promise<void> {
 
 		// 1.71.9 (QoL 1): off-screen party-member arrow indicators.
 		installTeammateIndicators(() => multiplayer);
+
+		// 1.75.x: teammates' focused ranged-charge aim lines (fade in/out, opacity
+		// option in the mod tab; 0% default = hidden).
+		installPlayerAimLines(() => multiplayer);
 
 		// 1.71.9 (QoL 2): party-member avatars on the area/world maps.
 		installMapTeamAvatars(() => multiplayer);

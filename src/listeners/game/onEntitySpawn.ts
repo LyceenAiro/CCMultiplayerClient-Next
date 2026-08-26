@@ -264,14 +264,13 @@ export class OnEntitySpawnListener {
 			}
 		}
 
-		// 1.72.0 (dungeon-key fix): standing on an active KeyPanel swaps the
-		// charged shot for the panel's key BallInfo via playerEntity.overrideBall
-		// (the 'DUNGEON_KEY'/'DUNGEON_MASTER_KEY' hinted ball — the mine/temple
-		// key throw). It is never a player proxy, so every key throw logged
-		// 'filterBall returned null' and teammates saw nothing. Match the live
-		// override by identity; the receiver resolves a local KeyPanel's
-		// spawner (onThrowBall 'key:' branch) so the relayed key keeps its real
-		// visuals AND its panel/wall-unlock behaviour.
+		// 1.75.x (dungeon-key VISUAL-ONLY sync): relay the key throw again so
+		// teammates SEE the key ball fly, but the receiver replays a NEUTRALIZED
+		// copy (onThrowBall 'key:' branch — no attackInfo, no collisions) that can
+		// never open their key walls/doors. Key-locked progression stays
+		// per-client: each player unlocks their own walls with their own keys.
+		// Match the live override by identity ('DUNGEON_KEY'/'DUNGEON_MASTER_KEY'
+		// hinted ball swapped in by the active KeyPanel via playerEntity.overrideBall).
 		const playerEnt: any = ig.game.playerEntity;
 		const overrideBall: any = playerEnt && playerEnt.overrideBall;
 		if (overrideBall && overrideBall.data === settings.ballInfo) {

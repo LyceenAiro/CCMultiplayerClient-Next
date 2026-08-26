@@ -50,23 +50,31 @@ function tierFor(ping: number, lossPct: number): NetTier {
 /** Subtle dark outline behind the diamond so it reads on any portrait. */
 const BADGE_OUTLINE = '#16161f';
 
+
 /** Diamond half-sizes (integer gui px). Pixel-diamond rows are 2*(h-|dy|)+1 px, so
  * the fill is 2h+1 px wide and the outline 2(h+1)+1 px. Self badge = 50% of the old
  * 9px fill (h=2 → 5px fill / 7px outline); member badge = 25% (h=1 → 3px / 5px). */
 const BADGE_HALF_SELF = 2;
 const BADGE_HALF_MEMBER = 1;
 
-/** Badge center offsets from the hook origin (gui px). The member badge sits neatly
- * in the portrait's top-left corner at (3,3). The self badge has TWO sites because
- * the engine moves StatusElementModeGui itself: MINIMIZED (normal play) it sits at
- * (0,0) inside StatusHudGui, which is anchored right in the screen corner — a
- * negative offset renders OFF-SCREEN there, so the minimized badge uses +6 (inside
- * the icon box, the round-23 spot). EXPANDED (quick menu / menus / element switch —
- * engine sets gui.selectBg=true and slides the gui to a wheel slot) there is room
- * around it, so the badge sits OUTSIDE the wheel, above-left at (-6,-6). */
+/** Badge center offsets (gui px). The member badge sits neatly in the portrait's
+ * top-left corner at (3,3). The self badge has TWO anchors, both StatusHudGui-local
+ * and element-INDEPENDENT: MINIMIZED (normal play) it sits at the fixed (6,6) icon-
+ * box spot; EXPANDED (element switch display / Shift quick menu / backpack menu —
+ * gui.selectBg true) it rides the element WHEEL (elementBgGui), not the sliding
+ * current-element icon, at wheel-origin + (14,14) — OUTSIDE the wheel bg's solid
+ * diamond (measured from status-gui.png: the 80x80 wheel's top-left outer edge is
+ * the x+y=39 diagonal, vertices (39,0)/(0,39)). The badge is itself a diamond whose
+ * UI-facing edge sits at x+y = 2*off+3 = 31, so the badge<->wheel gap is
+ * (39-31)/sqrt2 = 5.7 gui px — matched to the MINIMIZED gap (box diamond edge
+ * x+y=22 vs badge edge x+y=15 -> 5.0 px). The old +17 spot left only 1.4 px (edge
+ * kissing the diamond); the +26 spot sat ON the cold<->wave connector line. Riding
+ * the sliding StatusElementModeGui itself was the fire-element bug: heat's slot is
+ * the bottom (35,59), so the badge jumped across the wheel per selected element.
+ * Menu mode shifts the wheel (+2,+21) and the badge follows. */
 const BADGE_OFF_MEMBER = 3;
-const BADGE_OFF_SELF = -6;
-const BADGE_OFF_SELF_MIN = 6;
+const BADGE_SELF_POS = 6;
+const BADGE_OFF_WHEEL = 14;
 /** Badge hover target is the diamond plus a small pad for easy hovering. */
 const BADGE_HOVER_PAD = 2;
 
@@ -265,21 +273,181 @@ function collectMemberHud(gui: any, renderer: any): void {
     }
 }
 
-/** Injected into sc.StatusElementModeGui.updateDrawables: the self badge. Offset
- * depends on the gui's mode (see BADGE_OFF_SELF_MIN): selectBg is the engine's own
- * expanded flag (quick menu / menus / element-switch display set it true; the
- * minimize routines set it false), so it picks the visible site automatically. */
+/** The 30x30 yellow diamond fill (src: status-gui.png 64,112,40,40 — the SAME
+ * sprite the own HUD's StatusElementModeGui fills the element slot with),
+ * pre-rendered into an offscreen canvas once per ui-scale. Sampled from a RAW
+ * DOM image (not the engine's nearest-neighbour pre-scaled ig.Image data) with
+ * bilinear smoothing ON — that is what kills the staircase jaggies on the
+ * diamond outline. Returns null while the raw sheet is still loading — the
+ * overlay just skips a few frames on its very first show. */
+let mpOvFillRaw: HTMLImageElement | null = null;
+let mpOvFillImg: any = null;
+let mpOvFillScale = 0;
+
+function getOverloadFillImage(): any {
+    const k: number = ((ig as any).system && (ig as any).system.scale) || 1;
+    if (mpOvFillImg && mpOvFillScale === k) return mpOvFillImg;
+    try {
+        if (!mpOvFillRaw) {
+            const raw = new Image();
+            raw.onload = () => { mpOvFillRaw = raw; };
+            raw.src = ((ig as any).root || '') + 'media/gui/status-gui.png';
+            return null;
+        }
+        const size = Math.max(1, Math.round(30 * k));
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.imageSmoothingEnabled = true; // smooth outline (spec: 去锯齿)
+        ctx.drawImage(mpOvFillRaw, 64, 112, 40, 40, 0, 0, size, size);
+        // Minimal ig.Image duck: draw() only touches loaded/width/height/filtered/data.
+        const img: any = Object.create((ig as any).Image.prototype);
+        img.data = canvas;
+        img.width = 30;
+        img.height = 30;
+        img.loaded = true;
+        img.filtered = {};
+        mpOvFillImg = img;
+        mpOvFillScale = k;
+        return img;
+    } catch (_) { return null; }
+}
+
+/** Injected next to collectMemberHud: the teammate's ELEMENT OVERLOAD as an
+ * overlay floating on the portrait, styled like the own HUD's element load fill
+ * (StatusElementModeGui): the yellow diamond fill sprite rising from the bottom
+ * of the diamond, blinking faster as the load climbs past 0.5/0.75/0.9 — with a
+ * reduced peak alpha (0.55) so the face stays readable. The 30px diamond is
+ * centred on the head (head: 24x24 at (0,-2), centre (12,10)) and the fill is
+ * bottom-aligned inside it, exactly like the vanilla slot. Hidden at zero load.
+ * Data: updatePlayerStats (el/ov) -> PartyMemberModel._mpElementLoad/_mpOverload. */
+function drawMemberOverloadOverlay(gui: any, renderer: any): void {
+    if (!netBadgeActive()) return;
+    const model: any = gui && gui.model;
+    if (!model || !model._mpName) return; // remote players only, never native bots
+    const overload: boolean = model._mpOverload === true;
+    let load = (typeof model._mpElementLoad === 'number') ? model._mpElementLoad : 0;
+    if (overload) load = 1;
+    if (load <= 0.01) return;
+    // Vanilla: d = ceil(load*33)+4 on a 40px slot -> *0.75 on our 30px diamond.
+    let d = Math.ceil(load * 24.75) + 3;
+    if (d > 30) d = 30;
+    // Blink intervals: vanilla 2/1/0.5/0.25 halved to 4/2/1/0.5 (spec: 呼吸频率
+    // 降低一半 — the overlay breathes at half the own HUD's pace).
+    let interval = 4;
+    if (load >= 0.9) interval = 0.5; else if (load >= 0.75) interval = 1; else if (load >= 0.5) interval = 2;
+    const t = (gui._mpOverloadTimer = ((gui._mpOverloadTimer || 0) + ((ig as any).system.actualTick || 0)) % 8);
+    let c = (t % interval) / interval;
+    c = c < 0.5 ? c * 2 : (1 - c) * 2; // 0..1 triangle blink
+    if (c <= 0.02) return;
+    const img = getOverloadFillImage();
+    if (!img) return;
+    // Diamond frame: x[-2..28], y[-2..28] — 30px centred on (13,13). Calibrated
+    // over three rounds of screenshots: the head graphic's own margins are
+    // asymmetric (face centre ~12.5,12.5) and the plate's bottom shadow weighs
+    // in; the perceived centre sits slightly down-right of the plate's
+    // geometric centre (12,12). Fill rises from the frame's bottom edge
+    // (y=28); blink peak alpha 0.75.
+    renderer.addGfx(img, -2, 28 - d, 0, 30 - d, 30, d).setAlpha(c * 0.75);
+}
+
+/** 1.75.x (self ping semantics): the SELF badge's latency = the EFFECTIVE
+ * end-to-end link for this client's gameplay. Host: its own RTT to the server (the
+ * host's world is the authority, one leg away). Member: own RTT + the host's RTT —
+ * every member input travels member->server->host and the authoritative state comes
+ * back the same way, so the two legs sum. The host's RTT rides the playerPing relay
+ * (remotePings[instanceHost], ~1/s); host unknown / report not in yet / negative
+ * sample -> fall back to the own RTT alone. The same value tiers the diamond, so
+ * color and tooltip never disagree. */
+function selfEffectivePing(): { ping: number; lossPct: number } | null {
+    const q = mpQuality;
+    if (!q) return null;
+    let ping = q.ping;
+    try {
+        const m: any = mpGetMain && mpGetMain();
+        if (m && !m.host) {
+            const hn: any = m.instanceHost;
+            const hp: number = (hn && m.remotePings && typeof m.remotePings[hn] === 'number') ? m.remotePings[hn] : -1;
+            if (q.ping >= 0 && hp >= 0) ping = Math.round(q.ping + hp);
+        }
+    } catch (_) { /* fall back to the own RTT */ }
+    return { ping, lossPct: q.lossPct };
+}
+
+/** Change-gated badge-anchor diagnostic (1.75.x): logged once per anchor CHANGE
+ * so a retest can tell detection failures (no log on Shift/switch/backpack) from
+ * positioning failures (log shows the wheel anchor but the diamond didn't move). */
+let _mpBadgeAnchor = '';
+
+/** 1.75.x: the badge's EASED StatusHudGui-local position. Anchor changes (minimized
+ * <-> wheel) glide exponentially (tau 80ms -> settles in ~0.3s) instead of snapping;
+ * a >40px jump (first frame / reappear after the HUD hid) snaps instead of flying
+ * across the screen. */
+let _mpBadgePos: { x: number; y: number } | null = null;
+
+/** Injected into sc.StatusElementModeGui.updateDrawables: the self badge. 1.75.x:
+ * two element-INDEPENDENT anchors (see the constants block) — minimized: fixed
+ * (6,6); expanded: the wheel's origin + (17,17), OUTSIDE the ring's top-left edge,
+ * reading elementBgGui's live hook.pos + currentState offset so the badge follows
+ * the wheel through its menu slide animations but NEVER the per-element slot this
+ * gui itself slides to. Anchor switches ease smoothly via _mpBadgePos (no snap).
+ * EXPANDED is detected from the WHEEL's own state (currentStateName not HIDDEN* —
+ * StatusElementBgGui sits in HIDDEN/HIDDEN_MENU during normal play and goes
+ * DEFAULT/QUICKMENU/MENU for the element-switch display, the Shift quick menu and
+ * the backpack respectively), with gui.selectBg as a secondary signal — the state
+ * machine is the on-screen truth, the flag alone proved unreliable. Subtracting
+ * this gui's live hook.pos converts the StatusHudGui-local target back into
+ * element-local draw coords. Latency shown/tiered is the EFFECTIVE self link. */
 function collectElementHud(gui: any, renderer: any): void {
     if (!netBadgeActive()) return;
     const h = gui.hook;
-    const sc = ensureScreenCoords(h);
-    const q = mpQuality;
-    if (!q) return;
-    const off = gui.selectBg ? BADGE_OFF_SELF : BADGE_OFF_SELF_MIN;
-    drawDiamond(renderer, off, off, BADGE_HALF_SELF, TIER_COLORS[q.tier]);
+    const scr = ensureScreenCoords(h);
+    const eff = selfEffectivePing();
+    if (!eff) return;
+    let tx = BADGE_SELF_POS, ty = BADGE_SELF_POS;
+    let anchor = 'min';
+    let wheelState = '';
+    try {
+        const hud: any = (sc as any).gui && (sc as any).gui.statusHud;
+        const bg: any = hud && hud.elementBgGui;
+        const bh: any = bg && bg.hook;
+        wheelState = (bg && typeof bg.currentStateName === 'string') ? bg.currentStateName : '';
+        const wheelShown = !!(bh && bh.pos && wheelState && wheelState.indexOf('HIDDEN') !== 0);
+        if (wheelShown || gui.selectBg) {
+            if (bh && bh.pos) {
+                const st: any = bh.currentState || {};
+                tx = bh.pos.x + (typeof st.offsetX === 'number' ? st.offsetX : 0) + BADGE_OFF_WHEEL;
+                ty = bh.pos.y + (typeof st.offsetY === 'number' ? st.offsetY : 0) + BADGE_OFF_WHEEL;
+                anchor = 'wheel';
+            }
+        }
+    } catch (_) { /* keep the minimized spot */ }
+    // 1.75.x: ease the drawn position toward the anchor target (see _mpBadgePos).
+    try {
+        const dt: number = ((ig as any).system && typeof (ig as any).system.actualTick === 'number') ? (ig as any).system.actualTick : 0.016;
+        if (!_mpBadgePos || Math.abs(_mpBadgePos.x - tx) > 40 || Math.abs(_mpBadgePos.y - ty) > 40) {
+            _mpBadgePos = { x: tx, y: ty };
+        } else {
+            const k = 1 - Math.exp(-dt / 0.08);
+            _mpBadgePos.x += (tx - _mpBadgePos.x) * k;
+            _mpBadgePos.y += (ty - _mpBadgePos.y) * k;
+        }
+    } catch (_) { _mpBadgePos = { x: tx, y: ty }; }
+    const px: number = (h && h.pos && typeof h.pos.x === 'number') ? h.pos.x : 0;
+    const py: number = (h && h.pos && typeof h.pos.y === 'number') ? h.pos.y : 0;
+    const offX = Math.round(_mpBadgePos.x - px);
+    const offY = Math.round(_mpBadgePos.y - py);
+    const diag = anchor + '(' + tx + ',' + ty + ')';
+    if (diag !== _mpBadgeAnchor) {
+        _mpBadgeAnchor = diag;
+        try { console.log('[mpbadge] anchor -> ' + diag + ' selectBg=' + !!gui.selectBg + ' wheel=' + (wheelState || '?') + ' guiPos=' + Math.round(px) + ',' + Math.round(py)); } catch (_) { /* ignore */ }
+    }
+    drawDiamond(renderer, offX, offY, BADGE_HALF_SELF, TIER_COLORS[tierFor(eff.ping, eff.lossPct)]);
     const pad = BADGE_HALF_SELF + BADGE_HOVER_PAD;
     hoverTargets.push({
-        x: sc.x + off - pad, y: sc.y + off - pad,
+        x: scr.x + offX - pad, y: scr.y + offY - pad,
         w: pad * 2, h: pad * 2, kind: 'badge',
     });
 }
@@ -613,11 +781,13 @@ function pumpNetBadges(): void {
             text = t('netPingLabel') + ': ' + peer + '  '
                 + t('netLossLabel') + ': ' + (hit.lossPct != null ? hit.lossPct : 0) + '%';
         } else {
-            const q = mpQuality;
+            // 1.75.x: the SELF badge reports the EFFECTIVE self link — host: own
+            // server RTT; member: own RTT + the host's RTT (selfEffectivePing).
+            const eff = selfEffectivePing();
             // 100% loss -> no answered probe -> ping unknown; show a dash instead of -1.
-            const ping = q && q.ping >= 0 ? Math.round(q.ping) + 'ms' : '—';
+            const ping = eff && eff.ping >= 0 ? Math.round(eff.ping) + 'ms' : '—';
             text = t('netPingLabel') + ': ' + ping + '  '
-                + t('netLossLabel') + ': ' + (q ? q.lossPct : 0) + '%';
+                + t('netLossLabel') + ': ' + (eff ? eff.lossPct : 0) + '%';
         }
     } else {
         text = (hit.name || '') + '  ' + t('memberLevel') + ' ' + (hit.level != null ? hit.level : '?');
@@ -661,6 +831,7 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
         updateDrawables(this: any, renderer: any) {
             this.parent(renderer);
             try { collectMemberHud(this, renderer); } catch (_) { /* never break the HUD draw */ }
+            try { drawMemberOverloadOverlay(this, renderer); } catch (_) { /* never break the HUD draw */ }
         },
     });
 
@@ -751,6 +922,28 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
     // key counter overlap. While that override is active, slide the key HUD to
     // just below the lowest visible plate; native y=53 everywhere else.
     if (scAny.KeyHudGui && typeof scAny.KeyHudGui.inject === 'function') {
+        // 1.75.x (key-HUD bugfix): what the VANILLA key HUD would show right now —
+        // a key counter exists for the current area AND we are inside a dungeon.
+        // Every custom hide/show decision below is gated on this, so the counter can
+        // never appear outside a dungeon (the old backpack-fade re-showed it
+        // unconditionally on menu close, which leaked it into field maps).
+        const keyHudVanillaVisible = (keyHud: any): boolean => {
+            try {
+                const sm: any = (sc as any).map;
+                if (!sm || typeof sm.isDungeon !== 'function' || !sm.isDungeon()) return false;
+                const areaType = keyHud && keyHud.areaItemType;
+                if (areaType == null || typeof sm.getAreaItemId !== 'function') return false;
+                return sm.getAreaItemId(areaType) !== -1;
+            } catch (_) { return false; }
+        };
+        const keyHudMenuOpen = (model: any): boolean => {
+            try {
+                if (!model) return false;
+                if (typeof model.isMenu === 'function' && model.isMenu()) return true;
+                if (typeof model.isQuickMenu === 'function' && model.isQuickMenu()) return true;
+                return false;
+            } catch (_) { return false; }
+        };
         const repositionKeyHud = (keyHud: any): void => {
             try {
                 // invisibleUpdate: our fade state machine lives in this update()
@@ -759,32 +952,45 @@ export function installNetBadge(getMain: () => Multiplayer | undefined): void {
                 // and the next close saw a stale timer and popped instantly (the
                 // alternating gone/instant-appear cycle). One-time lazy write.
                 try { if (keyHud.hook && !keyHud.hook.invisibleUpdate) keyHud.hook.invisibleUpdate = true; } catch (_) { /* ignore */ }
-                // Backpack/menu fix: while the game is NOT in the running sub-state
-                // (main menu, quick menu, level-up, cutscene), leave the position to
-                // the engine — and while the MAIN MENU (backpack) is open, hide the
-                // key HUD outright (user request): the engine's menu spot (y=110)
-                // lands on top of our co-op party plates. On menu close the engine
-                // re-runs updateVisibility (SUB_STATE_CHANGED -> isRunning) which
-                // transitions it back to DEFAULT by itself.
                 const model: any = (sc as any).model;
-                if (!model || typeof model.isRunning !== 'function' || !model.isRunning()) {
-                    try {
-                        if (model && typeof model.isMenu === 'function' && model.isMenu()
-                            && keyHud.currentStateName !== 'HIDDEN') {
-                            keyHud._mpMenuHidden = true; // WE hid it -> fade back in on close
-                            keyHud._mpFadeAt = 0;
-                            keyHud.doStateTransition('HIDDEN');
-                        }
-                    } catch (_) { /* ignore */ }
+                const vanillaVisible = keyHudVanillaVisible(keyHud);
+                // Backpack / quick-menu fix: while the MAIN MENU (backpack) OR the
+                // Shift quick menu is open, hide the key counter outright (user
+                // request). Only when the vanilla HUD would show it inside a dungeon
+                // do we remember that WE hid it, so closing the menu fades it back.
+                // Outside a dungeon the native state stays HIDDEN and no stale
+                // _mpMenuHidden latch is ever armed (bug 1).
+                if (keyHudMenuOpen(model)) {
+                    if (vanillaVisible && keyHud.currentStateName !== 'HIDDEN') {
+                        keyHud._mpMenuHidden = true; // WE hid it -> fade back in on close
+                        keyHud._mpFadeAt = 0;
+                        keyHud.doStateTransition('HIDDEN');
+                    } else if (!vanillaVisible) {
+                        // Stale latch from an earlier dungeon visit: never re-show here.
+                        keyHud._mpMenuHidden = false;
+                        keyHud._mpFadeAt = 0;
+                        if (keyHud.currentStateName !== 'HIDDEN') keyHud.doStateTransition('HIDDEN');
+                    }
                     return;
                 }
-                // Fade-back after the backpack closes (user request): the engine pops
-                // the HUD back INSTANTLY on SUB_STATE_CHANGED (time-0 DEFAULT
+                if (!model || typeof model.isRunning !== 'function' || !model.isRunning()) {
+                    return; // level-up / cutscene: engine owns the key HUD state
+                }
+                // Fade-back after the backpack / quick menu closes (user request): the
+                // engine pops the HUD back INSTANTLY on SUB_STATE_CHANGED (time-0 DEFAULT
                 // transition) while the menu's exit zoom is still playing. Undo the
                 // pop in the same frame (time-0 HIDDEN, nothing was drawn yet), wait
                 // out the exit animation (0.2s HIDDEN fade + 0.3s position restore),
                 // then fade in from transparent by ramping hook.localAlpha (0 -> 0.8).
+                // 1.75.x: only when the vanilla HUD would still be visible here — a
+                // menu close outside a dungeon keeps the counter hidden.
                 if (keyHud._mpMenuHidden) {
+                    if (!vanillaVisible) {
+                        keyHud._mpMenuHidden = false;
+                        keyHud._mpFadeAt = 0;
+                        if (keyHud.currentStateName !== 'HIDDEN') keyHud.doStateTransition('HIDDEN');
+                        return;
+                    }
                     const now = Date.now();
                     if (keyHud.currentStateName !== 'HIDDEN') keyHud.doStateTransition('HIDDEN');
                     if (!keyHud._mpFadeAt) keyHud._mpFadeAt = now + 300;

@@ -6,17 +6,22 @@ interface IIdentifyResult {
     isNew?: boolean;
     /** Server-side save to restore on login, or null if none. */
     save?: { slot: string, data: string } | null;
-    /** Round 16 (issue 4): server-provided per-extra-party-member enemy max-HP
+    /** Round 16 (issue 4): server-provided per-extra-player enemy max-HP
      * fraction (config.json monsterHpPerPlayer, default 0.7 = +70% HP per extra
-     * member). The HOST client applies it using its own party roster size. */
+     * player in the room). The HOST client applies it using its room player
+     * count (1.75.x: room-based, not party-roster-based). */
     hpScale?: number;
+    /** 1.76.x: the same scheme, but ONLY for boss enemies (enemyType.boss) —
+     * config.json monsterBossHpPerPlayer, default 0.9 = +90% HP per extra
+     * player in the room. Regular enemies keep hpScale. */
+    hpScaleBoss?: number;
     /** Same scheme for the hit-count break threshold (config.json
-     * monsterBreakPerPlayer, default 0.7 = +70% per extra member). */
+     * monsterBreakPerPlayer, default 0.7 = +70% per extra player in the room). */
     breakScale?: number;
     /** Same scheme for the elemental-status THRESHOLD (config.json
      * monsterStatusThresholdPerPlayer, default 0.6 = +60% bar-fill required per
-     * extra member). The HOST divides enemy statusInflict susceptibility by
-     * 1 + statusScale * (partySize - 1). */
+     * extra player in the room). The HOST divides enemy statusInflict
+     * susceptibility by 1 + statusScale * (playersInRoom - 1). */
     statusScale?: number;
     /** 1.74.x: whether online players collide with each other (config.json
      * playerCollision, default false = always walk-through). */

@@ -117,7 +117,7 @@ export interface IConnection {
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
      * uncharged ball vs strong melee / charged ball / knockback skill) instead of a
      * fixed MEDIUM. */
-    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number }): void;
+    enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number, stunSteps?: Array<{ type: string, [k: string]: any }> }): void;
     /** ROUND 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a real
      * enemy. The server self-drops enemyDamage back to that member, so any OTHER member
      * spectating heard nothing. The host relays a cosmetic-only notice (no damage) so
@@ -133,6 +133,11 @@ export interface IConnection {
      * speedlines on the same entity; the server excludes the sender and rate-limits
      * ~20/s. kind = 'counter' | 'break'. */
     emitCombatFx(uid: number, kind: string): void;
+    /** 1.75.x (boss-phase quick revive): the HOST detected a boss phase transition
+     * (hpBreak threshold or a boss COMBAT_CUTSCENE) — relay to the instance so
+     * soft-dead members revive immediately. Host-only on the server; `uid` is the
+     * boss entity id (0 when the transition came from a cutscene). */
+    sendBossPhase(map: string, uid: number): void;
     /** The local player genuinely fell into a fall terrain (water/hole/...) —
      * relay the terrain to the party so teammates replay the splash + fall-damage
      * visual on our mirror. Needed because replica-local terrain falls are
@@ -143,6 +148,16 @@ export interface IConnection {
      * player position} so same-block teammates gather onto us and replay the
      * cutscene. Server broadcasts to the map instance, sender excluded. */
     sendCutsceneTrigger(map: string, mi: number, p: [number, number, number]): void;
+    /** 1.75.x (quest enemy AR labels): a real enemy action just showed a floating
+     * SHOW_AR_MSG window ([饥饿的叫声] / [舔树] on quest enemies). Relay the label
+     * so teammates replay it on their puppet/csPuppet of the same uid. */
+    sendEnemyArMsg(data: { uid: number, label: any, time: number, mode: number, color: number }): void;
+    /** 1.76.x (barrier denial FX): the local player just triggered a locked-barrier
+     * denial — relay the "拒绝访问" AR window (kind 'ar', anchored on the denied
+     * player's mirror), the barrier flash (kind 'flash', fixed world position),
+     * and the hover drag-back pose+ring (kind 'hover') so teammates see the
+     * effect too. */
+    sendPlayerFx(data: { pl: string, kind: 'ar' | 'flash' | 'hover', label?: any, time?: number, mode?: number, color?: number, sheet?: string, key?: string, x?: number, y?: number, z?: number }): void;
     /** Round 17: HOST -> all — one of my real enemies started an attack (fresh attack
      * anim edge at block cadence). Members replay it on their puppet toward the local
      * player (member puppets no longer run local AI). Round 22 (RC1): `t` is the
@@ -213,6 +228,12 @@ export interface IConnection {
      * client, so it unambiguously identifies the same plant for everyone. The server relays
      * it to the other same-instance members (sender excluded). */
     plantBreak(data: { map: string, mapId: number }): void;
+    /** ROUND 141 (prop hit-FX sync): any client -> its instance — the local player's
+     * ball/melee hit a map destructible and played the vanilla impact flash; relay the
+     * impact point (hit center + element + attack type) so every other same-instance
+     * client replays the flash on its own copy of the prop (their player-ball puppets
+     * are collision-neutered, so their local ballHit never fires for teammates). */
+    propHitFx(data: { map: string, mapId: number, x: number, y: number, z: number, el: number, at: number }): void;
     /** 1.71.0 (dungeon puzzles): any client -> its instance — compact state of
      * dungeon puzzle entities (boxes/platforms/switches/ice pillars) that changed
      * locally. The server relays it to the other same-instance members.
@@ -249,7 +270,7 @@ export interface IConnection {
     // Real player profile (level/stats/equip) shown in the Social info box.
     updatePlayerProfile(profile: IPlayerProfile): void;
     // Frequent live combat stats (currentHp/currentSp) for the in-game party HUD.
-    updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number }): void;
+    updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }): void;
 
     // ---- social (lobby architecture) ----
     friendAdd(name: string): void;
@@ -479,12 +500,22 @@ export interface IConnection {
      * relayed, sender excluded). Replay it locally on the same-uid entity. kind =
      * 'counter' | 'break'. */
     onCombatFx(callback: (uid: number, kind: string) => void): void;
+    /** 1.75.x (boss-phase quick revive): the instance host detected a boss phase
+     * transition — revive the soft-dead local player immediately. */
+    onBossPhase(callback: (data: { map: string, uid?: number }) => void): void;
     /** A party teammate genuinely fell into a fall terrain — replay the fall
      * visual (splash effect + damage popup + respawn drift) on their mirror. */
     onPlayerFall(callback: (from: string, terrain: number) => void): void;
     /** A same-block teammate started a story-gated dungeon cutscene — gather
      * onto their exact position and start the same trigger locally. */
     onCutsceneTrigger(callback: (data: { map: string, mi: number, p: [number, number, number], from?: string }) => void): void;
+    /** 1.75.x (quest enemy AR labels): a peer's real enemy action showed a floating
+     * AR window — replay it on our matching puppet/csPuppet. */
+    onEnemyArMsg(callback: (data: { uid: number, label: any, time: number, mode: number, color: number }) => void): void;
+    /** 1.76.x (barrier denial FX): a teammate was denied by a locked barrier —
+     * replay the AR window on their mirror / the barrier flash at the fixed
+     * position (see NetSync.applyPlayerFx). */
+    onPlayerFx(callback: (data: any) => void): void;
     /** Round 23: the host killed a real enemy — grant the relayed credits to our own
      * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
      * via broadcastHostState. */
@@ -551,6 +582,9 @@ export interface IConnection {
      * chain: dropped anim + FX + our own drop rolls + propsDestroyed count + respawn
      * var). Idempotent: an already-dropped/absent plant is a no-op. */
     onPlantBreak(callback: (data: { map: string, mapId: number }) => void): void;
+    /** ROUND 141: a teammate's attack hit a destructible — replay the impact flash
+     * at the relayed position on our intact copy (see NetSync.applyPropHitFx). */
+    onPropHitFx(callback: (data: { map: string, mapId: number, x: number, y: number, z: number, el: number, at: number }) => void): void;
 
     onRegisterEntity(callback:
         (id: number, type: string, pos: Vec3, settings: object) => void): void;
@@ -569,7 +603,7 @@ export interface IConnection {
     onPlayerProfile(callback:
         (player: string, profile: IPlayerProfile) => void): void;
     onPlayerStats(callback:
-        (player: string, stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number }) => void): void;
+        (player: string, stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }) => void): void;
     /** Round 17: a player in our instance reported its own RTT (ms, ~1/s cadence,
      * server-relayed). Shown on name tags when 显示ping值 is on. Round 20: the relay
      * also carries `isHost` (true when that player is the map-instance host). */
@@ -600,7 +634,7 @@ export interface IConnection {
      * kicked. The roster-diff toast path only announces OTHER members. */
     onPartySelfEvent(callback: (event: 'join' | 'leave' | 'kicked') => void): void;
     onPartyInvite(callback: (from: string, partyId: string) => void): void;
-    onPartyMove(callback: (data: { leader?: string, map?: string, pos?: Vec3 }) => void): void;
+    onPartyMove(callback: (data: { leader?: string, map?: string, pos?: Vec3, blocked?: string }) => void): void;
     // Server nudge to re-assert our current instance (e.g. after someone joined
     // our party) so both ends spawn each other's mirror entity.
     onPartyReSync(callback: () => void): void;

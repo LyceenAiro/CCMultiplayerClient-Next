@@ -1915,7 +1915,10 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
         },
         onTabButtonCreation(this: any, b: string, a: number, d: any) {
             if (b === 'requests') {
-                const btn = new sc.ItemTabbedBox.TabButton(t('requestsTab'), 'social-requests', 100);
+                // 1.75.x (user request): icon = the 数据 page's 活动日志 (activity
+                // log) tab icon 'stats-log' (game's own icon set; the old custom
+                // 'social-requests' key was never in the game's icon map).
+                const btn = new sc.ItemTabbedBox.TabButton(t('requestsTab'), 'stats-log', 100);
                 btn.textChild.setPos(7, 1);
                 btn.setPos(0, 2);
                 btn.setData({ type: d.type });
@@ -1939,7 +1942,10 @@ export function installSocialMenuButton(getMain: () => Multiplayer | undefined):
                 return btn;
             }
             if (b === 'room') {
-                const btn = new sc.ItemTabbedBox.TabButton(t('roomTab'), 'social-room', 85);
+                // 1.75.x (user request): icon = the native 联系人 (contacts) tab
+                // icon 'social-contacts' (the old custom 'social-room' key was
+                // never in the game's icon map).
+                const btn = new sc.ItemTabbedBox.TabButton(t('roomTab'), 'social-contacts', 85);
                 btn.textChild.setPos(7, 1);
                 btn.setPos(0, 2);
                 btn.setData({ type: d.type });

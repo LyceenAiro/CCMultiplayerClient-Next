@@ -16,12 +16,11 @@ export class OnMapLoadedListener {
 	}
 
 	public afterUpdate(): void {
-		// Flush pending enemy-mirror spawns ONLY once the map has fully finished
-		// loading (loadingComplete -> not teleporting). Flushing earlier (bare
-		// ig.ready) fires while map resources are still streaming in, so the
-		// EnemyType.load() inside spawnMultiplayerEntity misses the resource batch
-		// and the mirror spawns invisible/broken (looks like a "frozen" enemy).
-		if (this.main.loadingMap || ig.game.isTeleporting()) return;
+		// 1.75.x: destructible-persistence reapply now runs from netSync.tick's
+		// map-change branch (plus a 1s same-map safety net), so it is NOT called
+		// here anymore — this listener runs BEFORE netSync.tick, where
+		// netSync.mapName still names the PREVIOUS map and a reapply could kill
+		// an unrelated entity that shares a mapId on the new map.
 		while (this.main.futureEntities.length > 0) {
 			this.main.spawnMultiplayerEntity(this.main.futureEntities[0]);
 			this.main.futureEntities.shift();

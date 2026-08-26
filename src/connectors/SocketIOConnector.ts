@@ -392,6 +392,7 @@ export class SocketIoConnector implements IConnection {
                 // version string so the client can show the "server updated" popup.
                 version?: string,
                 hpScale?: number,
+                hpScaleBoss?: number,
                 attackScale?: number,
                 defenseScale?: number,
                 focusScale?: number,
@@ -410,7 +411,7 @@ export class SocketIoConnector implements IConnection {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -955,7 +956,7 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
-	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number }): void {
+	public enemyDamage(hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, stb?: number, hints?: string[], hx?: number, hy?: number, stunSteps?: Array<{ type: string, [k: string]: any }> }): void {
 		this.syncEmit('enemyDamage', hit);
 	}
 
@@ -972,6 +973,13 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('combatFx', { uid, kind });
 	}
 
+	/** 1.75.x (boss-phase quick revive): the HOST detected a boss phase transition
+	 * (hpBreak threshold or a boss COMBAT_CUTSCENE) — tell the instance so soft-dead
+	 * members revive immediately. Host-only on the server (broadcastHostState). */
+	public sendBossPhase(map: string, uid: number): void {
+		this.syncEmit('bossPhase', { map, uid });
+	}
+
 	/** The local player genuinely fell (water/hole/...): relay the ig.TERRAIN
 	 * number to the party — replicas suppress terrain-driven falls locally. */
 	public sendPlayerFall(terrain: number): void {
@@ -983,6 +991,21 @@ export class SocketIoConnector implements IConnection {
 	 * replay it (see CutsceneRelay). */
 	public sendCutsceneTrigger(map: string, mi: number, p: [number, number, number]): void {
 		this.syncEmit('cutsceneTrigger', { map, mi, p });
+	}
+
+	/** 1.75.x (quest enemy AR labels, 深度呵护): a REAL enemy action showed a
+	 * floating SHOW_AR_MSG window ([饥饿的叫声] / [舔树]). Relay the label so
+	 * teammates replay it on their puppet/csPuppet of the same uid. */
+	public sendEnemyArMsg(data: { uid: number, label: any, time: number, mode: number, color: number }): void {
+		this.syncEmit('enemyArMsg', data);
+	}
+
+	/** 1.76.x (barrier denial FX): the local player bumped a locked red barrier —
+	 * relay the "拒绝访问" AR window (kind 'ar'), the barrier flash (kind 'flash')
+	 * and the hover drag-back pose+ring (kind 'hover') so teammates see the
+	 * denial effect on their own screen. */
+	public sendPlayerFx(data: { pl: string, kind: 'ar' | 'flash' | 'hover', label?: any, time?: number, mode?: number, color?: number, sheet?: string, key?: string, x?: number, y?: number, z?: number }): void {
+		this.syncEmit('playerFx', data);
 	}
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
@@ -1096,6 +1119,11 @@ export class SocketIoConnector implements IConnection {
 	// at the same mapId (see NetSync.applyPlantBreak). syncEmit: solo-instance skip.
 	public plantBreak(data: { map: string, mapId: number }): void {
 		this.syncEmit('plantBreak', data);
+	}
+	/** ROUND 141 (prop hit-FX sync): relay a local destructible-hit impact flash to
+	 * the instance (see NetSync.observeLocalPropBallHit). syncEmit: solo-instance skip. */
+	public propHitFx(data: { map: string, mapId: number, x: number, y: number, z: number, el: number, at: number }): void {
+		this.syncEmit('propHitFx', data);
 	}
 
 	// 1.71.0: dungeon puzzle-state relay (boxes/platforms/switches/ice pillars).
@@ -1253,7 +1281,7 @@ export class SocketIoConnector implements IConnection {
 	public updateEntityHealth(id: number | null, health: number, maxHp?: number): void {
 		this.socket.emit('updateEntityHealth', {id, hp: health, maxHp});
 	}
-	public updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number }): void {
+	public updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }): void {
 		this.socket.emit('updatePlayerStats', stats);
 	}
 	// ---- NEW sync system ----
@@ -1401,7 +1429,7 @@ export class SocketIoConnector implements IConnection {
 			callback(data);
 		});
 	}
-	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }) => void): void {
+	public onEnemyDamage(callback: (hit: { uid: number, damage: number, attacker: string, type?: number, ball?: boolean, charged?: boolean, knockback?: number, attackElement?: number, critical?: boolean, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number, stunSteps?: Array<{ type: string, [k: string]: any }> }) => void): void {
 		this.socket.on('enemyDamage', (data: any) => {
 			callback(data);
 		});
@@ -1429,6 +1457,13 @@ export class SocketIoConnector implements IConnection {
 			}
 		});
 	}
+	/** 1.75.x (boss-phase quick revive): the instance host detected a boss phase
+	 * transition — revive the soft-dead local player (see NetSync.applyBossPhase). */
+	public onBossPhase(callback: (data: { map: string, uid?: number }) => void): void {
+		this.socket.on('bossPhase', (data: any) => {
+			callback(data || {});
+		});
+	}
 	/** A party teammate genuinely fell — replay the fall visual on their mirror
 	 * (see NetSync.replayPlayerFall). */
 	public onPlayerFall(callback: (from: string, terrain: number) => void): void {
@@ -1446,6 +1481,20 @@ export class SocketIoConnector implements IConnection {
 				&& Array.isArray(data.p) && data.p.length === 3) {
 				callback(data);
 			}
+		});
+	}
+	/** 1.75.x (quest enemy AR labels): a peer's real enemy action showed a floating
+	 * AR window — replay it on our matching puppet/csPuppet (see NetSync.applyEnemyArMsg). */
+	public onEnemyArMsg(callback: (data: { uid: number, label: any, time: number, mode: number, color: number }) => void): void {
+		this.socket.on('enemyArMsg', (data: any) => {
+			if (data && typeof data.uid === 'number') callback(data);
+		});
+	}
+	/** 1.76.x (barrier denial FX): a teammate was denied by a locked barrier —
+	 * replay the AR window on their mirror / the flash at the fixed position. */
+	public onPlayerFx(callback: (data: any) => void): void {
+		this.socket.on('playerFx', (data: any) => {
+			if (data && typeof data.pl === 'string') callback(data);
 		});
 	}
 	/** ROUND 45 (Gap A, host origin): the host relayed a member's hit on a real enemy —
@@ -1579,6 +1628,17 @@ export class SocketIoConnector implements IConnection {
 			}
 		});
 	}
+	/** ROUND 141 (prop hit-FX sync): a teammate's attack hit a destructible — replay
+	 * the impact flash on our copy (see NetSync.applyPropHitFx). The server relays the
+	 * event to the other instance members (sender excluded) and validates the payload. */
+	public onPropHitFx(callback: (data: { map: string, mapId: number, x: number, y: number, z: number, el: number, at: number }) => void): void {
+		this.socket.on('propHitFx', (data: any) => {
+			if (data && typeof data.map === 'string' && typeof data.mapId === 'number'
+				&& typeof data.x === 'number' && typeof data.y === 'number' && typeof data.z === 'number') {
+				callback({ map: data.map, mapId: data.mapId, x: data.x, y: data.y, z: data.z, el: data.el, at: data.at });
+			}
+		});
+	}
 	public onRegisterEntity(callback: (id: number, type: string, pos: Vec3, settings: object) => void): void {
 		this.socket.on('registerEntity', (data: any) => {
 			callback(data.id, data.type, data.pos, data.settings);
@@ -1619,7 +1679,7 @@ export class SocketIoConnector implements IConnection {
 			callback(data.player, data.profile);
 		});
 	}
-	public onPlayerStats(callback: (player: string, stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number }) => void): void {
+	public onPlayerStats(callback: (player: string, stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }) => void): void {
 		this.socket.on('updatePlayerStats', (data: any) => {
 			callback(data.player, data);
 		});

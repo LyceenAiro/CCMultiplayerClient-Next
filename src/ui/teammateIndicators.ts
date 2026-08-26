@@ -1,5 +1,6 @@
 import { Multiplayer } from '../multiplayer';
 import { getMpUiScale } from './uiScale';
+import { getMpOption } from './mpOptions';
 
 /**
  * 1.71.9 (QoL 1): off-screen teammate arrows.
@@ -40,8 +41,16 @@ const EDGE_GAP = 4;
 // Max scale of the .mpArrowPulse breathing animation (matches the CSS keyframes).
 const PULSE_MAX = 1.16;
 // ROUND: user request — the arrow no longer grows/shrinks with distance; it is a
-// single fixed size.
-const ARROW_SIZE = 20;
+// single fixed size. 1.75.x: that size is now a per-player option
+// (多人设置 → 队友箭头大小); 20 is the previous value and fallback.
+const ARROW_SIZE_DEFAULT = 20;
+
+function pickArrowSize(): number {
+	try {
+		const v = getMpOption('teammateArrowSize');
+		return typeof v === 'number' && isFinite(v) && v >= 8 && v <= 96 ? v : ARROW_SIZE_DEFAULT;
+	} catch (_) { return ARROW_SIZE_DEFAULT; }
+}
 
 let installed = false;
 let getMain: (() => Multiplayer | undefined) | null = null;
@@ -273,7 +282,7 @@ function tick(): void {
 			else if (py > vh - margin) { py = vh - margin; if (Math.abs(Math.cos(ang)) > 0.001) px = cx + ((vh - margin) - cy) / Math.tan(ang); }
 			px = Math.max(margin, Math.min(vw - margin, px));
 			py = Math.max(margin, Math.min(vh - margin, py));
-			const size = ARROW_SIZE;
+			const size = pickArrowSize();
 			const el = ensureEl(name);
 			if (el.attr('data-size') !== String(Math.round(size))) {
 				el.attr('data-size', Math.round(size));

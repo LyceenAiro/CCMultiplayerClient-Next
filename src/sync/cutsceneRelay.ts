@@ -104,7 +104,7 @@ class CutsceneRelay implements ICutsceneRelay {
 			// enemy-target signature (SET_SCREEN_ENEMY_TARGET / SET_FINAL_DRAMATIC_EFFECT)
 			// — e.g. cold-dng.b3.center's BattleStart when stepping off the elevator.
 			const isEncounter = trig.eventType === EVT.PARALLEL && this.hasEncounterSignature(trig);
-			if (!isCutscene && !isEncounter) return false;
+			if (!isCutscene && !isEncounter && !this.isDrillBossIntroTrigger(trig)) return false;
 			if (typeof trig.triggerVar !== 'string' || trig.triggerVar.indexOf('map._entity') !== 0) return false;
 			// In the BAKED game VarCondition.condition is the COMPILED predicate
 			// function, not the source string — the string check here silently
@@ -120,6 +120,19 @@ class CutsceneRelay implements ICutsceneRelay {
 			const ctl: any = (window as any).__mpStory;
 			if (ctl && typeof ctl.isPerPlayerChainTrigger === 'function' && ctl.isPerPlayerChainTrigger(trig)) {
 				return false;
+			}
+			// 1.76.x (master-door unlock per-player, direct check): a cutscene
+			// armed by one of THIS map's key-lock unlock counters
+			// (map.masterDoorOpened / map.keyUsed / ...) documents the LOCAL
+			// player's own key spend — it must never gather/relay, no matter
+			// which upstream判定 route classified it. Defense-in-depth on top of
+			// storySync's isPerPlayerChainTrigger (case d).
+			{
+				const m: any = this.getMain();
+				const ns: any = m && m.netSync;
+				if (ns && typeof ns.isKeyLockGateCondition === 'function' && ns.isKeyLockGateCondition(condStr)) {
+					return false;
+				}
 			}
 			return true;
 		} catch (_) { return false; }
@@ -139,6 +152,37 @@ class CutsceneRelay implements ICutsceneRelay {
 			}
 		} catch (_) { /* ignore */ }
 		return false;
+	}
+
+	/** 1.75.x (drill-boss barrier intro): the Temple Mine final-boss trigger —
+	 * PARALLEL, named "Intro", sets map.barrierUp and carries both SET_CAMERA_POS
+	 * and RUMBLE_SCREEN steps. Detected from the raw settings, scoped to the boss map. */
+	private isDrillBossIntroTrigger(trig: any): boolean {
+		try {
+			if (!trig || trig._killed) return false;
+			const mapName: string = ((ig.game as any).mapName || '') as string;
+			if (mapName !== 'cold-dng/g/boss' && mapName !== 'cold-dng.g.boss') return false;
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			if (trig.eventType !== EVT.PARALLEL) return false;
+			const raw = trig._mpCsSettings;
+			if (!raw || raw.name !== 'Intro' || !Array.isArray(raw.event)) return false;
+			let barrier = false, cam = false, rumble = false;
+			const scan = (steps: any[]): void => {
+				if (!Array.isArray(steps)) return;
+				for (let i = 0; i < steps.length; i++) {
+					const s = steps[i];
+					if (!s || typeof s.type !== 'string') continue;
+					if (s.type === 'CHANGE_VAR_BOOL' && s.varName === 'map.barrierUp' && s.value === true) barrier = true;
+					if (s.type === 'SET_CAMERA_POS') cam = true;
+					if (s.type === 'RUMBLE_SCREEN') rumble = true;
+					if (Array.isArray(s.action)) scan(s.action);
+					if (Array.isArray(s.thenStep)) scan(s.thenStep);
+					if (Array.isArray(s.elseStep)) scan(s.elseStep);
+				}
+			};
+			scan(raw.event);
+			return barrier && cam && rumble;
+		} catch (_) { return false; }
 	}
 
 	/** Fade + collision-off for other mirrors while an encounter-battle intro plays
@@ -161,6 +205,76 @@ class CutsceneRelay implements ICutsceneRelay {
 			const EVT: any = (ig as any).EVENT_TYPE || {};
 			return trig.eventType === EVT.PARALLEL && this.hasEncounterSignature(trig);
 		} catch (_) { return false; }
+	}
+
+	/** 1.75.x (overworld side-quest cutscenes): true when the trigger's RAW
+	 * startCondition references `quest.*`. Only then is a relayed copy gated on the
+	 * RECEIVER's own quest state — main-story/dungeon/puzzle conditions (plot/tmp/map
+	 * vars) must keep the old always-replay behaviour, because the relay exists to
+	 * cover exactly the case where those vars/event-readiness were missed locally. */
+	private hasQuestGate(trig: any): boolean {
+		try {
+			const raw = trig && trig._mpCsSettings;
+			let cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+			// Fallback for triggers that existed before the relay hook stashed their
+			// raw settings (map loaded pre-install): VarCondition keeps the source in
+			// `pretty` even in the baked game.
+			if (!cond && trig && trig.startCondition && typeof trig.startCondition.pretty === 'string') {
+				cond = trig.startCondition.pretty;
+			}
+			return /quest\./.test(cond);
+		} catch (_) { return false; }
+	}
+
+	/** Extract every quest id referenced by the trigger condition (`quest.a-b_1...`). */
+	private questIdsReferenced(cond: string): string[] {
+		const out: string[] = [];
+		try {
+			if (!cond) return out;
+			const re = /quest\.([A-Za-z0-9_\-]+)/g;
+			let m: RegExpExecArray | null;
+			while ((m = re.exec(cond)) && out.length < 16) {
+				if (m[1] && out.indexOf(m[1]) === -1) out.push(m[1]);
+			}
+		} catch (_) { /* ignore */ }
+		return out;
+	}
+
+	/** A referenced quest is "locally known" when this save has accepted it or
+	 * already solved it. Never compare task steps here — the full condition
+	 * evaluation below handles that; this only rejects players whose save has no
+	 * trace of the side quest at all. */
+	private questLocallyKnown(id: string): boolean {
+		try {
+			const q: any = (sc as any).quests;
+			if (!q) return true; // no quest model to ask: keep the old behaviour
+			if (typeof q.isQuestActive === 'function' && q.isQuestActive(id)) return true;
+			if (typeof q.isQuestSolved === 'function' && q.isQuestSolved(id)) return true;
+		} catch (_) { /* fall through to false */ }
+		return false;
+	}
+
+	/** Evaluate the trigger's own compiled startCondition against THIS client's vars,
+	 * after confirming every referenced quest exists in this save. A player who never
+	 * accepted the side quest fails the first part even for negated conditions like
+	 * `!quest.x.solved` (which would otherwise evaluate true for a missing quest), and
+	 * a player on a different task step fails the second part — either way they must
+	 * not be teleported nor play the cutscene, because the quest data/entities are
+	 * missing locally and the scene would wedge. */
+	private questGateMet(trig: any): boolean {
+		try {
+			const raw = trig && trig._mpCsSettings;
+			let cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+			if (!cond && trig && trig.startCondition && typeof trig.startCondition.pretty === 'string') {
+				cond = trig.startCondition.pretty;
+			}
+			const ids = this.questIdsReferenced(cond);
+			for (const id of ids) {
+				if (!this.questLocallyKnown(id)) return false;
+			}
+			if (!trig || !trig.startCondition || typeof trig.startCondition.evaluate !== 'function') return true;
+			return trig.startCondition.evaluate() === true;
+		} catch (_) { return false; /* quest-gated and unverifiable: skip, never wedge */ }
 	}
 
 	private markEncounterFade(trig: any): void {
@@ -204,7 +318,7 @@ class CutsceneRelay implements ICutsceneRelay {
 					'local cutscene start: ' + this.trigLabel(trig)
 					+ ' storySync=' + (this.storySyncActive() ? 1 : 0));
 			}
-			if (this.storySyncActive()) return; // story sync owns trigger authority
+			if (this.storySyncActive() && !this.isDrillBossIntroTrigger(trig)) return; // story sync owns trigger authority (except the drill-boss barrier)
 			if (!this.qualifies(trig)) {
 				if (trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE) {
 					this.logOnce('qual:' + (trig.mapId || '?'), 'start NOT relay-qualified: ' + this.trigLabel(trig)
@@ -249,7 +363,7 @@ class CutsceneRelay implements ICutsceneRelay {
 		try {
 			if (!data || typeof data.map !== 'string' || typeof data.mi !== 'number') return;
 			if (!Array.isArray(data.p) || data.p.length !== 3) return;
-			if (this.storySyncActive()) { this.logOnce('rs:' + data.mi, 'relay mi=' + data.mi + ' ignored: storySync active'); return; }
+			if (this.storySyncActive() && data.map !== 'cold-dng/g/boss' && data.map !== 'cold-dng.g.boss') { this.logOnce('rs:' + data.mi, 'relay mi=' + data.mi + ' ignored: storySync active'); return; }
 			const g: any = ig.game;
 			if (!g || !g.playerEntity) return;
 			if ((g.mapName || '') !== data.map) return; // different block — not for us
@@ -262,6 +376,12 @@ class CutsceneRelay implements ICutsceneRelay {
 			}
 			const trig = this.findTrigger(data.mi);
 			if (!trig) { this.logOnce('nf:' + data.mi, 'relay mi=' + data.mi + ' — trigger NOT FOUND on this map'); return; }
+		// storySync owns every other trigger on the boss map — the drill-boss barrier
+		// intro is the one exception (blocked players must be pulled inside).
+		if (this.storySyncActive() && !this.isDrillBossIntroTrigger(trig)) {
+			this.logOnce('rs:' + data.mi, 'relay mi=' + data.mi + ' ignored: storySync active');
+			return;
+		}
 			// 1.74.x (element-get freeze): per-player upgrade chain — skip the
 			// relayed copy; our own native trigger plays it locally (mixed
 			// old/new client pairs still send these).
@@ -272,8 +392,60 @@ class CutsceneRelay implements ICutsceneRelay {
 					return;
 				}
 			}
+			// 1.76.x (master-door unlock per-player, direct check): never replay a
+			// cutscene armed by a key-lock unlock counter — each client plays its
+			// own when IT spends the key.
+			{
+				const m: any = this.getMain();
+				const ns: any = m && m.netSync;
+				const raw2 = trig && (trig._mpCsSettings || trig._mpStorySettings);
+				const cond2 = (raw2 && typeof raw2.startCondition === 'string') ? raw2.startCondition
+					: ((trig && trig.startCondition && typeof trig.startCondition.pretty === 'string') ? trig.startCondition.pretty : '');
+				if (ns && typeof ns.isKeyLockGateCondition === 'function' && ns.isKeyLockGateCondition(cond2)) {
+					this.logOnce('keylock:' + data.mi, 'relay mi=' + data.mi + ' skipped: key-lock unlock cutscene (per-player)');
+					return;
+				}
+			}
+			// 1.75.x (overworld side-quest cutscenes): a quest-gated trigger must be
+			// locally available for US. Otherwise we have not accepted that side quest
+			// (or are on a different step) — no teleport, no replay, or the scene's
+			// quest data is missing locally and we'd be stuck.
+			if (this.hasQuestGate(trig) && !this.questGateMet(trig)) {
+				this.logOnce('quest:' + data.mi, 'relay mi=' + data.mi + ' skipped: local quest condition not met');
+				return;
+			}
 			// We already consumed it (we were standing in the zone ourselves, or
 			// saw it in an earlier session) — no teleport, no replay.
+		// 1.75.x (drill-boss barrier): never replay the full Intro event on teammates
+		// — it would block mobility, pause BGM and drive the boss puppet. Instead mark
+		// consumed FIRST (prevents our own native trigger from firing once we teleport
+		// into the zone), then netSync does the one-shot teleport + camera/rumble-only
+		// replay.
+		if (this.isDrillBossIntroTrigger(trig)) {
+			if (trig.triggerVar && ig.vars.get(trig.triggerVar)) {
+				this.logOnce('done:' + data.mi, 'drill intro already consumed');
+				return;
+			}
+			if (trig.triggerVar) {
+				// Write the per-map storage object DIRECTLY — the hooked ig.vars.set
+				// would let an active story sync relay this per-player consumed flag
+				// to players outside the boss block and pre-consume their trigger.
+				try {
+					const vars: any = (ig as any).vars;
+					const mapObj: any = vars && vars.storage && vars.storage.map;
+					const key: string = trig.triggerVar.slice(4);
+					if (mapObj && typeof mapObj === 'object' && key) mapObj[key] = true;
+				} catch (_) { /* consumed flag is best-effort */ }
+			}
+			const m: any = this.getMain();
+			const ns: any = m && m.netSync;
+			if (ns && typeof ns.applyDrillBossIntro === 'function') {
+				ns.applyDrillBossIntro(data.p);
+				console.log('[cutscenerelay] drill-boss intro relayed mi=' + data.mi
+					+ ' from=' + (data.from || '?'));
+			}
+			return;
+		}
 			this.maybeRespawn(trig);
 			if (trig.triggerVar && ig.vars.get(trig.triggerVar)) { this.logOnce('done:' + data.mi, 'relay mi=' + data.mi + ' already consumed'); return; }
 			if (trig.eventCall && trig.eventCall.isRunning()) { this.logOnce('run:' + data.mi, 'relay mi=' + data.mi + ' already running natively'); return; }

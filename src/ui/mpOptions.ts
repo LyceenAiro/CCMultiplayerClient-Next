@@ -25,6 +25,18 @@ import { isSharedTownNow } from '../util/areaUtil';
  *   - tagSize      : tag font 小/中/大 (tinyFont / smallFont / main bold font).
  *   Choice rows use a value readout + two arrow buttons (buildChoiceRow). Every
  *   row change rebuilds all tags next frame via resetAllTags().
+ *
+ * Round 142 — tab icon + slider rows:
+ *   - The 多人 tab button now uses the native icon mode (icon-only unpressed,
+ *     icon+label pressed, like the engine's own options tabs) with the social
+ *     page's 联系人 (contacts) tab icon 'social-contacts' from the built-in
+ *     icon font — replaces the old noIcon text-only button.
+ *   - The 7 stepped settings (host tick rate, position rate, tag alpha, tag
+ *     size, UI scale, arrow size, aim-line opacity) moved from arrow-cycled
+ *     choice rows to the native draggable OBJECT_SLIDER bar (buildSliderRow) —
+ *     the same widget 文本速度 (text speed) uses. Values, allowlists and
+ *     persistence are unchanged; the slider position is just the index into
+ *     the same value lists.
  */
 
 const LS_KEY = 'cc-mp-options';
@@ -71,6 +83,12 @@ interface IMpOptions {
      * multiplier (0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 3 / 4). In-canvas name tags
      * use the same value with 'auto' = 1 (they are already drawn at game zoom). */
     uiScale: number | 'auto';
+    /** 1.75.x: base size (px) of the off-screen teammate direction arrows.
+     * Independent of uiScale — that global scale still multiplies this value. */
+    teammateArrowSize: number;
+    /** 1.75.x: opacity of teammates' fully-focused ranged-charge aim lines.
+     * 0 = hidden (default); read live by aimLineIndicators every frame. */
+    aimLineOpacity: number;
 }
 
 const DEFAULTS: IMpOptions = {
@@ -88,12 +106,18 @@ const DEFAULTS: IMpOptions = {
     tagSize: 'tiny',
     showSaveToast: true,
     uiScale: 'auto',
+    teammateArrowSize: 20,
+    aimLineOpacity: 0,
 };
 
 let cached: IMpOptions | null = null;
 
 /** Allowed fixed UI-scale multipliers (plus 'auto'). Mirrored by the tab labels. */
 const UI_SCALE_VALUES: Array<number | 'auto'> = ['auto', 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+/** 1.75.x: allowed base sizes (px) for the off-screen teammate arrows. 20 = the
+ * previous fixed size. Kept as a short discrete list so the choice row and the
+ * localStorage allowlist share one source of truth. */
+const ARROW_SIZE_VALUES = [12, 16, 20, 24, 28, 32, 40];
 
 function loadOptions(): IMpOptions {
     if (cached) return cached;
@@ -112,6 +136,8 @@ function loadOptions(): IMpOptions {
         tagSize: DEFAULTS.tagSize,
         showSaveToast: DEFAULTS.showSaveToast,
         uiScale: DEFAULTS.uiScale,
+        teammateArrowSize: DEFAULTS.teammateArrowSize,
+        aimLineOpacity: DEFAULTS.aimLineOpacity,
     };
     try {
         const raw = window.localStorage.getItem(LS_KEY);
@@ -141,6 +167,16 @@ function loadOptions(): IMpOptions {
                 // else (older saves / hand-edited values) -> default auto.
                 if (parsed.uiScale === 'auto' || UI_SCALE_VALUES.indexOf(parsed.uiScale) !== -1) {
                     out.uiScale = parsed.uiScale;
+                }
+                // 1.75.x: teammate-arrow base size (px). Allowlisted like the other
+                // fixed choices; anything else (or an older save) -> default 20.
+                if (typeof parsed.teammateArrowSize === 'number' && ARROW_SIZE_VALUES.indexOf(parsed.teammateArrowSize) !== -1) {
+                    out.teammateArrowSize = parsed.teammateArrowSize;
+                }
+                // 1.75.x: teammate aim-line opacity. Allowlisted like tagAlpha;
+                // default 0 (hidden) for older saves / hand-edited values.
+                if (typeof parsed.aimLineOpacity === 'number' && AIM_LINE_OPACITY_VALUES.indexOf(parsed.aimLineOpacity) !== -1) {
+                    out.aimLineOpacity = parsed.aimLineOpacity;
                 }
             }
         }
@@ -237,6 +273,11 @@ const TAG_SIZE_LABELS = [t('sizeSmall'), t('sizeMedium'), t('sizeLarge')];
 /** 1.71.10: external-UI scale choices. 'auto' follows the on-screen game zoom;
  * the fixed tiers are exact multipliers. Same VALUES as UI_SCALE_VALUES above. */
 const UI_SCALE_LABELS = [t('uiScaleAuto'), '50%', '75%', '100%', '125%', '150%', '200%', '300%', '400%'];
+/** 1.75.x: teammate-arrow size labels (px), one per ARROW_SIZE_VALUES entry. */
+const ARROW_SIZE_LABELS = ARROW_SIZE_VALUES.map((v) => v + 'px');
+/** 1.75.x: allowed opacities for teammates' focused aim lines (0 = hidden default). */
+const AIM_LINE_OPACITY_VALUES = [0, 0.25, 0.5, 0.75, 1];
+const AIM_LINE_OPACITY_LABELS = ['0%', '25%', '50%', '75%', '100%'];
 /** Round 21: host enemy-block tick-rate choices (15/30/60 Hz). Display labels are
  * plain ASCII (`30 tick`) — the rate is a number the label names directly. */
 const HOST_TICK_VALUES = [15, 30, 60];
@@ -246,29 +287,34 @@ const HOST_TICK_LABELS = ['15 tick', '30 tick', '60 tick'];
 const PLAYER_STATE_RATES = [10, 20, 30, 60];
 const PLAYER_STATE_LABELS = ['10 Hz', '20 Hz', '30 Hz', '60 Hz'];
 
-/** A choice row for the mod tab: a label + a value readout flanked by two small
- * arrow buttons, modeled on buildToggleRow + the native OBJECT_SLIDER option gui.
- * One focus cell per row (rowGroup column 0) carries data = {description, row};
- * keyboard left/right and mouse clicks cycle the choice via the row's onLeftRight
- * / onPressed, and hovering shows the description exactly like the toggle rows. */
-function buildChoiceRow(rowIdx: number, rowGroup: any, label: string, description: string, key: keyof IMpOptions, choices: string[], values: any[], onApplied: () => void): any {
+/** ROUND 142: a slider row for the mod tab — a label + the engine's own
+ * sc.OptionFocusSlider, the same draggable stepped bar the native 文本速度
+ * (text-speed) option uses (OPTION_TYPES.OBJECT_SLIDER: snap + fill + a readout
+ * riding ON the thumb). Values stay the old discrete allowlists; the slider
+ * position is simply the index into `values`. Mouse click/drag is handled by
+ * the OptionFocusSlider itself (onMouseInteract/onDrag -> changeCallback);
+ * keyboard/gamepad left/right arrives via OptionsTabBox's rowButtonGroup
+ * setLeftRightCallback -> the row's onLeftRight. The focus cell IS the slider;
+ * its data = {description, row} feeds both the info bar (selection callback)
+ * and the group press routing, exactly like the toggle rows. */
+function buildSliderRow(rowIdx: number, rowGroup: any, label: string, description: string, key: keyof IMpOptions, labels: string[], values: any[], onApplied: () => void): any {
     const RowCtor = (ig as any).GuiElementBase.extend({
         row: -1,
         nameGui: null,
+        slider: null,
         valueGui: null,
-        leftBtn: null,
-        rightBtn: null,
-        focus: null,
         _key: null,
-        _choices: null,
+        _labels: null,
         _values: null,
         _onApplied: null,
+        _lastVal: 0,
+        _rowGroup: null,
         init(this: any) {
             this.parent();
             this.setSize(431, 26);
             this.row = rowIdx;
             this._key = key;
-            this._choices = choices;
+            this._labels = labels;
             this._values = values;
             this._onApplied = onApplied;
             this.nameGui = new (sc as any).TextGui(label);
@@ -285,59 +331,32 @@ function buildChoiceRow(rowIdx: number, rowGroup: any, label: string, descriptio
                 corner.setPos(166, 3);
                 this.addChildGui(corner);
             } catch (_) { /* gfx optional */ }
-            // Current-choice readout on the right half (native type guis sit at x=175).
+            // Native OBJECT_SLIDER geometry: OptionRow gives the type area the
+            // right half (x=175, width 431-175=256); the focus slider inside is
+            // 248 wide (b-4 twice) and lands at row-x 179 / y≈2 through the
+            // native centering chain — we place it there directly. The widget
+            // self-aligns X_CENTER/Y_CENTER for its native container, so reset
+            // to X_LEFT/Y_TOP before positioning.
+            const n = this._values.length;
+            const w = 248;
+            this._lastVal = this.indexFromOption();
+            this.slider = new (sc as any).OptionFocusSlider((v: number) => this.onSliderChange(v), true, true, rowGroup);
+            this.slider.setPreferredThumbSize(Math.max(10, Math.floor((w + 4) / n)), 21);
+            this.slider.setMinMaxValue(0, n - 1);
+            this.slider.setValue(this._lastVal);
+            this.slider.setSize(w, 21, 9);
+            this.slider.setAlign(ig.GUI_ALIGN.X_LEFT, ig.GUI_ALIGN.Y_TOP);
+            this.slider.setPos(179, 2);
+            this.slider.data = { description: description, row: this.row };
+            this.addChildGui(this.slider);
+            rowGroup.addFocusGui(this.slider, 0, this.row);
+            // Current-choice label riding on the thumb (native shows the index
+            // or a percentage there; ours shows the friendly label — tinyFont so
+            // even the narrowest thumb, 9-step UI scale at 28px, fits 自动/400%).
             this.valueGui = new (sc as any).TextGui('', { font: (sc as any).fontsystem.tinyFont });
-            this.valueGui.setAlign(ig.GUI_ALIGN.X_LEFT, ig.GUI_ALIGN.Y_CENTER);
-            this.valueGui.setPos(175, 0);
-            this.addChildGui(this.valueGui);
-            // The single focus cell for this row (rowGroup column 0). Keyboard
-            // confirm + mouse click route through the row's onPressed (the rowGroup
-            // press callback fires for members); its own onButtonPress stays empty so
-            // nothing double-cycles. It spans the value readout (so clicking the value
-            // also cycles) and sits UNDER the arrows, so the arrows win the mouse.
-            const FocusGui = (ig as any).FocusGui.extend({
-                init(this: any) {
-                    this.parent();
-                    this.setAlign(ig.GUI_ALIGN.X_LEFT, ig.GUI_ALIGN.Y_CENTER);
-                    this.setPos(0, 0);
-                    this.setSize(60, 26);
-                },
-                updateDrawables(drawer: any) {
-                    // Faint highlight so keyboard focus is visible.
-                    try {
-                        if (this.focus) drawer.addColor('rgba(255,255,255,0.10)', 0, 0, this.hook.size.x, this.hook.size.y);
-                    } catch (_) { /* ignore */ }
-                },
-            });
-            this.focus = new FocusGui();
-            this.focus.rowRef = this;
-            this.focus._rowGroup = rowGroup;
-            this.focus.data = { description: description, row: this.row };
-            this.addChildGui(this.focus);
-            rowGroup.addFocusGui(this.focus, 0, this.row);
-            // Arrow buttons around the value. The decorative ◀/▶ glyphs are NOT in the
-            // game fonts, so '<'/'>' (which are) are used. Mouse-only: each arrow
-            // overrides onButtonPress to cycle; they are not focus cells.
-            const ArrowBtn = (sc as any).ButtonGui.extend({
-                _onCycle: null,
-                init(this: any, text: string) {
-                    this.parent(text, 24, true, (sc as any).BUTTON_TYPE.DEFAULT, null, false);
-                    this._onCycle = null;
-                },
-                onButtonPress(this: any) { if (this._onCycle) this._onCycle(); },
-            });
-            this.leftBtn = new ArrowBtn('<');
-            this.leftBtn._onCycle = () => this.cycle(-1);
-            this.leftBtn.setAlign(ig.GUI_ALIGN.X_LEFT, ig.GUI_ALIGN.Y_CENTER);
-            this.leftBtn.setPos(175, 0);
-            this.addChildGui(this.leftBtn);
-            // Round-14 fix: the right arrow was hard-coded '<' in ArrowBtn.init,
-            // so both buttons rendered as '<'. The glyph is now passed in.
-            this.rightBtn = new ArrowBtn('>');
-            this.rightBtn._onCycle = () => this.cycle(1);
-            this.rightBtn.setAlign(ig.GUI_ALIGN.X_LEFT, ig.GUI_ALIGN.Y_CENTER);
-            this.rightBtn.setPos(201, 0);
-            this.addChildGui(this.rightBtn);
+            this.valueGui.setAlign(ig.GUI_ALIGN.X_CENTER, ig.GUI_ALIGN.Y_CENTER);
+            this.slider.thumb.addChildGui(this.valueGui);
+            this._rowGroup = rowGroup;
             try { this.hook.setMouseRecord(true); } catch (_) { /* ignore */ }
             this.refresh();
         },
@@ -346,41 +365,41 @@ function buildChoiceRow(rowIdx: number, rowGroup: any, label: string, descriptio
             const idx = this._values.indexOf(v);
             return idx === -1 ? 0 : idx;
         },
-        optionFromIndex(this: any, idx: number) {
-            setMpOption(this._key, this._values[idx]);
+        onSliderChange(this: any, v: number) {
+            // changeCallback from mouse click/drag — with snap on, v is already
+            // an integer step index clamped to [0, values.length-1].
+            if (v !== this._lastVal) {
+                this._lastVal = v;
+                this.commit();
+            }
         },
-        cycle(this: any, dir: number) {
-            const n = this._values.length;
-            const cur = this.indexFromOption();
-            const next = ((cur + dir) % n + n) % n;
-            this.optionFromIndex(next);
+        commit(this: any) {
+            setMpOption(this._key, this._values[this._lastVal]);
             this.refresh();
             if (this._onApplied) this._onApplied();
         },
         refresh(this: any) {
-            const idx = this.indexFromOption();
-            this.valueGui.setText(this._choices[idx]);
-            // Value starts right of the left arrow; right arrow glued to the text.
-            const vx = 175 + 24 + 2;
-            this.valueGui.setPos(vx, 0);
-            const rx = vx + this.valueGui.hook.size.x + 4;
-            this.rightBtn.setPos(rx, 0);
-            // The focus cell spans the value readout (and beyond) so clicking the
-            // value itself also cycles forward.
-            this.focus.setPos(vx, 0);
-            this.focus.setSize(Math.max(40, 431 - vx), 26);
+            this.valueGui.setText(this._labels[this._lastVal]);
         },
         onPressed(this: any, a: any) {
-            if (a === this.focus) this.cycle(1);
+            // Sliders have no confirm action (native OBJECT_SLIDER has no
+            // onPressed either), but the group press callback calls
+            // rows[row].onPressed unconditionally — keep the no-op.
         },
         onLeftRight(this: any, dir: boolean) {
-            this.cycle(dir ? 1 : -1);
+            // Mirror native OBJECT_SLIDER.onLeftRight: step the index, let the
+            // slider clamp it to the ends, commit only on a real change.
+            const prev = this._lastVal;
+            this.slider.setValue(dir ? prev + 1 : prev - 1);
+            this._lastVal = this.slider.getValue();
+            if (this._lastVal !== prev) this.commit();
             return true;
         },
         onMouseInteract(this: any) {
-            // Mirror native OptionRow hover -> info text (same as the toggle rows).
+            // Row-level hover -> info text for the label half (hovering the
+            // slider itself shows the description via the selection callback).
             try {
-                if ((sc as any).menu && (sc as any).menu.buttonInteract && (sc as any).menu.buttonInteract.isActive() && this.focus._rowGroup && this.focus._rowGroup.isActive()) {
+                if ((sc as any).menu && (sc as any).menu.buttonInteract && (sc as any).menu.buttonInteract.isActive() && this._rowGroup && this._rowGroup.isActive()) {
                     const b = this.hook.screenCoords;
                     const mx = (sc as any).control.getMouseX();
                     const my = (sc as any).control.getMouseY();
@@ -413,17 +432,13 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                 // (arena is conditional) — find the real count of defined tabs.
                 let idx = 0;
                 for (let i = 0; i < this.tabArray.length; i++) if (this.tabArray[i]) idx = i + 1;
-                // TabButton(text, icon, largeWidth, smallWidth, noIcon). Native tabs
-                // show icon-only when unpressed; we use noIcon + the label in both
-                // states so we don't depend on a font icon that may not exist.
-                const btn = new scAny.ItemTabbedBox.TabButton(t('optionsTab'), t('optionsTab'), 48, 48, true);
-                try {
-                    // Fit the width to the actual CJK text and keep it constant
-                    // across pressed/unpressed (otherwise it snaps small↔large).
-                    btn.setWidthToTextSize();
-                    btn._smallWidth = btn._largeWidth;
-                    btn.hook.size.x = btn._smallWidth;
-                } catch (_) { /* keep the 48px fallback */ }
+                // TabButton(text, icon, largeWidth). ROUND 142: native icon
+                // mode, exactly like the engine's own options tabs
+                // (OptionsTabBox._createTabButton passes largeWidth 90 and no
+                // noIcon): unpressed shows just the icon, pressed icon + label.
+                // The icon reuses the social/party page's 联系人 (contacts) tab
+                // icon 'social-contacts' from the engine's built-in icon font.
+                const btn = new scAny.ItemTabbedBox.TabButton(t('optionsTab'), 'social-contacts', 90);
                 try { btn.textChild.setPos(7, 1); } catch (_) { /* ignore */ }
                 btn.setPos(0, 2);
                 btn.setData({ type: MP_OPTION_CATEGORY });
@@ -456,7 +471,7 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     // now HOT-APPLIES while WE are the current host so the hostile
                     // entity stream AND the enemy-projectile stream both follow the
                     // newly selected frequency immediately.
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optHostTick'), t('optHostTickDesc'), 'hostTickRate', HOST_TICK_LABELS, HOST_TICK_VALUES, () => {
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optHostTick'), t('optHostTickDesc'), 'hostTickRate', HOST_TICK_LABELS, HOST_TICK_VALUES, () => {
                         try {
                             const m = getMain();
                             if (m && m.host && m.netSync) m.netSync.setBlockInterval(m.getHostTickInterval());
@@ -466,7 +481,7 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     // Round 23: own playerState send rate. HOT-APPLIES — netSync reads it
                     // live every tick (shouldSendPlayerState's floor), so the rows' onApplied
                     // can be a no-op (the next packet uses the new rate immediately).
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optPlayerStateRate'), t('optPlayerStateRateDesc'), 'playerStateRate', PLAYER_STATE_LABELS, PLAYER_STATE_RATES, () => { /* netSync reads live every tick */ });
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optPlayerStateRate'), t('optPlayerStateRateDesc'), 'playerStateRate', PLAYER_STATE_LABELS, PLAYER_STATE_RATES, () => { /* netSync reads live every tick */ });
                     this.list.addButton(rows[r], true); r++;
                     // Round 21: network debug overlay toggles. The HUD pump reads the
                     // options live each second, so a change needs no immediate action.
@@ -483,16 +498,25 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     // gate in multiplayer.ts's onSaveSaved reads it live at save time.
                     rows[r] = buildToggleRow(r, this.rowButtonGroup, t('optShowSaveToast'), t('optShowSaveToastDesc'), 'showSaveToast', () => { /* read live at save time */ });
                     this.list.addButton(rows[r], true); r++;
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optTagAlpha'), t('optTagAlphaDesc'), 'tagAlpha', TAG_ALPHA_LABELS, TAG_ALPHA_VALUES, refreshTags);
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optTagAlpha'), t('optTagAlphaDesc'), 'tagAlpha', TAG_ALPHA_LABELS, TAG_ALPHA_VALUES, refreshTags);
                     this.list.addButton(rows[r], true); r++;
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optTagSize'), t('optTagSizeDesc'), 'tagSize', TAG_SIZE_LABELS, TAG_SIZE_KEYS, refreshTags);
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optTagSize'), t('optTagSizeDesc'), 'tagSize', TAG_SIZE_LABELS, TAG_SIZE_KEYS, refreshTags);
                     this.list.addButton(rows[r], true); r++;
                     // 1.71.10: one scale for every mod-owned EXTERNAL UI (panels,
                     // toasts, chat, tooltips, arrows, story banners). Auto follows
                     // the game's on-screen zoom; fixed tiers are exact. The CSS
                     // pump reads the option live every frame, so only the canvas
                     // name tags need an immediate rebuild here.
-                    rows[r] = buildChoiceRow(r, this.rowButtonGroup, t('optUiScale'), t('optUiScaleDesc'), 'uiScale', UI_SCALE_LABELS, UI_SCALE_VALUES, refreshTags);
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optUiScale'), t('optUiScaleDesc'), 'uiScale', UI_SCALE_LABELS, UI_SCALE_VALUES, refreshTags);
+                    this.list.addButton(rows[r], true); r++;
+                    // 1.75.x: teammate-arrow size is separate from the global
+                    // external-UI scale. teammateIndicators reads the option live
+                    // every frame, so no rebuild callback is needed.
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optArrowSize'), t('optArrowSizeDesc'), 'teammateArrowSize', ARROW_SIZE_LABELS, ARROW_SIZE_VALUES, () => { /* read live every frame */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // 1.75.x: teammate ranged-charge aim-line opacity. aimLineIndicators
+                    // reads the option live every frame; 0% (default) hides the lines.
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optAimLineOpacity'), t('optAimLineOpacityDesc'), 'aimLineOpacity', AIM_LINE_OPACITY_LABELS, AIM_LINE_OPACITY_VALUES, () => { /* read live every frame */ });
                     this.list.addButton(rows[r], true); r++;
                     this.rows = rows;
                 } catch (e) { console.warn('[multiplayer] failed to build options rows', e); }
@@ -717,8 +741,9 @@ function pingSuffix(ms: number): string {
 
 /** Round 16/17: label for the LOCAL player's own tag. When 显示ping值 is on and the
  * connection has a valid locally-measured RTT sample, append ` (123ms)`; otherwise
- * return the plain name. The own tag ALWAYS shows this client's own latency
- * (connector pingMs), never the server-relayed value. */
+ * return the plain name. 1.75.x (effective self latency): the HOST's tag shows only
+ * " (Host)" (user request — no own latency there); a MEMBER's tag shows own RTT +
+ * the host's relayed RTT. The badge tooltip still shows the host its own RTT. */
 function ownTagLabel(m: Multiplayer | undefined, base: string): string {
     try {
         // Main-city refactor: in a shared town, name tags show the plain name only —
@@ -728,11 +753,18 @@ function ownTagLabel(m: Multiplayer | undefined, base: string): string {
         const conn: any = m && (m as any).connection;
         if (!conn) return base;
         if (typeof conn.isOpen === 'function' && !conn.isOpen()) return base;
-        // Round 20: the map-instance HOST's own tag shows " (Host)" instead of the
-        // latency. The host never receives its own playerPing relay, so the changeMap
-        // verdict (main.host) is the authoritative source here.
+        // Round 20: the map-instance HOST's own tag shows " (Host)" only (the
+        // changeMap verdict main.host is authoritative — the host never receives
+        // its own playerPing relay). 1.75.x: NO latency suffix on the host's own
+        // tag (user request) — the effective-ping rule below is members-only.
         if (m && (m as any).host) return base + t('hostSuffix');
-        return base + pingSuffix(conn.pingMs);
+        // 1.75.x: member effective ping = own RTT + host RTT; fall back to the own
+        // RTT while the host (or its report) is unknown.
+        let eff: number = conn.pingMs;
+        const hn: any = (m as any).instanceHost;
+        const hp: number = (hn && (m as any).remotePings && typeof (m as any).remotePings[hn] === 'number') ? (m as any).remotePings[hn] : -1;
+        if (typeof conn.pingMs === 'number' && conn.pingMs >= 0 && hp >= 0) eff = Math.round(conn.pingMs + hp);
+        return base + pingSuffix(eff);
     } catch (_) { return base; }
 }
 

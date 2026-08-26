@@ -351,6 +351,10 @@ export class StorySyncController {
 	private hudStar: JQuery | null = null;
 	/** Cached ig.Sound fanfares (quest-accept / light-party / full-party / quest-complete). */
 	private storySounds: { [key: string]: any } = Object.create(null);
+	/** 1.76.x: the party-size tier already SEEN by this client ('none' | 'light' |
+	 * 'full'). Drives the 轻锐小队/满编小队 milestone banner — see
+	 * checkPartyMilestoneBanner. */
+	private partyTierSeen: 'none' | 'light' | 'full' = 'none';
 
 	private updateRegistered = false;
 	private questObserverInstalled = false;
@@ -1860,6 +1864,9 @@ export class StorySyncController {
 		try {
 			this.ensureEngineHooks();
 			this.ensureStoryIntegrity();
+			// 1.76.x: the 轻锐小队/满编小队 milestone banner runs OUTSIDE the active
+			// gate — it is a party-size announcement, not a story-sync feature.
+			this.checkPartyMilestoneBanner();
 			if (this.active) {
 				try { this.flushMapVars(); } catch (_) { /* ignore */ }
 				// Self-heal the solved-member view entry once a second: a mid-sync save
@@ -1998,6 +2005,22 @@ export class StorySyncController {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.75.x: parkour anchor progress is strictly PER-PLAYER. The standard parkour
+	 * marker vars must never cross clients, even during an active side-quest sync —
+	 * otherwise every teammate's markers follow the runner's progress (and the
+	 * relayed rollback can restart the runner's parkourStart trigger). Same key set
+	 * as netSync.isParkourMarkerVar. */
+	private isParkourMarkerVar(bucket: string, key: string): boolean {
+		if (!bucket || !key) return false;
+		if (bucket === 'tmp') {
+			return key === 'parkourPath' || key === 'parkourUp' || key === 'parkourUpFirst' || key === 'parkourDone';
+		}
+		if (bucket.indexOf('maps.') === 0) {
+			return key === 'parkourPath' || key === 'parkourDone' || key === 'showFirstMarker';
+		}
+		return false;
+	}
+
 	/** Post-write capture: resolve a written path to its storage bucket + key and
 	 * queue the new value when it is a sync-relevant map/tmp var. */
 	private captureMapVar(path: any): void {
@@ -2028,6 +2051,24 @@ export class StorySyncController {
 			return;
 		}
 		if (!key || key.indexOf('.') !== -1 || !obj) return;
+		if (this.isParkourMarkerVar(bucket, key)) return; // parkour markers stay local
+		// 1.76.x (barrier denial FX): tmp.barrierBlock arms the per-player BarrierBlock
+		// parallel event (拒绝访问 + drag-back) on the TOUCHING client — relaying it
+		// would fire every receiver's OWN denial event and drag THEM back. The visual
+		// itself is relayed properly via netSync's playerFx channel.
+		if (bucket === 'tmp' && key === 'barrierBlock') return;
+		// 1.75.x: ground-item pickup vars (laser pickaxe/TNT/docs/stone key) are
+		// strictly per-player — a teammate must pick the item up themselves, so
+		// side-quest map-var sync must never carry their taken state.
+		try {
+			const ns: any = this.main && (this.main as any).netSync;
+			if (ns && typeof ns.isLocalPickupVar === 'function' && ns.isLocalPickupVar(bucket, key)) return;
+			// 1.75.x: key-locked dungeon blocks (key walls / pillars / master-key
+			// walls) unlock strictly per-player — their vanilla perma var and their
+			// unlock counters (map.locksOpened / map.keyUsed / ...) must never
+			// cross clients either.
+			if (ns && typeof ns.isKeyLockedPerPlayerVar === 'function' && ns.isKeyLockedPerPlayerVar(bucket, key)) return;
+		} catch (_) { /* never break var capture */ }
 		const v = obj[key];
 		const tv = typeof v;
 		if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') return;
@@ -2068,6 +2109,19 @@ export class StorySyncController {
 			const currentBucket = 'maps.' + (vars.currentLevelName || '');
 			for (const e of data.list) {
 				if (!e || typeof e.b !== 'string' || typeof e.k !== 'string' || !e.k) continue;
+				if (this.isParkourMarkerVar(e.b, e.k)) continue; // never apply a peer's parkour marker state
+				// 1.76.x: never apply a peer's barrier-denial arm var (same rule as the
+				// capture side — it would fire OUR BarrierBlock drag event).
+				if (e.b === 'tmp' && e.k === 'barrierBlock') continue;
+				// 1.75.x: never apply a peer's ground-item pickup state (same rule as
+				// netSync.applySpawnVar — each player picks the item up themselves).
+				try {
+					const ns: any = this.main && (this.main as any).netSync;
+					if (ns && typeof ns.isLocalPickupVar === 'function' && ns.isLocalPickupVar(e.b, e.k)) continue;
+					// 1.75.x: key-locked dungeon blocks unlock per-player — never apply
+					// a peer's perma var or unlock counter for them.
+					if (ns && typeof ns.isKeyLockedPerPlayerVar === 'function' && ns.isKeyLockedPerPlayerVar(e.b, e.k)) continue;
+				} catch (_) { /* never break var apply */ }
 				const tv = typeof e.v;
 				if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') continue;
 				let obj: any = null;
@@ -2523,7 +2577,12 @@ export class StorySyncController {
 	 *   (c) a CUTSCENE armed by a manualKill var of a live enemy on this map
 	 *       (BossDies defeat cutscenes — members start these directly from
 	 *       netSync's boss-defeat staging; a relayed duplicate on top started
-	 *       the wedge). */
+	 *       the wedge);
+	 *   (d) 1.75.x: a cutscene armed by a PER-PLAYER key-lock unlock counter
+	 *       (map.masterDoorOpened / map.keyUsed / ..., see
+	 *       netSync.isKeyLockGateCondition) — the Temple Mine master-door
+	 *       camera beat and its key-door siblings. The unlock is a local key
+	 *       spend, so the scene plays on the unlocking client only. */
 	private isLocalChainTrigger(trig: any, raw: any): boolean {
 		try {
 			if (!trig) return false;
@@ -2562,12 +2621,22 @@ export class StorySyncController {
 				trig._mpChainStatic = stat;
 			}
 			if (trig._mpChainStatic) return true;
-			const condStr = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+			let condStr = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+			if (!condStr && trig.startCondition && typeof trig.startCondition.pretty === 'string') {
+				condStr = trig.startCondition.pretty; // baked-game fallback (VarCondition source)
+			}
 			if (condStr) {
 				const mkVars = this.mapManualKillVars();
 				for (let i = 0; i < mkVars.length; i++) {
 					if (condStr.indexOf(mkVars[i]) !== -1) return true;
 				}
+				// 1.75.x (master-door unlock per-player): a cutscene armed by a
+				// key-lock unlock counter (map.masterDoorOpened / map.keyUsed / ...)
+				// documents a LOCAL key spend — each client must play it natively when
+				// ITS OWN unlock counter flips. Relaying/gathering it showed the unlock
+				// scene (plus the relay's gather teleport) to keyless teammates.
+				const ns: any = this.main && (this.main as any).netSync;
+				if (ns && typeof ns.isKeyLockGateCondition === 'function' && ns.isKeyLockGateCondition(condStr)) return true;
 			}
 			return false;
 		} catch (_) { return false; }
@@ -3127,6 +3196,14 @@ export class StorySyncController {
 		if (!trig) {
 			console.warn('[storysync] matching trigger not found for event key=' + data.key + ' kind=' + data.kind);
 			showMpToast({ title: t('storySyncEventMissingTrigger') });
+			return;
+		}
+		// 1.75.x: per-player scenes (entry gates, the upgrade chain, key-lock
+		// unlock beats like the master-door camera) are never relayed by current
+		// builds — refuse a stale relay from an older peer too; our own trigger
+		// plays the scene natively when ITS local condition flips.
+		if (this.isBlockerTrigger(trig)) {
+			console.log('[storysync] ignored relayed per-player event key=' + data.key + ' kind=' + data.kind);
 			return;
 		}
 		if (this.deferRelayedEventIfBusy(trig, data.kind, data.type, data.seq)) return;
@@ -4277,9 +4354,10 @@ export class StorySyncController {
 	/** 1.70.62: FF14-duty-commence-style big glowing text for every party member
 	 * (leader included). Pure overlay — no pointer interception, auto-fades after
 	 * the CSS animation (3.4s). Chinese-only layout: gold serif title between the
-	 * FF14 line/diamond ornaments, quest name below, quest-accept fanfare, then —
-	 * for parties of 4+ — the light/full party banner follows once this one has
-	 * faded out. */
+	 * FF14 line/diamond ornaments, quest name below, quest-accept fanfare.
+	 * 1.76.x: the light/full party banner no longer follows this one — it is a
+	 * party-size milestone now (checkPartyMilestoneBanner) and has normally
+	 * already played when the roster reached the threshold. */
 	private playCommencementBanner(): void {
 		try {
 			if (typeof document === 'undefined' || !document.body) return;
@@ -4299,19 +4377,6 @@ export class StorySyncController {
 			// FF14 quest-accept fanfare for EVERY party member (onStart ran on all
 			// clients at once).
 			this.playStorySound('accept');
-			// Parties of 3+: after the commencement banner has faded, follow up with
-			// the light/full party banner + the FF14 duty-enter jingle.
-			const count = this.members.length;
-			const quest = this.quest;
-			if (count >= 3) {
-				const kind = count >= 8 ? 'full' : 'light';
-				(window as any).setTimeout(() => {
-					try {
-						if (!this.active || this.quest !== quest) return; // sync ended meanwhile
-						this.playPartyBanner(kind);
-					} catch (_) { /* ignore */ }
-				}, 3700);
-			}
 		} catch (_) { /* ignore */ }
 	}
 
@@ -4344,8 +4409,33 @@ export class StorySyncController {
 			+ '<span class="seg left"></span><span class="dia"></span><span class="seg right"></span></div>';
 	}
 
+	/** 1.76.x: the 轻锐小队/满编小队 banner is now a PARTY-SIZE milestone, fully
+	 * decoupled from story sync (it used to only follow the sync-start
+	 * commencement banner). Runs per frame from tick(): reads the live roster —
+	 * players + bots, the same headcount the social menu's 当前小队 N/8 shows —
+	 * and plays ONCE on every UPWARD tier crossing: 轻锐小队 at 4, 满编小队 at 8
+	 * (FF14 light/full-party semantics). A player who JOINS an
+	 * already-qualifying party starts at 'none', so their first qualifying
+	 * roster plays once for them too. Dropping below a tier never plays; a later
+	 * re-crossing (e.g. the squad re-assembles to 8) plays again. */
+	private checkPartyMilestoneBanner(): void {
+		try {
+			const roster: any[] = Array.isArray(this.main.partyMembers) ? this.main.partyMembers : [];
+			const bots: any[] = Array.isArray((this.main as any).partyBots) ? (this.main as any).partyBots : [];
+			const count = roster.length + bots.length;
+			const tier = count >= 8 ? 'full' : count >= 4 ? 'light' : 'none';
+			const prev = this.partyTierSeen;
+			if (tier === 'none' || tier === prev) { this.partyTierSeen = tier; return; }
+			this.partyTierSeen = tier;
+			// Upward crossings only: none->light, none->full, light->full. A
+			// downgrade (full->light when the 8th member leaves) just re-arms.
+			if (tier === 'full' || prev === 'none') this.playPartyBanner(tier);
+		} catch (_) { /* never break the frame */ }
+	}
+
 	/** Second banner for parties of 4+: 轻锐小队 (4-7 players) / 满编小队 (8), with
-	 * the matching FF14 party-assembled jingle. */
+	 * the matching FF14 party-assembled jingle. 1.76.x: driven by the party-size
+	 * milestone (checkPartyMilestoneBanner), no longer by sync start. */
 	private playPartyBanner(kind: 'light' | 'full'): void {
 		try {
 			if (typeof document === 'undefined' || !document.body) return;
