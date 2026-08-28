@@ -42,6 +42,7 @@ import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
 import { installCutsceneRelay, ICutsceneRelay } from './sync/cutsceneRelay';
+import { installTempPartyBotSupport, ITempPartyBotSupport } from './sync/tempPartyBot';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
@@ -299,6 +300,7 @@ export class Multiplayer {
 	public ghostChests?: IGhostChestsModule;
 	public puzzleSync?: IPuzzleSync;
 	public cutsceneRelay?: ICutsceneRelay;
+	public tempPartyBots?: ITempPartyBotSupport;
 	/** netSync hook fired when this client is promoted to instance host (set in
 	 * initializeListeners; respawns puppet enemies as real AI-driven ones). */
 	public onPromotedToHost?: () => void;
@@ -472,6 +474,17 @@ export class Multiplayer {
 				this.netSync.setDeathConfig(
 					num(result.softDeathReviveHpNormal, 0.5), num(result.softDeathReviveHpBoss, 0.25),
 					num(result.softDeathReviveTimeNormal, 30), num(result.softDeathReviveTimeBoss, 30));
+			}
+		} catch (_) { /* ignore */ }
+
+		// Perfect-guard compensation (server config): member-side grace window after
+		// a monster verdict lands — perfectGuardBaseMs + perfectGuardPingFactor x RTT.
+		// Older servers omit the fields — fall back to the documented defaults
+		// (30ms / 0.6). Each part disables at 0.
+		try {
+			if (this.netSync) {
+				const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
+				this.netSync.setPerfectGuardComp(num(result.perfectGuardBaseMs, 30), num(result.perfectGuardPingFactor, 0.6));
 			}
 		} catch (_) { /* ignore */ }
 
@@ -2683,6 +2696,36 @@ export class Multiplayer {
 		return (party && party.partyEntities && party.partyEntities[name]) || null;
 	}
 
+	/** 1.76.x (bot attack sync): given a combatant ENTITY, return the name of the
+	 * party BOT we own (party leader, native AI) that it is — or '' when it is
+	 * not one of our bots. Only the leader's bots run native AI (member copies
+	 * are _mpPuppet), so relays keyed off this can never echo from a receiver. */
+	public ownedBotNameOf(entity: any): string {
+		try {
+			if (!entity || !this.isPartyLeader) return '';
+			const names = this.partyBots || [];
+			if (!names.length) return '';
+			const party: any = (sc as any).party;
+			for (const n of names) {
+				const e = this.partyBotEntity(party, n);
+				if (e && e === entity) return n;
+			}
+		} catch (_) { /* ignore */ }
+		return '';
+	}
+
+	/** 1.76.x (bot attack sync): OUR local puppet copy of a leader-owned party bot
+	 * (sc.party party entity by name) — the anchor for replayed bot attack
+	 * visuals. Null when the bot isn't adopted (yet) on this client. */
+	public botEntityByName(name: string): any {
+		try {
+			if (!name) return null;
+			const party: any = (sc as any).party;
+			const e = this.partyBotEntity(party, name);
+			return (e && !e._killed && e.coll) ? e : null;
+		} catch (_) { return null; }
+	}
+
 	/** Round 15: marks ONE party bot as a member-side puppet (AI suppressed, pos/
 	 * anim/hp lerped from the leader's botState stream). Extracted from applyPartyBots
 	 * so the ungated botState adoption path (adoptBot) puppets identically. */
@@ -2916,6 +2959,17 @@ export class Multiplayer {
 				if (e._mpPuppet && typeof b.fx === 'number' && typeof b.fy === 'number' && e.face) {
 					try {
 						if (typeof b.a === 'string' && b.a) {
+							// 1.76.x (bot attack sync): on an anim CHANGE also replay the
+							// melee/art SWEEP visual — the leader's bot ran its real
+							// COMBAT_SWEEP locally; the puppet only replays the pose. Same
+							// helper the player-mirror anim path uses; neutral element +
+							// default sweep family (bots are Lea-faced clones).
+							if ((e as any)._mpLastBotAnim !== b.a) {
+								(e as any)._mpLastBotAnim = b.a;
+								try {
+									if (this.netSync) (this.netSync as any).spawnAttackFxForAnim(e, b.a, 0, undefined);
+								} catch (_) { /* visuals only */ }
+							}
 							this.setEntityAnimationProtected(e, { x: b.fx, y: b.fy }, b.a);
 						} else {
 							(e.face as any).xProtected = b.fx;
@@ -4086,6 +4140,14 @@ export class Multiplayer {
 					return this.parent();
 				},
 			});
+			// 1.76.x (temporary cutscene companions): story scenes that require a
+			// party bot (party.has/alive-gated triggers, {"party":"X"} entity
+			// fetches) spawn a LOCAL-ONLY temp companion when the bot is missing.
+			// Never synced, invisible to everyone else, cleaned up after the scene.
+			try {
+				this.tempPartyBots = installTempPartyBotSupport(() => this);
+				this.tempPartyBots.install();
+			} catch (e) { console.warn('[multiplayer] temp party bot install failed', e); }
 		}
 	}
 

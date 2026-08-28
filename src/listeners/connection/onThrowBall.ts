@@ -15,7 +15,12 @@ export class OnThrownBallListener {
 			return; // malformed; nothing to do
 		}
 
-		const entity = this.resolveEntity(ballInfo.combatant);
+		// 1.76.x (bot attack sync): bn names one of the SENDER's party bots — anchor
+		// the replay on OUR local bot puppet instead of the sender's mirror.
+		const botName = ballInfo.bn;
+		const entity = botName
+			? this.main.botEntityByName(botName)
+			: this.resolveEntity(ballInfo.combatant);
 		if (!entity) {
 			// Mirror not spawned yet (they entered while we were loading a map). Skip
 			// this one ball quietly — the next update will land once their mirror is up.
@@ -25,8 +30,9 @@ export class OnThrownBallListener {
 		// The mirror's `proxies` was captured at spawn time; element switches make
 		// 1.4.2 reassign playerEntity.proxies to a NEW object, leaving the mirror
 		// with a stale reference and SHOOT_PROXY unable to resolve the proxy name.
-		// Refresh it so the proxy lookup succeeds.
-		(entity as any).proxies = ig.game.playerEntity.proxies;
+		// Refresh it so the proxy lookup succeeds. (Bots keep their OWN proxies —
+		// they resolve the same proxy names natively.)
+		if (!botName) (entity as any).proxies = ig.game.playerEntity.proxies;
 
 		// 1.72.0 (assault fix): 'assault:<elementKey>' relays the 强袭/ASSAULT
 		// modifier's extra projectile. It has no proxy — spawn the engine's shared
@@ -161,21 +167,28 @@ export class OnThrownBallListener {
 		// it. The puzzle/block/switch state already syncs via puzzleSync (ROUND 131)
 		// and combat damage via combatHit, so the physical replay is unneeded. The
 		// assault:/key:/generic: branches above already returned and are unaffected.
+		// 1.76.x: BOT balls are NOT position-streamed (the playerBall stream covers
+		// the local player only) — replay them even in dungeons.
 		const smAny: any = (sc as any).map;
-		if (smAny && typeof smAny.isDungeon === 'function' && smAny.isDungeon()) return;
+		if (!botName && smAny && typeof smAny.isDungeon === 'function' && smAny.isDungeon()) return;
 
 	// 1.75.x: when the relay carries the engine's exact spawn coords, spawn the
 	// resolved proxy right there. Skill bursts (SHOOT_PROXY_RANGE's startDist/
 	// offset — the Burn! flame cone) otherwise collapse onto the mirror's face
 	// point and read as a plain bullet stream. Old senders without pos keep the
 	// legacy SHOOT_PROXY-at-face behaviour.
+	// 1.76.x (bot attack sync): a BOT-thrown ball is NEUTRALIZED (visual-only) —
+	// the bot puppet is a native Player-typed party entity, so a live ball rooted
+	// at it would deal REAL local damage on this client and double with the
+	// leader's own ball.
 	if (ballInfo.pos && typeof ballInfo.pos.x === 'number') {
 		try {
 			const proxy: any = (sc as any).ProxyTools.getProxy(ballInfo.ballInfo, entity as any);
 			if (proxy && typeof proxy.spawn === 'function') {
 				const root: any = (entity as any).getCombatantRoot
 					? ((entity as any).getCombatantRoot() || entity) : entity;
-				proxy.spawn(ballInfo.pos.x, ballInfo.pos.y, ballInfo.pos.z, root, ballInfo.dir);
+				const spawnedBall = proxy.spawn(ballInfo.pos.x, ballInfo.pos.y, ballInfo.pos.z, root, ballInfo.dir);
+				if (botName) this.neutralizeReplayBall(spawnedBall);
 			}
 		} catch (_) { /* a failed ball replay must never break the frame */ }
 		return;

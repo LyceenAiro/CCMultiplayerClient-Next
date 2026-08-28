@@ -111,7 +111,15 @@ export interface IConnection {
      * the member applies VERBATIM — `perfect` = a perfect guard (0 damage + counter
      * window), `regular` = a regular guard (chip damage + guard-bar), `knockback` =
      * whether the engine knockback fires. PvP hits (mirror-to-mirror) omit these. */
-    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void;
+    combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number, auid?: number }): void;
+    /** Perfect-guard compensation: MEMBER -> instance — a deferred monster verdict
+     * converted to a PERFECT guard locally (the member raised guard within the
+     * configured compensation window). `auid` = the attacker enemy's uid (0 when
+     * unknown — old hosts). The host runs the GUARD_COUNTER reaction + mirror FX. */
+    latePerfectGuard(data: { auid?: number }): void;
+    /** Perfect-guard compensation: a member's deferred verdict converted to PERFECT
+     * (server stamps `player` = the guarding member's name). Host-side handler. */
+    onLatePerfectGuard(callback: (data: { player?: string, auid?: number }) => void): void;
     /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
      * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
@@ -389,14 +397,14 @@ export interface IConnection {
     onChestState(cb: (opened: { [chestKey: string]: string[] }) => void): void;
     /** Round 11: a player CAST a special skill — replay its effect sheet on the
      * sender's mirror (f = fixed world pos for spawnFixed effects). */
-    skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void;
+    skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any, bot?: string }): void;
     /** 1.75.x: one of OUR LOOPING player-skill effects ended (Effect.stop) —
      * relay the stop so every mirror's replayed copy ends too (the heat guard
      * art's flameGuard blinkCount:-1 would otherwise blink red forever). */
-    skillFxStop?(fx: { sheet: string, key: string }): void;
+    skillFxStop?(fx: { sheet: string, key: string, bot?: string }): void;
     /** 1.75.x: a remote caster's looping player-skill effect ended — stop the
      * replayed copy we spawned for their mirror. */
-    onSkillFxStop?(cb: (player: string, data: { sheet: string, key: string }) => void): void;
+    onSkillFxStop?(cb: (player: string, data: { sheet: string, key: string, bot?: string }) => void): void;
     /** Elemental-status build-up: a whitelisted effect sheet spawned on a
      * HOST-side real enemy (charge-up telegraphs like the snowman's
      * coldMegaCharge). Receivers replay it on the same-uid puppet. */
@@ -562,7 +570,7 @@ export interface IConnection {
     combatArtName(label: any): void;
     /** 1.72.0: a same-instance player fired a combat art — show the name banner
      * over their mirror (receiver-side option-gated). */
-    onCombatArtName(callback: (data: { player: string, label: any }) => void): void;
+    onCombatArtName(callback: (data: { player: string, label: any, bot?: string }) => void): void;
     /** 1.73.0 (admin UI): the server admin issued a debug command for THIS
      * player (giveExp/giveCredits/giveItem/teleport). Execute + adminAck. */
     onAdminCommand(callback: (cmd: { cmdId: number, kind: string, amount?: number, id?: number, map?: string, marker?: string }) => void): void;
@@ -663,7 +671,7 @@ export interface IConnection {
      * (the sender never receives its own block, but the check is belt-and-braces). */
     onBotState(callback: (data: { map?: string, from?: string, bots: IBotStateEntry[] }) => void): void;
     /** Round 11: replay a remote player's skill effect on their mirror. */
-    onSkillFx(callback: (player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void;
+    onSkillFx(callback: (player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any, bot?: string }) => void): void;
     onFriendList(callback: (friends: Array<{ name: string, online: boolean }>) => void): void;
     onFriendActionResult(callback: (result: any) => void): void;
     onFriendRequest(callback: (from: string) => void): void;

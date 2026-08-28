@@ -405,13 +405,17 @@ export class SocketIoConnector implements IConnection {
                 softDeathReviveHpBoss?: number,
                 softDeathReviveTimeNormal?: number,
                 softDeathReviveTimeBoss?: number,
+                // Perfect-guard compensation (member side): base grace ms + ping
+                // factor x RTT. Older servers omit both -> client defaults 30/0.6.
+                perfectGuardBaseMs?: number,
+                perfectGuardPingFactor?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -763,8 +767,19 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('throwBall', ballInfo);
 	}
 
-	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void {
+	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number, auid?: number }): void {
 		this.syncEmit('combatHit', hit);
+	}
+
+	/** Perfect-guard compensation: a deferred monster verdict converted to a
+	 * PERFECT guard locally — tell the host (GUARD_COUNTER + mirror FX). */
+	public latePerfectGuard(data: { auid?: number }): void {
+		this.syncEmit('latePerfectGuard', data);
+	}
+	public onLatePerfectGuard(callback: (data: { player?: string, auid?: number }) => void): void {
+		this.socket.on('latePerfectGuard', (data: any) => {
+			if (data && typeof data === 'object') callback(data);
+		});
 	}
 
 	/** Elemental-status-era enemy action FX: a whitelisted sheet spawned on a
@@ -933,25 +948,26 @@ export class SocketIoConnector implements IConnection {
 	}
 
 	// Round 11: special-skill effect replay (sheet path + effect key).
-	public skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }): void {
+	public skillFx(fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any, bot?: string }): void {
 		this.syncEmit('skillFx', fx);
 	}
-	public onSkillFx(callback: (player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any }) => void): void {
+	public onSkillFx(callback: (player: string, fx: { sheet: string, key: string, f?: { x: number, y: number, z: number } | null, p?: any, bot?: string }) => void): void {
 		this.socket.on('skillFx', (data: any) => {
 			if (data) callback(data.player, data);
 		});
 	}
 	/** 1.75.x: one of our LOOPING player-skill effects ended — relay the stop so
 	 * every mirror's replayed copy ends too (guard-art flameGuard & co.). */
-	public skillFxStop(fx: { sheet: string, key: string }): void {
+	public skillFxStop(fx: { sheet: string, key: string, bot?: string }): void {
 		this.syncEmit('skillFxStop', fx);
 	}
-	public onSkillFxStop(callback: (player: string, data: { sheet: string, key: string }) => void): void {
+	public onSkillFxStop(callback: (player: string, data: { sheet: string, key: string, bot?: string }) => void): void {
 		this.socket.on('skillFxStop', (data: any) => {
 			if (!data || typeof data.player !== 'string') return;
 			callback(data.player, {
 				sheet: typeof data.sheet === 'string' ? data.sheet : '',
 				key: typeof data.key === 'string' ? data.key : '',
+				bot: typeof data.bot === 'string' ? data.bot : undefined,
 			});
 		});
 	}
@@ -1075,8 +1091,8 @@ export class SocketIoConnector implements IConnection {
 
 	// 1.72.0 (combat-art name banner): any client -> its instance — the local player
 	// fired a combat art; teammates raise the name banner over our mirror.
-	public combatArtName(label: any): void {
-		this.syncEmit('combatArtName', { label });
+	public combatArtName(label: any, bot?: string): void {
+		this.syncEmit('combatArtName', { label, bot });
 	}
 
 	// 1.73.0 (admin UI): outcome of one adminCommand back to the server.

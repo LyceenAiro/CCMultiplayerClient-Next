@@ -104,6 +104,19 @@ export class OnEntitySpawnListener {
 				} else {
 					console.warn('[multiplayer] Could not find type of ball (filterBall returned null). combatant=localPlayer');
 				}
+			} else {
+				// 1.76.x (bot attack sync): one of OUR party bots (leader, native AI)
+				// threw — relay it with the bot's name so receivers anchor the visual
+				// on their bot puppet. The bot's own proxy set resolves the ball type.
+				const bn = this.main.ownedBotNameOf(settings.combatant);
+				if (bn) {
+					const botBall = this.filterBotBall(settings, settings.combatant);
+					if (botBall) {
+						botBall.pos = { x, y, z };
+						botBall.bn = bn;
+						this.main.connection.throwBall(botBall);
+					}
+				}
 			}
 			return this.original.call(ig.game, type, x, y, z, settings, showAppearEffects);
 		}
@@ -118,7 +131,28 @@ export class OnEntitySpawnListener {
 		// cannot echo back from a receiver.
 		try {
 			const CPE: any = (sc as any).CombatProxyEntity;
-			if (CPE && (type as unknown) === CPE && settings && settings.combatant === ig.game.playerEntity) {
+			if (CPE && (type as unknown) === CPE && settings) {
+				// 1.76.x (bot attack sync): a BOT-owned generic proxy (the bot's dash-art
+				// mines / walls) resolves against the BOT's own proxy set and relays
+				// with the bot name.
+				const botProxyName = this.main.ownedBotNameOf(settings.combatant);
+				if (botProxyName) {
+					const botProxies: any = (settings.combatant as any).proxies || {};
+					for (const name in botProxies) {
+						const p: any = botProxies[name];
+						if (p && p.data && p.data === settings.data) {
+							this.main.connection.throwBall({
+								ballInfo: 'proxy:' + name,
+								combatant: (settings.combatant as unknown as IMultiplayerEntity).multiplayerId,
+								dir: settings.dir || { x: 0, y: 0 },
+								party: 0,
+								pos: { x, y, z },
+								bn: botProxyName,
+							});
+							break;
+						}
+					}
+				} else if (settings.combatant === ig.game.playerEntity) {
 				const proxies: any = (ig.game.playerEntity as any).proxies || {};
 				for (const name in proxies) {
 					const p: any = proxies[name];
@@ -134,6 +168,7 @@ export class OnEntitySpawnListener {
 						});
 						break;
 					}
+				}
 				}
 			}
 		} catch (_) { /* the proxy relay must never break a spawn */ }
@@ -205,6 +240,34 @@ export class OnEntitySpawnListener {
 		}
 
 		return entity;
+	}
+
+	/** 1.76.x (bot attack sync): resolve a BOT-thrown ball's proxy NAME against the
+	 * bot entity's OWN proxy set (same data-identity match as filterBall). Returns
+	 * null when the ball is not one of the bot's proxies (key/override balls — those
+	 * stay unrelayed, exactly like the player path's unmatched case). */
+	private filterBotBall(settings: {
+		ballInfo: any
+		combatant: ig.Entity,
+		dir: Vec2,
+		party: number,
+	}, bot: ig.Entity): IBallInfo | null {
+		const proxies: any = (bot as any).proxies;
+		if (!proxies) return null;
+		for (const name in proxies) {
+			if (Object.prototype.hasOwnProperty.call(proxies, name)) {
+				const proxy = proxies[name] as any;
+				if (proxy !== undefined && proxy.data === settings.ballInfo) {
+					return {
+						ballInfo: name,
+						combatant: (settings.combatant as IMultiplayerEntity).multiplayerId,
+						dir: settings.dir,
+						party: settings.party,
+					};
+				}
+			}
+		}
+		return null;
 	}
 
 	private filterBall(settings: {

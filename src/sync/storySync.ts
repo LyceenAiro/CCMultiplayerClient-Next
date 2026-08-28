@@ -2068,6 +2068,10 @@ export class StorySyncController {
 			// unlock counters (map.locksOpened / map.keyUsed / ...) must never
 			// cross clients either.
 			if (ns && typeof ns.isKeyLockedPerPlayerVar === 'function' && ns.isKeyLockedPerPlayerVar(bucket, key)) return;
+			// ROUND 146: story-duel PVP arena walls/sign (pvpArena / pvpSign) are
+			// exclusive to the isolated dueling client — relaying them fences in
+			// every synced teammate's map copy.
+			if (ns && typeof ns.isPvpArenaVar === 'function' && ns.isPvpArenaVar(bucket, key)) return;
 		} catch (_) { /* never break var capture */ }
 		const v = obj[key];
 		const tv = typeof v;
@@ -2121,6 +2125,8 @@ export class StorySyncController {
 					// 1.75.x: key-locked dungeon blocks unlock per-player — never apply
 					// a peer's perma var or unlock counter for them.
 					if (ns && typeof ns.isKeyLockedPerPlayerVar === 'function' && ns.isKeyLockedPerPlayerVar(e.b, e.k)) continue;
+					// ROUND 146: never apply a peer's story-duel PVP arena walls/sign.
+					if (ns && typeof ns.isPvpArenaVar === 'function' && ns.isPvpArenaVar(e.b, e.k)) continue;
 				} catch (_) { /* never break var apply */ }
 				const tv = typeof e.v;
 				if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') continue;
@@ -4411,19 +4417,21 @@ export class StorySyncController {
 
 	/** 1.76.x: the 轻锐小队/满编小队 banner is now a PARTY-SIZE milestone, fully
 	 * decoupled from story sync (it used to only follow the sync-start
-	 * commencement banner). Runs per frame from tick(): reads the live roster —
-	 * players + bots, the same headcount the social menu's 当前小队 N/8 shows —
-	 * and plays ONCE on every UPWARD tier crossing: 轻锐小队 at 4, 满编小队 at 8
-	 * (FF14 light/full-party semantics). A player who JOINS an
+	 * commencement banner). Runs per frame from tick(): reads the live roster
+	 * and plays ONCE on every UPWARD tier crossing. ROUND 145: the headcount is
+	 * PLAYERS ONLY — MOD bots (partyBots) no longer count toward the banner —
+	 * and 轻锐小队 now triggers at 3 players (design intent; it silently
+	 * required 4 before), 满编小队 stays at 8. A player who JOINS an
 	 * already-qualifying party starts at 'none', so their first qualifying
 	 * roster plays once for them too. Dropping below a tier never plays; a later
 	 * re-crossing (e.g. the squad re-assembles to 8) plays again. */
 	private checkPartyMilestoneBanner(): void {
 		try {
 			const roster: any[] = Array.isArray(this.main.partyMembers) ? this.main.partyMembers : [];
-			const bots: any[] = Array.isArray((this.main as any).partyBots) ? (this.main as any).partyBots : [];
-			const count = roster.length + bots.length;
-			const tier = count >= 8 ? 'full' : count >= 4 ? 'light' : 'none';
+			// ROUND 145: players only — bots (partyBots) are deliberately excluded
+			// from the milestone headcount.
+			const count = roster.length;
+			const tier = count >= 8 ? 'full' : count >= 3 ? 'light' : 'none';
 			const prev = this.partyTierSeen;
 			if (tier === 'none' || tier === prev) { this.partyTierSeen = tier; return; }
 			this.partyTierSeen = tier;
@@ -4433,9 +4441,10 @@ export class StorySyncController {
 		} catch (_) { /* never break the frame */ }
 	}
 
-	/** Second banner for parties of 4+: 轻锐小队 (4-7 players) / 满编小队 (8), with
+	/** Party-size banner for 3+ players: 轻锐小队 (3-7 players) / 满编小队 (8), with
 	 * the matching FF14 party-assembled jingle. 1.76.x: driven by the party-size
-	 * milestone (checkPartyMilestoneBanner), no longer by sync start. */
+	 * milestone (checkPartyMilestoneBanner — ROUND 145: players only, bots
+	 * excluded, light tier at 3), no longer by sync start. */
 	private playPartyBanner(kind: 'light' | 'full'): void {
 		try {
 			if (typeof document === 'undefined' || !document.body) return;

@@ -641,6 +641,17 @@ export class NetSync {
 	 * release bumps it so shouldSendPlayerState fires an immediate packet (the host
 	 * must see guard edges at ~network latency, not the 10Hz floor). */
 	private _mpGuardGateToken = 0;
+	private _mpPgBaseMs = 30;
+	private _mpPgPingF = 0.6;
+	private _mpPgPending: Array<{ hit: any, expireAt: number, map: string }> = [];
+	/** Perfect-guard compensation (member only; server config perfectGuardBaseMs /
+	 * perfectGuardPingFactor, sent in the handshakeResponse). A host-authoritative
+	 * monster verdict with plain damage does NOT apply immediately while the
+	 * compensation window is open: it sits in _mpPgPending for
+	 * (base + pingFactor x RTT) ms, and a guard press inside that window converts
+	 * it to a PERFECT guard (0 damage, perfect FX, GUARD_COUNTER relayed to the
+	 * host). An unexpired pending whose guard never comes applies normally at
+	 * expiry. Each part disables at 0; both parts 0 = feature off. */
 	private _mpGuardLastSent = -1;
 	/** Round 23: the same growth-forced-full trigger for the HOSTILE stream, tracked on
 	 * its OWN counter so a late joiner gets BOTH streams' first post-join blocks full —
@@ -797,6 +808,12 @@ export class NetSync {
 		// Round 21: a member reported a monster hit it detected LOCALLY. Bookkeeping only
 		// (their HP streams via playerState); the host must NOT re-apply any damage.
 		conn.onCombatResult((hit) => this.onCombatResult(hit));
+		// Perfect-guard compensation: a MEMBER converted a deferred monster verdict
+		// to a PERFECT guard locally — the host runs the GUARD_COUNTER reaction +
+		// mirror FX. Older servers never relay this (the handler never fires).
+		if (typeof (conn as any).onLatePerfectGuard === 'function') {
+			(conn as any).onLatePerfectGuard((data: any) => this.onLatePerfectGuard(data));
+		}
 		// Round 26: a SHARED enemy (uid) had a counter/guard-break FX elsewhere (server-
 		// relayed, sender excluded). Replay it on our matching puppet / real enemy so the
 		// head popup + speedlines show for everyone, not just the acting member.
@@ -1422,6 +1439,8 @@ export class NetSync {
 					const origSpawnOnTarget = ES.prototype.spawnOnTarget;
 					ES.prototype.spawnOnTarget = function (a: string, b: any, c: any) {
 						let markUid = 0;
+						// 1.76.x (bot attack sync): non-empty when b is one of OUR party bots.
+						let botFxName = '';
 						try {
 							const m = (window as any).__mpMain;
 							const telegraph = isEnemyTelegraph(this.path, a);
@@ -1456,8 +1475,14 @@ export class NetSync {
 							}
 							const enemyRelay = !!(m && m.host && fxOwner && fxOwner instanceof EnemyCtor && !fxOwner._mpPuppet && !fxOwner._mpMirror);
 							if (m && m.netSync && (SKILL_SHEETS[this.path] || telegraph || enemyRelay) && b && ig.game) {
-								if (SKILL_SHEETS[this.path] && b === ig.game.playerEntity) {
-									m.netSync.broadcastSkillFx(this.path, a, null, c);
+								// 1.76.x (bot attack sync): a whitelisted skill effect anchored on one
+								// of our party bots (leader-owned native AI) — relay with the bot name
+								// so receivers anchor the replay on their bot puppet.
+								if (SKILL_SHEETS[this.path] && b !== ig.game.playerEntity && m.ownedBotNameOf) {
+									botFxName = m.ownedBotNameOf(b);
+								}
+								if (SKILL_SHEETS[this.path] && (b === ig.game.playerEntity || botFxName)) {
+									m.netSync.broadcastSkillFx(this.path, a, null, c, botFxName || undefined);
 								} else if (enemyRelay) {
 									// Enemy action FX (SHOW_EFFECT telegraphs — the buffalo's
 									// red 'angry2' flash, charge glows, the snowman's
@@ -1475,8 +1500,8 @@ export class NetSync {
 						// 1.75.x (guard-art loop FX): mark LOOPING player-skill effects so the
 						// Effect.stop wrap can relay their end — without it the heat guard art's
 						// flameGuard (blinkCount:-1 red glow) replayed on mirrors FOREVER.
-						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && b === ig.game.playerEntity) {
-							try { h._mpSkillFxLoop = { sheet: this.path, key: a }; } catch (_) { /* ignore */ }
+						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && (b === ig.game.playerEntity || botFxName)) {
+							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName || '' }; } catch (_) { /* ignore */ }
 						}
 						if (markUid > 0 && h) {
 							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; } catch (_) { /* ignore */ }
@@ -1490,13 +1515,19 @@ export class NetSync {
 					const origSpawnFixed = ES.prototype.spawnFixed;
 					ES.prototype.spawnFixed = function (a: string, x: number, y: number, z: number, i: any, j: any) {
 						let markUid = 0;
+						// 1.76.x (bot attack sync): non-empty when i is one of OUR party bots.
+						let botFxName2 = '';
 						try {
 							const m = (window as any).__mpMain;
 							const telegraph = isEnemyTelegraph(this.path, a);
 							const enemyRelay = !!(m && m.host && i && i instanceof (ig as any).ENTITY.Enemy && !i._mpPuppet && !i._mpMirror);
 							if (m && m.netSync && (SKILL_SHEETS[this.path] || telegraph || enemyRelay) && i && ig.game) {
-								if (SKILL_SHEETS[this.path] && i === ig.game.playerEntity) {
-									m.netSync.broadcastSkillFx(this.path, a, { x, y, z }, j);
+								// 1.76.x (bot attack sync): same bot branch on the fixed-spawn path.
+								if (SKILL_SHEETS[this.path] && i !== ig.game.playerEntity && m.ownedBotNameOf) {
+									botFxName2 = m.ownedBotNameOf(i);
+								}
+								if (SKILL_SHEETS[this.path] && (i === ig.game.playerEntity || botFxName2)) {
+									m.netSync.broadcastSkillFx(this.path, a, { x, y, z }, j, botFxName2 || undefined);
 								} else if (enemyRelay) {
 									m.netSync.broadcastEnemyFx(this.path, a, i, { x, y, z }, j);
 									markUid = (typeof i.uid === 'number') ? i.uid : 0;
@@ -1506,8 +1537,8 @@ export class NetSync {
 						const h = origSpawnFixed.call(this, a, x, y, z, i, j);
 						const mpLoopSpawn = !!(j && typeof j.duration === 'number' && j.duration < 0);
 						// 1.75.x (guard-art loop FX): same mark on the fixed-spawn path.
-						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && i === ig.game.playerEntity) {
-							try { h._mpSkillFxLoop = { sheet: this.path, key: a }; } catch (_) { /* ignore */ }
+						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && (i === ig.game.playerEntity || botFxName2)) {
+							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName2 || '' }; } catch (_) { /* ignore */ }
 						}
 						if (markUid > 0 && h) {
 							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; } catch (_) { /* ignore */ }
@@ -1517,6 +1548,48 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] EffectSheet wrap failed', e); }
+			try {
+				// ROUND 144 (burst-shockwave FX sync): SPAWN_BURSTS action steps — the
+				// drillertoise's Stomp shockwave ring ('toiseDustBurst'), the sandworm's
+				// ground bursts, ... — spawn an ig.BurstSpawnerEntity, a PLAIN ig.Entity
+				// (not a proxy, not an Enemy) that plays each burst puff through
+				// EffectHandle.spawnFixed with NO target entity. The EffectSheet wrap
+				// above only relays fixed spawns whose target IS the enemy, so these puffs
+				// were never relayed: members ate the shockwave DAMAGE (the host's
+				// CircleHitForces hit their mirrors fine) with zero visuals. Wrap the
+				// spawner's startSpawn choke point instead: when the burst's combatant is
+				// one of OUR real enemies, relay each puff through the existing enemyFx
+				// channel as a fixed-position effect anchored on that enemy's uid (the
+				// receiver's fx.f branch replays sheet.spawnFixed at the exact spot).
+				// Puppets never run action steps, so a receiver cannot echo this back.
+				const BS: any = (ig as any).BurstSpawnerEntity;
+				if (BS && BS.prototype && typeof BS.prototype.startSpawn === 'function' && !BS.prototype._mpBurstFxWrapped) {
+					BS.prototype._mpBurstFxWrapped = true;
+					const origStartSpawn = BS.prototype.startSpawn;
+					BS.prototype.startSpawn = function (this: any) {
+						try {
+							const m = (window as any).__mpMain;
+							const cbt: any = this.combatant;
+							if (m && m.host && m.netSync && cbt
+								&& cbt instanceof (ig as any).ENTITY.Enemy
+								&& !cbt._mpPuppet && !cbt._mpMirror
+								&& this.effect && this.effect.effectSheet
+								&& typeof this.effect.effectSheet.path === 'string'
+								&& typeof this.effect.name === 'string') {
+								// The puff spawns at the spawner's CURRENT position (it advanced
+								// moveSpeed px/s since the last interval) — snapshot before orig runs.
+								const pos: any = this.coll && this.coll.pos;
+								if (pos) {
+									m.netSync.broadcastEnemyFx(
+										this.effect.effectSheet.path, this.effect.name, cbt,
+										{ x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z) }, null);
+								}
+							}
+						} catch (_) { /* never break the burst spawn */ }
+						return origStartSpawn.apply(this, arguments as any);
+					};
+				}
+			} catch (e) { console.warn('[netsync] BurstSpawner FX wrap failed', e); }
 			try {
 				// 1.71.11: relay the END of a host-side relayed telegraph effect. Every
 				// engine stop path funnels through Effect.stop() — action end
@@ -1551,7 +1624,7 @@ export class NetSync {
 								this._mpSkillFxStopRelayed = true;
 								const m2 = (window as any).__mpMain;
 								if (m2 && m2.netSync) {
-									m2.netSync.broadcastSkillFxStop(sk.sheet || '', sk.key || '');
+									m2.netSync.broadcastSkillFxStop(sk.sheet || '', sk.key || '', sk.bot || undefined);
 								}
 							}
 						} catch (_) { /* never break the engine stop */ }
@@ -2296,15 +2369,21 @@ export class NetSync {
 					const g = origGetChargeAction.call(this, type, level);
 					try {
 						const game: any = ig.game;
-						if (game && this === game.playerEntity) {
-							const ns = cur();
-							const conn: any = ns && ns.main && ns.main.connection;
+						// 1.76.x (bot attack sync): one of OUR party bots released an art —
+						// relay the banner with the bot's name (receivers anchor it on the
+						// bot puppet). Bots are Player-typed party entities, so this same
+						// wrap sees their releases.
+						const nsCur: any = cur();
+						const botArt = (game && this !== game.playerEntity && nsCur && nsCur.main && nsCur.main.ownedBotNameOf)
+							? nsCur.main.ownedBotNameOf(this) : '';
+						if (game && (this === game.playerEntity || botArt)) {
+							const conn: any = nsCur && nsCur.main && nsCur.main.connection;
 							if (conn && typeof conn.isOpen === 'function' && conn.isOpen() && typeof conn.combatArtName === 'function') {
 								const PA: any = (sc as any).PLAYER_ACTION;
 								const name = (this.model && typeof this.model.getCombatArtName === 'function' && PA) ? this.model.getCombatArtName(PA[g]) : null;
 								if (name) {
 									const label = (typeof name === 'object' && name.data) ? name.data : String(name);
-									conn.combatArtName(label);
+									conn.combatArtName(label, botArt || undefined);
 								}
 							}
 						}
@@ -2642,6 +2721,27 @@ export class NetSync {
 					// The damageResult is the 5th argument (u) — the engine caller is
 					// `onPreDamageModification(f,a,c,g,u,q,t)` where `u` is the damage result.
 					onPreDamageModification(this: any, a: any, ...rest: any[]) {
+						// 1.76.x (member break-accumulation fix — Ti'im's fireHits): force the
+						// forwarded damage INTO the damageResult BEFORE the engine's reaction
+						// evaluation. The parent feeds rest[3].damage to HP-fraction break
+						// trackers during _checkHitReactions; the old post-parent force
+						// (branch C below) ran too late, so a member-forwarded hit
+						// accumulated the mirror-husk recomputed CHIP (~1-3) instead of the
+						// real forwarded number — a member's heat hits never moved the
+						// break gauge. Hit-count trackers (Digmo heatHits) were unaffected
+						// (they read baseOffensiveFactor, not damage). The post-parent force
+						// stays as the cleanup/styling pass (same value, idempotent).
+						try {
+							const nsPre = cur();
+							if (nsPre && nsPre.main.host && !nsPre.isPuppet(this)) {
+								const atkPre: any = rest[0];
+								const rootPre: any = atkPre && atkPre.getCombatantRoot ? (atkPre.getCombatantRoot() || atkPre) : atkPre;
+								if (rootPre && rootPre._mpMirror && rootPre._mpForcedDamage != null) {
+									const duPre: any = rest[3];
+									if (duPre && typeof duPre.damage === 'number') duPre.damage = rootPre._mpForcedDamage;
+								}
+							}
+						} catch (_) { /* detection failure: the post-parent force still applies */ }
 						const r = this.parent(a, ...rest);
 						const ns = cur();
 						if (!ns) return r;
@@ -3315,6 +3415,35 @@ export class NetSync {
 					},
 				});
 			} catch (e) { console.warn('[netsync] addShield wrap failed', e); }
+
+		// Perfect-guard compensation: detect the exact frame the LOCAL player's guard
+		// ENGAGES (the a.guarding false->true edge inside handleGuard — this only
+		// turns true when the guard action actually takes, so a blocked/whiffed
+		// press can't convert) and convert a pending deferred monster verdict into
+		// a PERFECT guard (_mpPgTryConvert). Member-only inside the handler.
+		try {
+			const P: any = (ig.ENTITY as any).Player;
+			if (P && P.prototype && typeof P.prototype.handleGuard === 'function'
+				&& !P.prototype._mpPgGuardWrapped) {
+				P.prototype._mpPgGuardWrapped = true;
+				const origHandleGuard = P.prototype.handleGuard;
+				P.prototype.handleGuard = function (a: any, b: any) {
+					const r = origHandleGuard.call(this, a, b);
+					try {
+						const nowG = !!(a && a.guarding);
+						if (nowG && !this._mpPgGuardEdge) {
+							this._mpPgGuardEdge = true;
+							const m = (window as any).__mpMain;
+							const ns = m && m.netSync;
+							if (ns) ns._mpPgTryConvert();
+						} else if (!nowG) {
+							this._mpPgGuardEdge = false;
+						}
+					} catch (_) { /* never break the guard handler */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[netsync] perfect-guard comp wrap failed', e); }
 
 		// ROUND 143 (underground drill-trail sync): stamp every GENERIC combat-proxy
 		// entity (scorpion StingLine/Sting, diggingbot rocks/icicles, ...) with its
@@ -4909,6 +5038,15 @@ export class NetSync {
 			afc: (el > 0 && stb > 0) ? afc : undefined,
 			// Lag-compensation anchor: the mirror's center at connect time.
 			hx, hy,
+			// Perfect-guard compensation: the attacker enemy's uid. The member echoes
+			// it back via latePerfectGuard when a deferred verdict converts to PERFECT,
+			// so the host can find the enemy for the GUARD_COUNTER reaction.
+			auid: (() => {
+				try {
+					const rt: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
+					return (rt && typeof rt.uid === 'number' && rt.uid > 0) ? rt.uid : undefined;
+				} catch (_) { return undefined; }
+			})(),
 		});
 	}
 
@@ -7182,7 +7320,7 @@ export class NetSync {
 		try { const m: any = (window as any).__mpMain; return !!(m && m._mpGodMode); } catch (_) { return false; }
 	}
 
-	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number }): void {
+	private applyCombatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number, auid?: number }, fromPending?: boolean): void {
 		try {
 			const D = (t: string, ...a: any[]) => { try { this._sfxLog('ch.' + t, ...a); } catch (_) { /* ignore */ } };
 			// ROUND 38: the attacker's REAL attack-type (sc.ATTACK_TYPE) rides on the packet
@@ -7290,6 +7428,33 @@ export class NetSync {
 			// the native onPreDamageModification wrap never runs on the member side, so
 			// clamp the relayed verdict here (also kills the min-1 PvP floor).
 			if (this._mpGodOn()) { dmg = 0; try { (hit as any).full = 0; } catch (_) { /* plain relay object */ } }
+			// PERFECT-GUARD COMPENSATION (member only; server config perfectGuardBaseMs
+			// + perfectGuardPingFactor): a PLAIN (unguarded) monster verdict does not
+			// apply immediately while the compensation window is open. The hit sits in
+			// _mpPgPending for (base + pingFactor x RTT) ms — during that window the
+			// player takes no damage from it, and a guard press converts it to a
+			// PERFECT guard (_mpPgTryConvert). Two fast paths at receipt: (a) our own
+			// perfect-guard window is STILL open locally (we pressed just before the
+			// verdict arrived but the host judged against a stale no-guard stream) ->
+			// convert immediately; (b) otherwise defer. Expired pendings re-enter here
+			// with fromPending=true and apply normally. Guard/perfect verdicts and
+			// zero-damage verdicts are never deferred (nothing to compensate).
+			if (isMonster && !perfect && !regular && dmg > 0 && !fromPending) {
+				const winMs = this._mpPgWindowMs();
+				if (winMs > 0) {
+					if (this._mpPgLocalPerfectActive(p)) {
+						D('pgnow', 'dmg=' + dmg);
+						this._mpPgApplyPerfect(p, hit, atkType, hit.auid);
+						return;
+					}
+					if (this._mpPgPending.length < 8) {
+						this._mpPgPending.push({ hit, expireAt: Date.now() + winMs, map: this.mapName });
+						D('pgdefer', 'win=' + Math.round(winMs), 'dmg=' + dmg);
+						return;
+					}
+					// Flood fallback (8 pendings): apply now — never drop a real hit.
+				}
+			}
 			// ROUND 79 (damage diagnostics): the member's own LOCAL stats + the verdict it
 			// received - vs the host's rc.dmg (which used the STREAMED copies of these) any
 			// drifted value shows up as a different def/gm/df/ef/fc right here.
@@ -9303,8 +9468,14 @@ export class NetSync {
 				if (this._mpDead) this.clearDeathState();
 				if (this._mpChargeFrozen) this.clearChargeFreeze();
 				this.clearEnemyCamHandles();
+				// Perfect-guard compensation: a disconnect mid-deferral must never
+				// apply a stale verdict into the next session.
+				if (this._mpPgPending.length) this._mpPgPending.length = 0;
 				return;
 			}
+			// Perfect-guard compensation: apply deferred monster verdicts whose
+			// compensation window expired without a guard press.
+			try { this._mpPgPump(); } catch (_) { /* ignore */ }
 
 			// ROUND 125: stale button-interact watchdog (1s throttle).
 			const nowSweep = Date.now();
@@ -10048,17 +10219,19 @@ export class NetSync {
 	 * are whitelisted to serializable fields — callbacks and entity-valued target2
 	 * references can't cross the wire (the receiver re-targets the effect at the
 	 * mirror via spawnOnTarget anyway). */
-	public broadcastSkillFx(sheetPath: string, key: string, fixed: { x: number, y: number, z: number } | null, params: any): void {
+	public broadcastSkillFx(sheetPath: string, key: string, fixed: { x: number, y: number, z: number } | null, params: any, bot?: string): void {
 		try {
 			if (!this.main.connection || !this.main.connection.isOpen()) return;
-			if (this._mpDead) return;
+			if (!bot && this._mpDead) return;
 			const p: any = {};
 			if (params && typeof params === 'object') {
 				const keep = ['target2Align', 'target2Offset', 'offset', 'rotOffset', 'align',
 					'angle', 'flipX', 'rotateFace', 'flipLeftFace', 'duration', 'group', 'noMultiGroup'];
 				for (const k of keep) if (params[k] !== undefined) p[k] = params[k];
 			}
-			this.main.connection.skillFx({ sheet: sheetPath, key, f: fixed, p });
+			// 1.76.x (bot attack sync): bot names one of OUR party bots — receivers
+			// anchor the replay on that bot's puppet instead of our mirror.
+			this.main.connection.skillFx({ sheet: sheetPath, key, f: fixed, p, bot });
 		} catch (_) { /* ignore */ }
 	}
 
@@ -10070,13 +10243,15 @@ export class NetSync {
 	 * (sc.SmallEntityBox, duration 1, rumble stopped — exactly the engine's own
 	 * local-banner shape) over their mirror. The RECEIVER's combat-art-name
 	 * option gates display, and a LangLabel data map resolves in our language. */
-	private applyArtName(data: { player: string, label: any }): void {
+	private applyArtName(data: { player: string, label: any, bot?: string }): void {
 		try {
 			if (!data || !data.player || data.player === this.main.name) return;
 			const opts: any = (sc as any).options;
 			if (!opts || typeof opts.get !== 'function' || !opts.get('combat-art-name')) return;
-			const pl = (this.main as any).players[data.player];
-			const mirror = pl && pl.entity;
+			// 1.76.x (bot attack sync): a bot's art banner anchors on the bot puppet.
+			const mirror = data.bot
+				? (this.main as any).botEntityByName(data.bot)
+				: ((this.main as any).players[data.player] && (this.main as any).players[data.player].entity);
 			if (!mirror || mirror._killed) return;
 			const SEB: any = (sc as any).SmallEntityBox;
 			const gui: any = (ig as any).gui;
@@ -10242,8 +10417,14 @@ export class NetSync {
 			sheet.load(() => {
 				try {
 					if (!sheet.loaded) return;
-					const pl = this.main.players[player];
-					const mirror = pl && pl.entity;
+					// 1.76.x (bot attack sync): a bot-owned effect anchors on OUR bot
+					// puppet; the composite key keeps its loop tracking separate from
+					// the sender's own same-sheet loops.
+					const botName = (fx as any).bot;
+					const anchor = botName
+						? this.main.botEntityByName(botName)
+						: ((this.main.players[player] || <any>null) && this.main.players[player].entity);
+					const mirror = anchor;
 					let handle: any = null;
 					if (fx.f) {
 						handle = sheet.spawnFixed(fx.key, fx.f.x, fx.f.y, fx.f.z, (mirror && !mirror._killed) ? mirror : null, fx.p || {});
@@ -10258,7 +10439,7 @@ export class NetSync {
 					if (handle) {
 						const isLoop = !!(fx.p && typeof fx.p.duration === 'number' && fx.p.duration < 0);
 						if (isLoop) {
-							const k = player + '|' + fx.sheet + '|' + fx.key;
+							const k = ((fx as any).bot ? (player + ':bot:' + (fx as any).bot) : player) + '|' + fx.sheet + '|' + fx.key;
 							const list = (this._skillFxLoopHandles[k] = this._skillFxLoopHandles[k] || []);
 							for (let i = list.length; i--;) {
 								const h: any = list[i];
@@ -10280,21 +10461,21 @@ export class NetSync {
 	private _skillFxLoopHandles: { [k: string]: any[] } = Object.create(null);
 
 	/** CASTER side: one of OUR looping skill effects just ended — relay the stop. */
-	public broadcastSkillFxStop(sheet: string, key: string): void {
+	public broadcastSkillFxStop(sheet: string, key: string, bot?: string): void {
 		try {
 			if (!this.main.connection || !this.main.connection.isOpen()) return;
 			if (typeof (this.main as any).isSoloInstance === 'function' && (this.main as any).isSoloInstance()) return;
 			if (!sheet || !key) return;
 			const conn: any = this.main.connection;
-			if (typeof conn.skillFxStop === 'function') conn.skillFxStop({ sheet, key });
+			if (typeof conn.skillFxStop === 'function') conn.skillFxStop({ sheet, key, bot });
 		} catch (_) { /* ignore */ }
 	}
 
 	/** RECEIVER side: the caster's looping skill effect ended — stop our replay. */
-	private applySkillFxStop(player: string, data: { sheet: string, key: string }): void {
+	private applySkillFxStop(player: string, data: { sheet: string, key: string, bot?: string }): void {
 		try {
 			if (!data || !data.sheet || !data.key || player === this.main.name) return;
-			const k = player + '|' + data.sheet + '|' + data.key;
+			const k = (data.bot ? (player + ':bot:' + data.bot) : player) + '|' + data.sheet + '|' + data.key;
 			const list = this._skillFxLoopHandles[k];
 			if (!list || !list.length) return;
 			for (let i = list.length; i--;) {
@@ -11709,6 +11890,169 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.7;
 		v = Math.max(0, Math.min(10, v));
 		this._mpHpScale = v;
+	}
+
+	/** Store the server-provided member perfect-guard compensation tuning:
+	 * baseMs = flat grace window after a monster hit lands (0 = base part off),
+	 * pingFactor x RTT = network-latency extension (0 = network part off).
+	 * Both clamp to >= 0 (a negative would disable-by-meaning; the server already
+	 * clamps too — this is the client-side belt-and-braces). */
+	public setPerfectGuardComp(baseMs: number, pingFactor: number): void {
+		this._mpPgBaseMs = (typeof baseMs === 'number' && isFinite(baseMs)) ? Math.max(0, baseMs) : 30;
+		this._mpPgPingF = (typeof pingFactor === 'number' && isFinite(pingFactor)) ? Math.max(0, pingFactor) : 0.6;
+		try { console.log('[netsync] perfect-guard comp: base=' + this._mpPgBaseMs + 'ms pingF=' + this._mpPgPingF); } catch (_) { /* ignore */ }
+	}
+
+	/** Perfect-guard compensation: the open deferral window RIGHT NOW (ms), or 0
+	 * when the feature is off / we are the host / offline. Member-only by design. */
+	private _mpPgWindowMs(): number {
+		if (this.main.host) return 0;
+		const conn: any = this.main && this.main.connection;
+		if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return 0;
+		const base = Math.max(0, this._mpPgBaseMs);
+		const f = Math.max(0, this._mpPgPingF);
+		if (base <= 0 && f <= 0) return 0;
+		// RTT to the host (-1 = no answered probe yet -> treat as 0, the base part
+		// still applies). A wild probe sample caps at 500ms so the damage deferral
+		// can never stretch into something the player reads as a dropped hit.
+		const ping = (typeof conn.pingMs === 'number' && conn.pingMs >= 0) ? Math.min(conn.pingMs, 500) : 0;
+		return base + f * ping;
+	}
+
+	/** Perfect-guard compensation: is the LOCAL player's own perfect-guard window
+	 * still open (any live shield connection whose perfectGuardTime hasn't run
+	 * out)? This is the receipt-time fast path: we pressed guard JUST before the
+	 * verdict arrived, but the host judged against a stale no-guard stream. */
+	private _mpPgLocalPerfectActive(p: any): boolean {
+		try {
+			const list = p && p.shieldsConnections;
+			if (!list || !list.length) return false;
+			for (let i = list.length; i--;) {
+				const c = list[i];
+				if (c && typeof c.isPerfect === 'function' && c.isPerfect()) return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** Perfect-guard compensation: apply a PERFECT-guard outcome to the local
+	 * player for a verdict the host judged as a plain hit. Mirrors the native /
+	 * host-judged perfect branch verbatim: 0 damage, perfect-guard FX + sound,
+	 * the "P" hit number, the perfectShield stat + cooldown reset, and 0.4s of
+	 * i-frames. Then notifies the host (latePerfectGuard) so the attacker enemy
+	 * still runs its GUARD_COUNTER reaction and the host/spectators render the
+	 * perfect on our mirror. */
+	private _mpPgApplyPerfect(p: any, hit: any, atkType: number, auid?: number): void {
+		try { (ig as any).vars.add('playerVar.input.perfectShield', 1); } catch (_) { /* ignore */ }
+		try { (sc as any).stats.addMap('combat', 'perfectShield', 1); } catch (_) { /* ignore */ }
+		try { if (typeof p.perfectGuardCooldown === 'number') p.perfectGuardCooldown = 0; } catch (_) { /* ignore */ }
+		p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
+		try {
+			const scAny: any = sc as any;
+			if (scAny.combat && typeof scAny.combat.showHitEffect === 'function' && p.coll) {
+				const s = p.coll.size || { x: 0, y: 0, z: 0 };
+				scAny.combat.showHitEffect(p,
+					{ x: p.coll.pos.x + s.x / 2, y: p.coll.pos.y + s.y / 2, z: p.coll.pos.z + s.z },
+					atkType, (hit && hit.element) || 0, 2 /* SHIELD_RESULT.PERFECT */, false);
+			}
+		} catch (_) { /* FX is cosmetic */ }
+		this.spawnHitNumberOn(p, 1, false, 2 /* SHIELD_RESULT.PERFECT */);
+		try { this._sfxLog('ch.pgLate', 'auid=' + (auid || 0), 'dmg=' + (hit && hit.damage)); } catch (_) { /* ignore */ }
+		try {
+			const conn: any = this.main && this.main.connection;
+			if (conn && typeof conn.isOpen === 'function' && conn.isOpen()
+				&& typeof conn.latePerfectGuard === 'function') {
+				conn.latePerfectGuard({ auid: (typeof auid === 'number' && auid > 0) ? auid : 0 });
+			}
+		} catch (_) { /* the counter relay is best-effort */ }
+	}
+
+	/** Perfect-guard compensation: the local player's guard just ENGAGED (called
+	 * from the handleGuard edge wrap). Convert the newest unexpired deferred
+	 * monster verdict into a PERFECT guard. Other pendings drop with it — the
+	 * perfect's 0.4s i-frames would absorb them at expiry anyway. */
+	public _mpPgTryConvert(): void {
+		try {
+			if (this.main.host) return;
+			if (!this._mpPgPending.length) return;
+			const conn: any = this.main && this.main.connection;
+			if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
+			const p: any = (ig as any).game && (ig as any).game.playerEntity;
+			if (!p || !p.params || p._killed || this._mpDead) { this._mpPgPending.length = 0; return; }
+			const now = Date.now();
+			let idx = -1;
+			for (let i = this._mpPgPending.length; i--;) {
+				const e = this._mpPgPending[i];
+				if (e.expireAt >= now && e.map === this.mapName) { idx = i; break; }
+			}
+			if (idx < 0) return;
+			const pend = this._mpPgPending.splice(idx, 1)[0];
+			this._mpPgPending.length = 0;
+			const atkType: number = (pend.hit && typeof pend.hit.attackType === 'number' && pend.hit.attackType > 0)
+				? pend.hit.attackType : 1;
+			this._mpPgApplyPerfect(p, pend.hit, atkType, pend.hit && pend.hit.auid);
+		} catch (_) { /* a failed conversion must never break the guard */ }
+	}
+
+	/** Perfect-guard compensation: per-frame pump (simplify.registerUpdate).
+	 * Applies deferred verdicts whose window expired with no guard press, and
+	 * drops pendings left behind by a map change. */
+	private _mpPgPump(): void {
+		try {
+			if (!this._mpPgPending.length) return;
+			const now = Date.now();
+			for (let i = this._mpPgPending.length; i--;) {
+				const e = this._mpPgPending[i];
+				if (e.map !== this.mapName) { this._mpPgPending.splice(i, 1); continue; }
+				if (now >= e.expireAt) {
+					this._mpPgPending.splice(i, 1);
+					try { this._sfxLog('ch.pgexpire', 'dmg=' + (e.hit && e.hit.damage)); } catch (_) { /* ignore */ }
+					this.applyCombatHit(e.hit, true);
+				}
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Perfect-guard compensation: HOST-side handler — a member's deferred
+	 * monster verdict converted to PERFECT on their screen. Run the attacker
+	 * enemy's GUARD_COUNTER reaction (uid space is shared with the member's
+	 * puppets) and render the perfect-guard FX on the member's mirror, exactly
+	 * like the host-judged perfect path in recomputeHostMonsterHit does. The
+	 * member's own guard-sound relay already covers the audio; the mirror call
+	 * below is the husk branch of the showHitEffect wrap (spark, sound-suppressed,
+	 * never re-relayed), so nothing doubles. */
+	private onLatePerfectGuard(data: { player?: string, auid?: number }): void {
+		try {
+			if (!this.main.host) return;
+			if (!data || typeof data.player !== 'string' || !data.player) return;
+			const entry: any = this.main.players[data.player];
+			const mirror: any = entry && entry.entity;
+			if (!mirror || mirror._killed) return;
+			const auid = (typeof data.auid === 'number' && data.auid > 0) ? data.auid : 0;
+			if (auid) {
+				try {
+					const list: any[] = (ig as any).game.entities;
+					const Enemy: any = (ig.ENTITY as any).Enemy;
+					for (let i = 0; i < list.length; i++) {
+						const e: any = list[i];
+						if (e instanceof Enemy && !e._mpMirror && !e._killed && e.uid === auid) {
+							this.triggerGuardCounter(e, mirror);
+							break;
+						}
+					}
+				} catch (_) { /* counter is best-effort */ }
+			}
+			try {
+				const scAny: any = sc as any;
+				if (scAny.combat && typeof scAny.combat.showHitEffect === 'function' && mirror.coll) {
+					const ms = mirror.coll.size || { x: 0, y: 0, z: 0 };
+					scAny.combat.showHitEffect(mirror,
+						{ x: mirror.coll.pos.x + ms.x / 2, y: mirror.coll.pos.y + ms.y / 2, z: mirror.coll.pos.z + ms.z },
+						1 /* LIGHT */, 0, 2 /* SHIELD_RESULT.PERFECT */, false);
+				}
+			} catch (_) { /* mirror FX is cosmetic */ }
+			try { this._sfxLog('rc.pgLate', 'from=' + data.player, 'auid=' + auid); } catch (_) { /* ignore */ }
+		} catch (_) { /* ignore */ }
 	}
 
 	/** Store the server-provided per-extra-member BOSS-only HP fraction
@@ -14980,6 +15324,23 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { return false; }
 	}
 
+	/** ROUND 146 (story-duel PVP arena vars stay local): the story PVP duel
+	 * arenas fence themselves off with ScalableProp barriers gated on `pvpArena`
+	 * (dungeon-ar barrierH/barrierV walls) plus the `pvpSign` 'PvP' text sign —
+	 * Bergen/Jungle/Heat duels use the map.* bucket, Rhombus/Hideout use tmp.*.
+	 * The duel event raises the var BEFORE START_PVP_BATTLE, i.e. before
+	 * pvpIsolation moves the dueling client into its solo instance, so the write
+	 * still relays to the party and the walls pop up on every NON-dueling
+	 * teammate's map copy. Key-only check on purpose: both buckets must be
+	 * covered and no legit flow needs these vars cross-client (each dueling
+	 * client raises its own local copy; non-duelists must never see them). */
+	public isPvpArenaVar(bucket: string, key: string): boolean {
+		try {
+			if (!key) return false;
+			return key === 'pvpArena' || key === 'pvpSign';
+		} catch (_) { return false; }
+	}
+
 	/** 1.75.x (poisoned-var self-heal): on every map entry, if a ground-pickup var
 	 * is true but the LOCAL player doesn't own its KEY item, the old relay poisoned
 	 * this save — clear the var so the item respawns. Writes straight into
@@ -15077,6 +15438,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (this.isParkourMarkerVar(rk.b, rk.k)) return;          // parkour markers are per-player
 			if (this.isLocalPickupVar(rk.b, rk.k)) return;            // ground-item pickups are per-player
 			if (this.isKeyLockedPerPlayerVar(rk.b, rk.k)) return;      // key walls/pillars unlock per-player
+			if (this.isPvpArenaVar(rk.b, rk.k)) return;              // ROUND 146: PVP-duel arena walls/sign stay local
 			if (!this._mpSpawnVarSet[rk.b + '|' + rk.k]) return;
 			const vars: any = (ig as any).vars;
 			if (!vars || typeof vars.get !== 'function') return;
@@ -15112,6 +15474,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (this.isParkourMarkerVar(rk.b, rk.k)) return; // parkour markers are per-player
 			if (this.isLocalPickupVar(rk.b, rk.k)) return;   // ground-item pickups are per-player
 			if (this.isKeyLockedPerPlayerVar(rk.b, rk.k)) return; // key walls/pillars unlock per-player
+			if (this.isPvpArenaVar(rk.b, rk.k)) return; // ROUND 146: PVP-duel arena walls/sign stay local
 			const vars: any = (ig as any).vars;
 			if (!vars || typeof vars.get !== 'function') return;
 			const v = vars.get(path); // engine accessor resolves map.X to the slash-keyed bucket
@@ -15160,6 +15523,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				if (this.isParkourMarkerVar(e.b, e.k)) continue; // never apply a peer's parkour marker state
 				if (this.isLocalPickupVar(e.b, e.k)) continue;   // never apply a peer's ground-pickup state
 				if (this.isKeyLockedPerPlayerVar(e.b, e.k)) continue; // never apply a peer's key-lock unlock state
+				if (this.isPvpArenaVar(e.b, e.k)) continue; // ROUND 146: never apply a peer's PVP-duel arena walls/sign
 				const tv = typeof e.v;
 				if (tv !== 'number' && tv !== 'boolean' && tv !== 'string') continue;
 				let obj: any = null;
@@ -18554,7 +18918,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * A close-combat art anim (its name contains "spin" — spinFullLong/spinFullRev — or
 	 * is attackLong/attackFinisher) uses the finisher family; a plain melee anim uses the
 	 * base family, mirroring the engine's own COMBAT_SWEEP step choice. */
-	private spawnAttackFxForAnim(ent: any, anim: string, elementMode?: number, clazz?: string): void {
+	public spawnAttackFxForAnim(ent: any, anim: string, elementMode?: number, clazz?: string): void {
 		try {
 			const sweeps: any = (sc as any).COMBAT_SWEEPS;
 			if (!sweeps) return;

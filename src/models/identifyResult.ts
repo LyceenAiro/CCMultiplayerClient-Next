@@ -48,6 +48,13 @@ interface IIdentifyResult {
      * positive resistance (never weaknesses). Both default 0 = no adjustment. */
     resistFlat?: number;
     resistPercent?: number;
+    /** Member perfect-guard compensation (server config): after a monster hit
+     * lands on a member, raising guard within (perfectGuardBaseMs +
+     * perfectGuardPingFactor x RTT-to-host) still counts as a PERFECT guard and
+     * the hit deals no damage while that window is open. Each part disables at
+     * 0; older servers omit both -> client falls back to the defaults 30 / 0.6. */
+    perfectGuardBaseMs?: number;
+    perfectGuardPingFactor?: number;
     /** 1.71.0: save-mirror metadata in mirror-rollback mode (newest first). */
     mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>;
 }
