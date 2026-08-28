@@ -13,6 +13,7 @@ import { installItemUseIndicators } from './ui/itemUseIndicator';
 import { installHealSync } from './ui/healSync';
 import { installVersionDisplay } from './ui/versionDisplay';
 import { installShopDiag } from './ui/shopDiag';
+import { installSkillGuard } from './sync/skillGuard';
 
 /**
  * CCLoader v2 entry point.
@@ -85,6 +86,10 @@ async function startMultiplayer(): Promise<void> {
 
 		// ROUND 123: 商人购买点击失灵的只读诊断（[mpdiag] 日志，不改行为）。
 		installShopDiag();
+
+		// 1.76.x: 电路技能分支战斗中异常切换 —— 触发点抓凶日志（[mpskill]）+ 2s
+		// 看门狗检测 activeActions 与 skills[] 的背离并自动 updateStats() 修复。
+		installSkillGuard();
 
 		// ROUND 95: item-use indicators — other players see the item icon pop above
 		// our head when we use a consumable (and vice versa).

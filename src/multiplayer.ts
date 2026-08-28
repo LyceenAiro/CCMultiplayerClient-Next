@@ -1035,13 +1035,17 @@ export class Multiplayer {
 					try { sameBlock = g.getLevelIdx(e.coll.pos.z) === g.getLevelIdx(mir.coll.pos.z); } catch (_) { sameBlock = true; }
 					const td = e.targetDetect || {};
 					const dd = td.detectDistance || 0, ld = td.loseDistance || 0;
-					const acquire = Math.max(dd, ld);
+					// 1.76.x: mirror acquire now follows vanilla updateTarget — detect
+					// radius only (no loseDistance widen), and onCloseBattle-only enemies
+					// need the mirror to already be in battle (targetedBy.length > 0).
+					const acquire = dd;
+					const mirInBattle = !!(mir.targetedBy && mir.targetedBy.length > 0);
 					let why = '';
 					if (e.target && e.target !== mir) why = 'holds ' + tn + ' (acquire branch needs !target)';
 					else if (!sameBlock) why = 'cross-block';
-					else if (!(dMir < acquire)) why = 'mirror ' + dMir + 'px > acquire ' + acquire + ' (detect ' + dd + ' / lose ' + ld + ')';
+					else if (!(dMir < acquire)) why = 'mirror ' + dMir + 'px > detect ' + acquire + ' (lose ' + ld + ')';
 					else if (td.detectZDelta && dz >= td.detectZDelta) why = 'z-delta ' + dz + ' >= ' + td.detectZDelta;
-					else if (!(td.onDistance || td.onCloseBattle)) why = 'no onDistance/onCloseBattle';
+					else if (!(td.onDistance || (td.onCloseBattle && mirInBattle))) why = td.onCloseBattle ? 'closeBattle but mirror not in battle' : 'no onDistance/onCloseBattle';
 					else why = 'SHOULD-ACQUIRE (all gates pass)';
 					let st = '-', act = '-';
 					try { st = e.currentState && e.currentState.name; } catch (_) { }

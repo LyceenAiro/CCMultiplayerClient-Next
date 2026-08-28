@@ -141,8 +141,18 @@ export interface IConnection {
     /** The local player genuinely fell into a fall terrain (water/hole/...) —
      * relay the terrain to the party so teammates replay the splash + fall-damage
      * visual on our mirror. Needed because replica-local terrain falls are
-     * suppressed (water-edge phantom-loop fix), which also muted REAL falls. */
-    sendPlayerFall(terrain: number): void;
+     * suppressed (water-edge phantom-loop fix), which also muted REAL falls.
+     * 1.76.x: `pt` carries the owner's engine-maintained respawn anchor
+     * (respawn.pos) so the mirror's respawnLine beam targets the REAL revive
+     * point instead of the mirror's own (stale/wrong) local anchor. */
+    sendPlayerFall(terrain: number, pt?: { x: number, y: number, z: number }): void;
+    /** 1.76.x (bomb handoff): we are leaving the map while a bomb we own is
+     * still live — stream its full state so the instance host (or the new host
+     * after migration) adopts it as a REAL bomb instead of it vanishing for
+     * everyone. Same field shape as a bombState entry. */
+    bombHandoff(pkt: { map: string, i: number, pmi: number, x: number, y: number, z: number, vx: number, vy: number, vz: number, t: number, h: number }): void;
+    /** 1.76.x: a same-instance peer handed off its live bomb before leaving. */
+    onBombHandoff(callback: (data: any) => void): void;
     /** A story-gated dungeon CUTSCENE EventTrigger just started locally (e.g.
      * the Temple Mine elevator console) — relay {map, trigger mapId, our exact
      * player position} so same-block teammates gather onto us and replay the
@@ -243,6 +253,14 @@ export interface IConnection {
     /** 1.71.0: a same-instance client relayed dungeon puzzle state — apply it to
      * our matching local entities by mapId. */
     onPuzzleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
+    /** 1.76.x (bounce-puzzle FX relay): our ball lit a bounce block / hit the
+     * group end-switch (final or fail) / our group reset — the sounds (bing /
+     * hit / fail) and the red bounceDenied fail-flash play LOCALLY only, so
+     * relay one compact event for same-instance peers to replay natively.
+     * k: 1=blockHit 2=switchFinal 3=switchFail 4=groupReset (mi = endSwitch). */
+    bounceFx(map: string, mi: number, k: number): void;
+    /** 1.76.x: a same-instance peer's bounce-puzzle FX event. */
+    onBounceFx(callback: (data: { map: string, mi: number, k: number }) => void): void;
     /** ROUND 132: stream the LOCAL player's thrown-ball positions (bounce-puzzle
      * visibility — throwBall only relays the throw moment, not the steered bounce). */
     playerBall(map: string, entries: Array<{ i: number, el?: number, chg?: number, x: number, y: number, z: number, vx?: number, vy?: number }>): void;
@@ -505,7 +523,7 @@ export interface IConnection {
     onBossPhase(callback: (data: { map: string, uid?: number }) => void): void;
     /** A party teammate genuinely fell into a fall terrain — replay the fall
      * visual (splash effect + damage popup + respawn drift) on their mirror. */
-    onPlayerFall(callback: (from: string, terrain: number) => void): void;
+    onPlayerFall(callback: (from: string, terrain: number, pt?: { x: number, y: number, z: number }) => void): void;
     /** A same-block teammate started a story-gated dungeon cutscene — gather
      * onto their exact position and start the same trigger locally. */
     onCutsceneTrigger(callback: (data: { map: string, mi: number, p: [number, number, number], from?: string }) => void): void;

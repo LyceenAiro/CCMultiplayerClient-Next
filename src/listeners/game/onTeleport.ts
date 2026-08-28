@@ -42,6 +42,10 @@ export class OnTeleportListener {
 			try {
 				const m: any = (window as any).__mpMain;
 				if (m && m.netSync && m.netSync.isLocalDead()) m.netSync.abortDeathForTeleport();
+				// 1.76.x (bomb handoff): leaving the map while a bomb we launched is
+				// still ticking — hand it to the instance host (or the new host after
+				// migration) so it keeps running for everyone else.
+				if (m && m.netSync && typeof m.netSync.sendBombHandoffs === 'function') m.netSync.sendBombHandoffs();
 			} catch (_) { /* ignore */ }
 			const gen = ++instance._teleportGen;
 			// DEFER the real teleport until changeMapResponse arrives. Members must

@@ -455,7 +455,19 @@ class CutsceneRelay implements ICutsceneRelay {
 				return;
 			}
 			// 1) gather: jump to the triggerer's exact coordinates.
-			try { g.playerEntity.setPos(data.p[0], data.p[1], data.p[2]); } catch (_) { /* ignore */ }
+			// 1.76.x (wave-transition teleport yank): an ENCOUNTER intro (PARALLEL
+			// battle trigger with the enemy-target signature — cold-dng.b2.room5 wave 2
+			// & co.) fires MID-FIGHT on whichever client notices the empty wave counter
+			// first, and gathering the rest to that player's coordinates yanks them out
+			// of combat (broken combos, players dropped into hazards/next to allies).
+			// Story cutscenes still gather — the scene needs the party inside the zone
+			// — but an encounter intro plays where everyone already stands, so only the
+			// local event replay runs (dramatic effect/camera), no teleport.
+			if (!this.isEncounterTrigger(trig)) {
+				try { g.playerEntity.setPos(data.p[0], data.p[1], data.p[2]); } catch (_) { /* ignore */ }
+			} else {
+				console.log('[cutscenerelay] encounter intro relay mi=' + data.mi + ' — gather teleport skipped (mid-fight)');
+			}
 			// 2) start the same cutscene locally and mark the trigger consumed.
 			this.applying = true;
 			try {

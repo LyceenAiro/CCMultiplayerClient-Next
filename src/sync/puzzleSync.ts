@@ -87,6 +87,10 @@ export interface IPuzzleSync {
 let updateRegistered = false;
 let pushHooksInstalled = false;
 let shared: PuzzleSync | null = null;
+/** 1.76.x: >0 while a receiver replays a relayed bounce-puzzle event — the
+ * resetGroup wrap must not rebroadcast it back (echo loop). */
+let bounceFxReplayDepth = 0;
+let bounceFxHooksInstalled = false;
 
 export function installPuzzleSync(getMain: () => Multiplayer | undefined): IPuzzleSync {
 	if (!shared) shared = new PuzzleSync(getMain);
@@ -115,6 +119,8 @@ class PuzzleSync implements IPuzzleSync {
 	 * plate/box must never overwrite an unsolved player's still-raised puzzle). */
 	private placedBoxIds = new Set<number>();
 	private _varLogSeen = new Set<string>();
+	/** 1.76.x: per-group timestamp of the last relayed fail-flash replay (spam guard). */
+	private bounceResetFxAt = new Map<string, number>();
 
 	constructor(private getMain: () => Multiplayer | undefined) {
 		(window as any).__mppuzzle = () => this.dump();
@@ -124,6 +130,7 @@ class PuzzleSync implements IPuzzleSync {
 		const m = this.getMain();
 		if (!m || !m.connection) return;
 		try { m.connection.onPuzzleState((data) => this.apply(data)); } catch (_) { /* ignore */ }
+		try { if (typeof (m.connection as any).onBounceFx === 'function') (m.connection as any).onBounceFx((data: any) => this.applyBounceFx(data)); } catch (_) { /* ignore */ }
 		try { if (typeof (m.connection as any).onSlidingPush === 'function') (m.connection as any).onSlidingPush((data: any) => this.applySlidingPush(data)); } catch (_) { /* ignore */ }
 		if (!updateRegistered) {
 			updateRegistered = true;
@@ -135,6 +142,7 @@ class PuzzleSync implements IPuzzleSync {
 			console.log('[puzzlesync] installed');
 		}
 		this.installPushPullHooks();
+		this.installBounceFxHooks();
 	}
 
 	public tick(): void {
@@ -329,6 +337,131 @@ class PuzzleSync implements IPuzzleSync {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 1.76.x (bounce-puzzle FX relay): our ball's puzzle feedback (the bing on
+ * a block light-up, the final/fail switch jingle, the red bounceDenied
+ * fail-flash) plays LOCALLY only — same-instance peers see the state sync but
+ * hear nothing and miss the fail flash. Broadcast one compact event; receivers
+ * replay the sound/FX natively on their own copy (applyBounceFx). */
+	private broadcastBounceFx(mi: number, k: number): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen()) return;
+			if (typeof (m.connection as any).bounceFx !== 'function') return;
+			if (typeof mi !== 'number' || !mi) return;
+			const g: any = ig.game;
+			const map = (g && g.mapName) || '';
+			if (!map) return;
+			(m.connection as any).bounceFx(map, mi, k);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.76.x: peer's bounce-puzzle FX — replay the vanilla sound/effect on our
+ * local copy of the entity (k:1 block bing+hit FX, k:2 final jingle+bounceFinal,
+ * k:3 fail jingle, k:4 native resetGroup => the red bounceDenied flash on the
+ * end switch + every unlit block). Only same-map applies. */
+	private applyBounceFx(data: { map: string, mi: number, k: number }): void {
+		try {
+			if (!data || typeof data.mi !== 'number') return;
+			const g: any = ig.game;
+			if (!g || (g.mapName || '') !== data.map) return;
+			const entities = (g.entities as any[]) || [];
+			let ent: any = null;
+			for (const e of entities) {
+				if (e && !e._killed && e.mapId === data.mi) { ent = e; break; }
+			}
+			if (!ent) return;
+			const SH: any = (ig as any).SoundHelper;
+			const play = (snd: any) => {
+				try { if (snd && SH && typeof SH.playAtEntity === 'function') SH.playAtEntity(snd, ent); } catch (_) { /* ignore */ }
+			};
+			const spawnFx = (key: string) => {
+				try { if (ent.effects && typeof ent.effects.spawnOnTarget === 'function') ent.effects.spawnOnTarget(key, ent); } catch (_) { /* ignore */ }
+			};
+			const k = data.k | 0;
+			if (k === 1) {
+				play(ent.sounds && ent.sounds.bing);
+				spawnFx('bounceHit');
+			} else if (k === 2) {
+				play(ent.sounds && ent.sounds.hit);
+				spawnFx('bounceFinal');
+			} else if (k === 3) {
+				play(ent.sounds && ent.sounds.fail);
+			} else if (k === 4) {
+				const grp: any = (sc as any).bounceSwitchGroups;
+				const groupName = ent.group;
+				if (!grp || typeof grp.resetGroup !== 'function' || !groupName) return;
+				// Fail-flash spam guard: one replay per group per 400ms (state-sync
+				// echoes can trail the relay).
+				const now = Date.now();
+				if (now - (this.bounceResetFxAt.get(groupName) || 0) < 400) return;
+				this.bounceResetFxAt.set(groupName, now);
+				bounceFxReplayDepth++;
+				try { grp.resetGroup(groupName); } finally { bounceFxReplayDepth--; }
+			}
+		} catch (_) { /* cosmetic replay must never break the frame */ }
+	}
+
+	/** 1.76.x: wrap the vanilla bounce-puzzle hit/reset entry points so the
+ * shooter's client broadcasts the FX event (see broadcastBounceFx). ballHit on
+ * these entities only ever runs on the SHOOTER's client (remote balls are
+ * visual proxies that never trigger gimmicks), so there is no echo; the
+ * resetGroup wrap additionally skips rebroadcast while applying network state
+ * or replaying a relayed reset. */
+	private installBounceFxHooks(): void {
+		if (bounceFxHooksInstalled) return;
+		bounceFxHooksInstalled = true;
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const self = this;
+		try {
+			const E: any = (ig.ENTITY as any);
+			if (E.BounceBlock && E.BounceBlock.prototype && typeof E.BounceBlock.prototype.ballHit === 'function') {
+				const origBlockHit = E.BounceBlock.prototype.ballHit;
+				E.BounceBlock.prototype.ballHit = function (this: any) {
+					const was = this.blockState;
+					const r = origBlockHit.apply(this, arguments as any);
+					try { if (was === 0 && this.blockState === 1) self.broadcastBounceFx(this.mapId, 1); } catch (_) { /* ignore */ }
+					return r;
+				};
+			}
+			if (E.BounceSwitch && E.BounceSwitch.prototype && typeof E.BounceSwitch.prototype.ballHit === 'function') {
+				const origSwitchHit = E.BounceSwitch.prototype.ballHit;
+				E.BounceSwitch.prototype.ballHit = function (this: any) {
+					const wasOn = this.isOn;
+					const r = origSwitchHit.apply(this, arguments as any);
+					try {
+						if (!wasOn && this.isOn) {
+							// Vanilla: onSwitchHit returned true (final hit) vs false (fail).
+							// Re-derive from the group record it updated.
+							let isFinal = false;
+							try {
+								const grp: any = (sc as any).bounceSwitchGroups;
+								const g = grp && typeof grp.getGroup === 'function' ? grp.getGroup(this.group) : null;
+								isFinal = !!(g && g.finalHit && g.blockHitCount === g.blocks.length);
+							} catch (_) { /* ignore */ }
+							self.broadcastBounceFx(this.mapId, isFinal ? 2 : 3);
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				};
+			}
+			const grp: any = (sc as any).bounceSwitchGroups;
+			if (grp && typeof grp.resetGroup === 'function' && !grp._mpBounceFxWrapped) {
+				grp._mpBounceFxWrapped = true;
+				const origReset = grp.resetGroup.bind(grp);
+				grp.resetGroup = function (groupName: any) {
+					const r = origReset(groupName);
+					try {
+						if (!bounceFxReplayDepth && !self.applying && groupName) {
+							const g = typeof grp.getGroup === 'function' ? grp.getGroup(groupName) : null;
+							const sw = g && g.endSwitch;
+							if (sw && sw.mapId) self.broadcastBounceFx(sw.mapId, 4);
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[puzzlesync] bounce-FX hooks failed', e); }
+	}
 	/** 1.74.0: host receives a member's push — recompute the push direction from the
 	 * ball's flight velocity (charged balls) or the hit point (bomb blasts), then
 	 * trace + slide the local pillar natively (or flash "blocked" if a wall/fence is

@@ -982,8 +982,13 @@ export class SocketIoConnector implements IConnection {
 
 	/** The local player genuinely fell (water/hole/...): relay the ig.TERRAIN
 	 * number to the party — replicas suppress terrain-driven falls locally. */
-	public sendPlayerFall(terrain: number): void {
-		this.syncEmit('playerFall', { t: terrain });
+	public sendPlayerFall(terrain: number, pt?: { x: number, y: number, z: number }): void {
+		// 1.76.x: attach the owner's respawn anchor so the receiving mirror's
+		// beam flies toward the REAL revive point. Old servers drop the extra
+		// fields (payload rebuilt server-side) -> receivers fall back gracefully.
+		const pkt: any = { t: terrain };
+		if (pt && isFinite(pt.x) && isFinite(pt.y) && isFinite(pt.z)) { pkt.x = pt.x; pkt.y = pt.y; pkt.z = pt.z; }
+		this.syncEmit('playerFall', pkt);
 	}
 
 	/** A story-gated dungeon cutscene EventTrigger started locally: relay the
@@ -1137,6 +1142,18 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
+	/** 1.76.x (bounce-puzzle FX relay): see connection.ts. */
+	public bounceFx(map: string, mi: number, k: number): void {
+		this.syncEmit('bounceFx', { map, mi, k });
+	}
+	public onBounceFx(callback: (data: { map: string, mi: number, k: number }) => void): void {
+		this.socket.on('bounceFx', (data: any) => {
+			if (data && typeof data.map === 'string' && typeof data.mi === 'number' && typeof data.k === 'number') {
+				callback({ map: data.map, mi: data.mi, k: data.k });
+			}
+		});
+	}
+
 	/** 1.73.x: the host's enemy counter reached 0 (battle done). Members set the
 	 * counter vars locally + zero the visible counter so the relayed battle-done
 	 * cutscene completes (its WAIT_UNTIL_TRUE waits on the post variable). */
@@ -1176,6 +1193,15 @@ export class SocketIoConnector implements IConnection {
 
 	/** 1.73.x: the bomb-launching client streams its live bomb positions so peers
 	 * render a flying bomb copy (the bomb entity runs where it was triggered). */
+	/** 1.76.x (bomb handoff): see connection.ts — leaving the map mid-fuse. */
+	public bombHandoff(pkt: any): void {
+		this.syncEmit('bombHandoff', pkt);
+	}
+	public onBombHandoff(callback: (data: any) => void): void {
+		this.socket.on('bombHandoff', (data: any) => {
+			if (data && typeof data.i === 'number') callback(data);
+		});
+	}
 	public bombState(map: string, entries: any[]): void {
 		this.syncEmit('bombState', { map, entries });
 	}
@@ -1466,10 +1492,13 @@ export class SocketIoConnector implements IConnection {
 	}
 	/** A party teammate genuinely fell — replay the fall visual on their mirror
 	 * (see NetSync.replayPlayerFall). */
-	public onPlayerFall(callback: (from: string, terrain: number) => void): void {
+	public onPlayerFall(callback: (from: string, terrain: number, pt?: { x: number, y: number, z: number }) => void): void {
 		this.socket.on('playerFall', (data: any) => {
 			if (data && typeof data.from === 'string' && typeof data.t === 'number') {
-				callback(data.from, data.t);
+				// 1.76.x: owner's respawn anchor (absent from old senders/servers).
+				const pt = (typeof data.x === 'number' && typeof data.y === 'number' && typeof data.z === 'number')
+					? { x: data.x, y: data.y, z: data.z } : undefined;
+				callback(data.from, data.t, pt);
 			}
 		});
 	}
