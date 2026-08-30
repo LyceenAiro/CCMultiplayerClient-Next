@@ -41,6 +41,7 @@ import { StorySyncController, repairStuckQuestStages } from './sync/storySync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
 import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
+import { installBubbleSync, IBubbleSync } from './sync/bubbleSync';
 import { installCutsceneRelay, ICutsceneRelay } from './sync/cutsceneRelay';
 import { installTempPartyBotSupport, ITempPartyBotSupport } from './sync/tempPartyBot';
 import { saveUploadQueue } from './sync/saveUploadQueue';
@@ -57,7 +58,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '2.0.0';
+export const MP_VERSION = '2.2.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -299,6 +300,7 @@ export class Multiplayer {
 	 * once; the session handle is re-bound every connect (initializeListeners). */
 	public ghostChests?: IGhostChestsModule;
 	public puzzleSync?: IPuzzleSync;
+public bubbleSync?: IBubbleSync;
 	public cutsceneRelay?: ICutsceneRelay;
 	public tempPartyBots?: ITempPartyBotSupport;
 	/** netSync hook fired when this client is promoted to instance host (set in
@@ -444,7 +446,7 @@ export class Multiplayer {
 		// 1.75.x: the base is the room player count, not the party roster.
 		if (typeof result.hpScale === 'number' && isFinite(result.hpScale)) this.mpHpScale = result.hpScale;
 		try { if (this.netSync) this.netSync.setHpScale(this.mpHpScale); } catch (_) { /* ignore */ }
-		// 1.76.x: bosses carry their OWN HP increment (default 0.9 = +90% per extra
+		// 1.76.x: bosses carry their OWN HP increment (default 1.0 = +100% per extra
 		// member). Older servers omit hpScaleBoss — keep the client default.
 		if (typeof result.hpScaleBoss === 'number' && isFinite(result.hpScaleBoss)) this.mpHpScaleBoss = result.hpScaleBoss;
 		try { if (this.netSync) this.netSync.setHpScaleBoss(this.mpHpScaleBoss); } catch (_) { /* ignore */ }
@@ -480,11 +482,11 @@ export class Multiplayer {
 		// Perfect-guard compensation (server config): member-side grace window after
 		// a monster verdict lands — perfectGuardBaseMs + perfectGuardPingFactor x RTT.
 		// Older servers omit the fields — fall back to the documented defaults
-		// (30ms / 0.6). Each part disables at 0.
+		// (10ms / 0.6). Each part disables at 0.
 		try {
 			if (this.netSync) {
 				const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
-				this.netSync.setPerfectGuardComp(num(result.perfectGuardBaseMs, 30), num(result.perfectGuardPingFactor, 0.6));
+				this.netSync.setPerfectGuardComp(num(result.perfectGuardBaseMs, 10), num(result.perfectGuardPingFactor, 0.6));
 			}
 		} catch (_) { /* ignore */ }
 
@@ -1127,6 +1129,11 @@ export class Multiplayer {
 		// The module is process-once; install() re-binds the listener to this socket.
 		if (!this.puzzleSync) this.puzzleSync = installPuzzleSync(() => this);
 		try { this.puzzleSync.install(); } catch (e) { console.warn('[multiplayer] puzzle sync install failed', e); }
+		// 1.77.x: host-authoritative water bubble / ice disk / cooled coals sync.
+		// Same process-once shape as the puzzle sync: install() re-binds the
+		// listeners to the current socket every connect.
+		if (!this.bubbleSync) this.bubbleSync = installBubbleSync(() => this);
+		try { this.bubbleSync.install(); } catch (e) { console.warn('[multiplayer] bubble sync install failed', e); }
 		// Dungeon cutscene gather: a story-gated CUTSCENE EventTrigger (switch /
 		// console) that fires on one client is relayed to same-block teammates,
 		// who teleport to the triggerer's exact position and replay the event.
@@ -1781,10 +1788,10 @@ export class Multiplayer {
 	public mpHpScale = 0.7;
 	/** 1.76.x: server-provided per-extra-player max-HP fraction for BOSS
 	 * enemies only (handshakeResponse.hpScaleBoss, config monsterBossHpPerPlayer,
-	 * default 0.9 = +90% per extra player in the room). Consumed by netSync
+	 * default 1.0 = +100% per extra player in the room). Consumed by netSync
 	 * (setHpScaleBoss) — the HOST scales boss max/current HP at spawn by
 	 * `1 + hpScaleBoss * (playersInRoom - 1)`; regular enemies keep mpHpScale. */
-	public mpHpScaleBoss = 0.9;
+	public mpHpScaleBoss = 1.0;
 	/** Server-provided per-extra-player hit-count break threshold fraction
 	 * (handshakeResponse.breakScale, default 0.7 = +70% per extra player in the
 	 * room). Consumed by netSync (setBreakScale) — the HOST multiplies each HIT

@@ -119,6 +119,12 @@ interface IEnemySnap {
 	                  // (diePre/dieExplosion/MANUAL_COMBATANT_KILL) could never stage and
 	                  // the boss simply VANISHED on the member. Shipping the var name lets
 	                  // any puppet stage the cinematic (stamped in the h<=0 block-apply).
+	af?: number;     // ROUND 147: the host spawned this enemy WITH its native
+	                  // appear fade-in (spawnEntity 5th arg — spawner waves /
+	                  // combat-force spawns / SPAWN_ENEMY steps). TTL'd (~4s from
+	                  // the spawn stamp) so only the member's FIRST full snaps for
+	                  // the uid carry it; spawnTypedPuppet replays the materialize
+	                  // FX at creation instead of an instant pop-in.
 }
 
 /** ROUND 66: one active shield connection, serialized from the host enemy's
@@ -258,10 +264,10 @@ export class NetSync {
 	private _mpHpScale = 0.7;
 	/** 1.76.x: per-extra-party-member max-HP fraction for BOSS enemies only
 	 * (server handshake hpScaleBoss, config monsterBossHpPerPlayer, default
-	 * 0.9 = +90% HP per additional party member). Boss detection is
+	 * 1.0 = +100% HP per additional party member). Boss detection is
 	 * enemyType.boss — the same flag the engine's big HP bar and the manualKill
 	 * defeat chain key on. Regular enemies keep using _mpHpScale. */
-	private _mpHpScaleBoss = 0.9;
+	private _mpHpScaleBoss = 1.0;
 	/** Per-extra-member hit-count break threshold fraction from the server
 	 * handshake (default 0.7 = +70% per additional party member). Set via
 	 * setBreakScale(); the HOST multiplies each HIT tracker's target and
@@ -805,6 +811,12 @@ export class NetSync {
 		if (typeof (conn as any).onPlayerFx === 'function') {
 			(conn as any).onPlayerFx((data: any) => this.applyPlayerFx(data));
 		}
+		// 1.76.x (Faj'ro puzzles): a teammate's real ball bounced/died at a wall or
+		// charged an ElementPole torch — replay the ball FX on their puppet / run the
+		// same pole charge chain here so the torches light for everyone.
+		if (typeof (conn as any).onPuzzleFx === 'function') {
+			(conn as any).onPuzzleFx((data: any) => this.applyPuzzleFx(data));
+		}
 		// Round 21: a member reported a monster hit it detected LOCALLY. Bookkeeping only
 		// (their HP streams via playerState); the host must NOT re-apply any damage.
 		conn.onCombatResult((hit) => this.onCombatResult(hit));
@@ -983,6 +995,9 @@ export class NetSync {
 			// teammates replay [饥饿的叫声] / [舔树] floating windows on their puppets.
 			try { this.installEnemyArMsgHook(); } catch (e) { console.warn('[netsync] enemy AR hook failed', e); }
 			try { this.installPlayerFxHook(); } catch (e) { console.warn('[netsync] player FX hook failed', e); }
+		// 1.76.x (Faj'ro puzzles): relay the LOCAL player's ball bounce/wall/air FX
+		// (receivers hold collision-less puppets) and ElementPole torch hits.
+		try { this.installPuzzleFxHooks(); } catch (e) { console.warn('[netsync] puzzle FX hooks failed', e); }
 			// 1.75.x (boss attack camera sync): host FOCUS_CAMERA/RESET_CAMERA relay.
 			try { this.installEnemyCameraHook(); } catch (e) { console.warn('[netsync] enemy camera hook failed', e); }
 			// SUPPRESS the engine's own player-death flow while connected. Engine
@@ -3382,25 +3397,23 @@ export class NetSync {
 								// (`this.perfectGuard&&(c=0.1*(1+PERFECT_GUARD_WINDOW))`), so a
 								// positive window identifies the player guard shield.
 								if (ns) {
-									// ROUND 31 (item 1d): capture the guard-press timestamp on EVERY
-									// shield add, not just perfect-window (perfectWindowSec>0) presses.
-									// The old gate only wrote _mpGuardStartMs on PERFECT_GUARD presses
-									// and never refreshed it otherwise, so a STALE timestamp from an
-									// earlier press was streamed on the next guard — corrupting the
-									// host's perfect-guard judgment. perfectWindowSec>0 just upgrades
-									// the window; the press time must always be fresh.
-									ns._mpGuardStartMs = Date.now();
+									// 1.76.x (hold-guard perfect fix): ONLY a PERFECT_GUARD press
+									// (perfectWindowSec > 0 — the engine passes that ONLY from the
+									// perfectGuard:true action step, i.e. perfectGuardCooldown==0 at
+									// press) opens the streamed perfect window. The old "refresh
+									// _mpGuardStartMs on EVERY addShield" let plain GUARD presses
+									// (cooldown active) and even unrelated skill shields re-open the
+									// window, so the host judged PERFECT for ~0.15s after every
+									// press/hold flicker and a merely-guarding member read as immune.
+									// Vanilla rule restored: only a perfect-ELIGIBLE press can perfect.
 									if (typeof perfectWindowSec === 'number' && perfectWindowSec > 0) {
+										ns._mpGuardStartMs = Date.now();
 										ns._mpGuardWindowSec = perfectWindowSec;
-									}
-									// ROUND 33 (item 1): a guard press the engine routed to the
-									// NON-perfect GUARD action (perfectGuardCooldown>0) calls addShield
-									// with NO window, so _mpGuardWindowSec was never (re)set for that
-									// press and gstSend computed 0 -> the host could never judge the
-									// press PERFECT. Derive the window from the player's LIVE modifier
-									// whenever the captured one is absent — the engine's own formula
-									// (ADD_PLAYER_SHIELD.run: 0.1*(1+PERFECT_GUARD_WINDOW)).
-									if (!(ns._mpGuardWindowSec > 0)) {
+									} else if (!(ns._mpGuardWindowSec > 0)) {
+										// Belt-and-suspenders for a client where PERFECT_GUARD never
+										// ran yet (guard re-entered from a charge): derive the window
+										// LENGTH for the sender's fallback math. _mpGuardStartMs stays
+										// 0, so no window is streamed until a real perfect press.
 										try {
 											if (this.params && typeof this.params.getModifier === 'function') {
 												const gw = Number(this.params.getModifier('PERFECT_GUARD_WINDOW')) || 0;
@@ -3701,6 +3714,19 @@ export class NetSync {
 								&& !(settings && settings.boostable)
 								&& (r.mapId || 0) === 0) {
 								r._mpCutsceneSpawned = true;
+							}
+							// ROUND 147 (encounter/wave fade-in relay): an enemy spawned WITH
+							// its native appear effect (spawnEntity's 5th arg — EnemySpawner
+							// waves, EnemySpawnerForce combat spawns, SPAWN_ENEMY steps) fades in
+							// on THIS client only; members create their puppet from the state
+							// stream without it (instant pop-in). Stamp the spawn time so
+							// encodeEnemy can ship a TTL'd `af` flag — the member replays the
+							// materialize FX when it creates the puppet. Mod spawns pass
+							// skipHook (typed puppets, handoff respawns) and never re-stamp.
+							if (r && r instanceof Enemy && rest[0]
+								&& !r._mpMirror && !r._mpPuppet
+								&& !(settings && settings.skipHook)) {
+								r._mpAppearFx = Date.now();
 							}
 						} catch (_) { /* never break a spawn */ }
 						return r;
@@ -4630,7 +4656,14 @@ export class NetSync {
 			// that arrived within 50ms of a guard press — plus the up-to-100ms stream
 			// cadence — judged PERFECT, making the window feel >1s. Now: no remaining
 			// window -> not perfect, full stop; a real press gets the small transport grace.
-			const winLeft = gstRemain > 0 ? gstRemain - elapsedSinceSend + GRACE : 0;
+				const winLeft0 = gstRemain > 0 ? gstRemain - elapsedSinceSend + GRACE : 0;
+				// 1.76.x (hold-guard immunity): HARD CAP at the engine's own physical
+				// perfect window (0.1s x (1+PERFECT_GUARD_WINDOW)) plus the transport
+				// grace. A member can never legitimately hold more window than that, so
+				// no stale, re-armed or inflated streamed gst can judge PERFECT beyond
+				// vanilla physics — held-guard perfect spam is impossible by construction.
+				const physWin = 0.1 * (1 + (typeof mirror._mpGw === 'number' ? mirror._mpGw : 0));
+				const winLeft = Math.min(winLeft0, physWin + GRACE);
 			const gm = typeof mirror._mpGm === 'number' ? mirror._mpGm : 0;
 			// ROUND 65 (guard direction fix): `guarding` alone is not enough — the native
 			// engine gates a successful guard behind TWO checks (game.compiled.js
@@ -4878,7 +4911,11 @@ export class NetSync {
 				// skipped entirely and the victim takes the whole unguarded hit).
 				const atkDf = (hitProps && typeof hitProps.damageFactor === 'number' && hitProps.damageFactor > 0)
 					? hitProps.damageFactor : 1;
-				shieldDmg = Math.max(0, Math.round(atkDf * Math.pow(a / def, 1.5)));
+				// 1.76.x: 3-decimal float, NOT an integer — the engine's bar drain is a
+				// FLOAT accumulator (damageShield adds ratio^1.5/7 per hit). The old
+				// integer rounding zeroed the drain against much weaker enemies, so the
+				// guard bar could NEVER break (vanilla breaks it after enough hits).
+				shieldDmg = Math.max(0, Math.round(atkDf * Math.pow(a / def, 1.5) * 1000) / 1000);
 				fullForBreak = baseAgainstMember;
 			} else {
 				// No guard: real-defense damage + knockback.
@@ -4908,6 +4945,21 @@ export class NetSync {
 					'final=' + finalDamage, 'bar=' + shieldDmg, 'full=' + fullForBreak,
 					'eng=' + engineDamage,
 					'perfect=' + (perfect ? 1 : 0), 'regular=' + (regular ? 1 : 0));
+			} catch (_) { /* diagnostic only */ }
+			// 1.76.x (hold-guard immunity diagnostic): ALWAYS-ON one-line verdict trace
+			// (throttled 1/200ms) — no __mpSfxDebug needed. Combined with the member-side
+			// [mpguard] line, one guarded hit pinpoints the exact branch.
+			try {
+				const nowT = Date.now();
+				if (!(this as any)._mpGuardTraceAt || nowT - (this as any)._mpGuardTraceAt > 200) {
+					(this as any)._mpGuardTraceAt = nowT;
+					console.log('[mpguard][host] for=' + mirror.name
+						+ ' gd=' + (guarding ? 1 : 0) + ' holds=' + (guardHolds ? 1 : 0)
+						+ ' gst=' + (Math.round(gstRemain * 1000) / 1000)
+						+ ' win=' + (Math.round(winLeft * 1000) / 1000)
+						+ ' perfect=' + (perfect ? 1 : 0) + ' regular=' + (regular ? 1 : 0)
+						+ ' dmg=' + finalDamage + ' bar=' + shieldDmg + ' full=' + fullForBreak);
+				}
 			} catch (_) { /* diagnostic only */ }
 		} catch (_) {
 			// Any failure: forward the engine's own number (fail-open toward damage).
@@ -5321,12 +5373,14 @@ export class NetSync {
 	 * dropped from the projectiles map immediately so nothing re-arms or
 	 * re-moves the detonating ball. Idempotent per entity. */
 	private _mpBallDetoQueue: Array<{ e: any, at: number }> = [];
-	private detonateBallPuppet(e: any, key?: string): void {
+	private detonateBallPuppet(e: any, key?: string, burst = true): void {
 		try {
 			if (!e || e._killed || e._mpBallDetonated) return;
 			e._mpBallDetonated = true;
 			try { if (e.animState) e.animState.alpha = 0; } catch (_) { /* ignore */ }
-			this.burstBallPuppet(e);
+			// 1.76.x: burst=false when a relayed wall/air FX (puzzleFx 'ball') already
+			// played the correct angled effect at the exact impact point.
+			if (burst) this.burstBallPuppet(e);
 			this._mpBallDetoQueue.push({ e, at: Date.now() });
 			if (key) delete this.projectiles[key];
 			else {
@@ -7379,6 +7433,23 @@ export class NetSync {
 			if (this._mpDead) { D('dead'); return; }                            // corpse takes no hits
 			const p: any = ig.game.playerEntity;
 			if (!p || !p.params || p._killed) { D('noplayer'); return; }
+			// 1.76.x (hold-guard immunity diagnostic): ALWAYS-ON one-line trace of every
+			// monster verdict addressed to OUR OWN player (throttled 1/200ms). Runs
+			// BEFORE every drop gate (i-frames / lag-compensation) so a swallowed
+			// verdict is still visible. Paired with the host's [mpguard] line, one
+			// guarded hit shows the exact branch.
+			try {
+				const nowT = Date.now();
+				if (!(this as any)._mpGuardTraceAt || nowT - (this as any)._mpGuardTraceAt > 200) {
+					(this as any)._mpGuardTraceAt = nowT;
+					console.log('[mpguard][member] dmg=' + Math.max(0, Math.round(hit.damage))
+						+ ' perfect=' + (hit.perfect ? 1 : 0) + ' regular=' + (hit.regular ? 1 : 0)
+						+ ' iframes=' + (Math.round((p.invincibleTimer || 0) * 100) / 100)
+						+ ' guardAnim=' + (typeof p.currentAnim === 'string' && p.currentAnim === 'guard' ? 1 : 0)
+						+ ' bar=' + (typeof hit.shieldDmg === 'number' ? hit.shieldDmg : -1)
+						+ ' full=' + (typeof hit.full === 'number' ? hit.full : -1));
+				}
+			} catch (_) { /* diagnostic only */ }
 			if (p.invincibleTimer && p.invincibleTimer > 0) { D('iframes', 't=' + p.invincibleTimer); return; } // i-frames
 		// LAG COMPENSATION (monster hits): the host judged this hit against our MIRROR,
 		// whose position trails our real player by roughly one RTT (stream cadence +
@@ -7486,7 +7557,13 @@ export class NetSync {
 			if (perfect) {
 				try {
 					try { (ig as any).vars.add('playerVar.input.perfectShield', 1); } catch (_) { /* ignore */ }
-					try { if (typeof p.perfectGuardCooldown === 'number') p.perfectGuardCooldown = 0; } catch (_) { /* ignore */ }
+					// 1.76.x: vanilla rule — a landed perfect resets the cooldown only with
+					// the PERFECT_GUARD_RESET skill (see _mpPgApplyPerfect for the why).
+					try {
+						const prMod = (p.params && typeof p.params.getModifier === 'function')
+							? (Number(p.params.getModifier('PERFECT_GUARD_RESET')) || 0) : 0;
+						if (prMod >= 1 && typeof p.perfectGuardCooldown === 'number') p.perfectGuardCooldown = 0;
+					} catch (_) { /* ignore */ }
 				} catch (_) { /* FX is cosmetic */ }
 				p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
 				// ROUND 32 (items 2a + 3b): the perfect-guard FX + sound now come from the
@@ -7562,7 +7639,10 @@ export class NetSync {
 					} catch (_) { /* ignore */ }
 					// ROUND 31 (item 1a): pass SHIELD_RESULT.REGULAR so a blocked hit shows the
 					// silver-shield GUARD number (the old hardcoded NONE rendered it plain).
-					if (dmg > 0) this.spawnHitNumberOn(p, dmg, !!hit.critical, 1 /* SHIELD_RESULT.REGULAR */);
+					// 1.76.x: show it at 0 chip too — vs a much weaker enemy the engine's guard
+					// formula legitimately rounds to 0, and the host's OWN native guard pops a
+					// "0" number (the member used to see nothing and read as immune).
+					this.spawnHitNumberOn(p, dmg, !!hit.critical, 1 /* SHIELD_RESULT.REGULAR */);
 					return;
 				}
 			}
@@ -9197,6 +9277,312 @@ export class NetSync {
 		} catch (_) { /* never break the frame */ }
 	}
 
+	/** 1.76.x (Faj'ro puzzles, send side): the temple puzzles run LOCAL in vanilla —
+	 * a thrown ball's bounce / wall-death / air-expiry effects and the whole
+	 * ElementPole torch chain (ballHit -> sc.ElementPoleGroups -> ElementPoleDest
+	 * turnOn + map var) only execute on the THROWER's client, because every other
+	 * player holds a collision-less position puppet of the ball. Wrap the three
+	 * engine hooks so the LOCAL player's own streamed balls relay their FX and the
+	 * pole charge chain; receivers replay via applyPuzzleFx. Fake balls injected by
+	 * applyPuzzleFx carry _mpPoleFake so the wraps never re-relay a replay. */
+	private installPuzzleFxHooks(): void {
+		try {
+			const BallP: any = (ig.ENTITY as any).Ball && (ig.ENTITY as any).Ball.prototype;
+			if (BallP && typeof BallP.onBounce === 'function' && !BallP._mpBallFxBounceWrapped) {
+				BallP._mpBallFxBounceWrapped = true;
+				const origBounce = BallP.onBounce;
+				BallP.onBounce = function (this: any, a: any, b: any) {
+					try {
+						const m = (window as any).__mpMain;
+						const ns: any = m && m.netSync;
+						if (ns && typeof ns.isOwnStreamedBall === 'function' && ns.isOwnStreamedBall(this)) {
+							ns.relayBallWallFx(this, 'b', a && a.x, a && a.y, b && b.blockDir);
+						}
+					} catch (_) { /* the FX relay must never break the bounce */ }
+					return origBounce.apply(this, arguments as any);
+				};
+			}
+			if (BallP && typeof BallP.onProjectileKill === 'function' && !BallP._mpBallFxKillWrapped) {
+				BallP._mpBallFxKillWrapped = true;
+				const origKill = BallP.onProjectileKill;
+				BallP.onProjectileKill = function (this: any, type: any, a: any, c: any) {
+					try {
+						const KT: any = (ig as any).PROJECTILE_KILL_TYPE;
+						const m = (window as any).__mpMain;
+						const ns: any = m && m.netSync;
+						if (ns && typeof ns.isOwnStreamedBall === 'function' && ns.isOwnStreamedBall(this)) {
+							if (type === KT.WALL) {
+								ns.relayBallWallFx(this, 'w', a && a.x, a && a.y, c && c.blockDir);
+							} else if (type === KT.AIR) {
+								const ctr: any = (typeof this.getCenter === 'function') ? this.getCenter() : (this.coll && this.coll.pos);
+								ns.relayBallWallFx(this, 'a', ctr && ctr.x, ctr && ctr.y, null);
+							}
+							// OTHER (destroy, e.g. enemy hit) is skipped: enemy hits already
+							// relay their own impact FX via the combatHit/enemyDamage path.
+						}
+					} catch (_) { /* the FX relay must never break the kill */ }
+					return origKill.apply(this, arguments as any);
+				};
+			}
+		} catch (e) { console.warn('[netsync] ball FX hooks failed', e); }
+		try {
+			const PoleP: any = (ig.ENTITY as any).ElementPole && (ig.ENTITY as any).ElementPole.prototype;
+			if (PoleP && typeof PoleP.ballHit === 'function' && !PoleP._mpPoleHitWrapped) {
+				PoleP._mpPoleHitWrapped = true;
+				const origHit = PoleP.ballHit;
+				PoleP.ballHit = function (this: any, c: any) {
+					const r = origHit.apply(this, arguments as any);
+					try {
+						if (c && !c._mpPoleFake) {
+							const m = (window as any).__mpMain;
+							const ns: any = m && m.netSync;
+							if (ns && typeof ns.relayPoleHit === 'function') ns.relayPoleHit(this, c);
+						}
+					} catch (_) { /* the relay must never break the puzzle */ }
+					return r;
+				};
+			}
+			const Groups: any = (sc as any).ElementPoleGroups;
+			if (Groups && typeof Groups.onCancelCheck === 'function' && !Groups._mpPoleCancelWrapped) {
+				Groups._mpPoleCancelWrapped = true;
+				const origCheck = Groups.onCancelCheck;
+				Groups.onCancelCheck = function (this: any, a: any) {
+					// the group's live ball BEFORE the original resets it — the relay is
+					// only valid when that ball was OUR OWN real throw (a receiver's group
+					// holds a fake ball whose _killed we flipped remotely).
+					let liveBall: any = null;
+					try {
+						const g = (Groups.groups && a && a.group) ? Groups.groups[a.group] : null;
+						liveBall = g ? g.currentBall : null;
+					} catch (_) { liveBall = null; }
+					const r = origCheck.apply(this, arguments as any);
+					try {
+						if (r && liveBall && !liveBall._mpPoleFake) {
+							const m = (window as any).__mpMain;
+							const ns: any = m && m.netSync;
+							if (ns && typeof ns.relayPoleCancel === 'function') ns.relayPoleCancel(liveBall, a && a.group);
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[netsync] pole hooks failed', e); }
+	}
+
+	/** 1.76.x (Faj'ro puzzles): is this ball one of the LOCAL player's own
+	 * position-streamed throws (the exact sendPlayerBallBlock criteria)? Only
+	 * those have collision-less puppets on receivers and thus need FX relays. */
+	public isOwnStreamedBall(e: any): boolean {
+		try {
+			if (!e || e._killed || !e.coll) return false;
+			const Ball = (ig.ENTITY as any).Ball;
+			if (!Ball || !(e instanceof Ball)) return false;
+			if (e.party !== (sc as any).COMBATANT_PARTY.PLAYER) return false;
+			if (e._mpPlayerBall || e._mpProj || e._mpMirror) return false;
+			const sm: any = (sc as any).map;
+			if (!(sm && typeof sm.isDungeon === 'function' && sm.isDungeon())) return false;
+			const me: any = (ig.game as any).playerEntity;
+			if (!me) return false;
+			let root: any = null;
+			try { root = e.getCombatantRoot ? e.getCombatantRoot() : (e.combatant || null); } catch (_) { root = e.combatant || null; }
+			if (root !== me) return false;
+			const proxies = me.proxies || {};
+			for (const pn in proxies) {
+				const p: any = proxies[pn];
+				if (p && p.data && p.data.animation && p.data.animation === e.animSheet) return true;
+			}
+			return false;
+		} catch (_) { return false; }
+	}
+
+	/** 1.76.x (Faj'ro puzzles): relay one ball FX moment ('b' bounce, 'w' wall
+	 * death, 'a' air expiry) at the thrower's exact impact point + wall angle. */
+	public relayBallWallFx(e: any, t: 'b' | 'w' | 'a', x?: number, y?: number, blockDir?: any): void {
+		try {
+			if (!this.playerFxRelayAllowed()) return;
+			if (typeof x !== 'number' || !isFinite(x) || typeof y !== 'number' || !isFinite(y)) return;
+			// destroy/bounce-proxy balls spawn a proxy ENTITY at death instead of a
+			// plain effect — that proxy is not replayed by this channel, so relaying
+			// would double nothing but confuse the puppet detonation. Skip them.
+			if (e.destroyProxySrc || e.bounceProxySrc) return;
+			const conn: any = this.main.connection;
+			if (!conn || (typeof conn.isOpen === 'function' && !conn.isOpen()) || typeof conn.sendPuzzleFx !== 'function') return;
+			const z = (e.coll && e.coll.pos && typeof e.coll.pos.z === 'number') ? e.coll.pos.z : 0;
+			let ang: number | undefined;
+			if (blockDir && typeof (Vec2 as any).clockangle === 'function') {
+				const a = (Vec2 as any).clockangle(blockDir);
+				if (typeof a === 'number' && isFinite(a)) ang = a;
+			}
+			conn.sendPuzzleFx({ pl: this.main.name, k: 'ball', t, i: e.uid, x, y, z, ang });
+		} catch (_) { /* visual only */ }
+	}
+
+	/** 1.76.x (Faj'ro puzzles): the LOCAL player's (or one of their party bots')
+	 * real ball just hit an ElementPole torch — relay the pole + element + ball
+	 * uid so receivers run the identical ballHit chain (charge FX, group
+	 * bookkeeping, dest turnOn + map var, wrong-element hit flash). */
+	public relayPoleHit(pole: any, ball: any): void {
+		try {
+			if (!this.playerFxRelayAllowed()) return;
+			if (!pole || !ball) return;
+			const me: any = (ig.game as any).playerEntity;
+			if (!me) return;
+			let root: any = null;
+			try { root = ball.getCombatantRoot ? ball.getCombatantRoot() : (ball.combatant || null); } catch (_) { root = ball.combatant || null; }
+			if (root !== me) {
+				// a party bot's throw — the leader relays those too (bots are local
+				// followers with real balls on the leader's client)
+				const botOk = !!(this.main && typeof (this.main as any).ownedBotNameOf === 'function'
+					&& (this.main as any).ownedBotNameOf(root));
+				if (!botOk) return;
+			}
+			const mapId = pole.mapId;
+			if (typeof mapId !== 'number' || !isFinite(mapId)) return;
+			let el = 0;
+			try { el = (typeof ball.getElement === 'function' && ball.getElement()) || 0; } catch (_) { el = 0; }
+			const conn: any = this.main.connection;
+			if (!conn || (typeof conn.isOpen === 'function' && !conn.isOpen()) || typeof conn.sendPuzzleFx !== 'function') return;
+			conn.sendPuzzleFx({ pl: this.main.name, k: 'pole', m: mapId, el, bi: ball.uid || 0 });
+		} catch (_) { /* never break the puzzle */ }
+	}
+
+	/** 1.76.x (Faj'ro puzzles): the thrower's real ball died with a group still
+	 * mid-charge — ElementPoleGroups.onCancelCheck just reset the group here.
+	 * Receivers flip their fake group ball to _killed and their own dest.update
+	 * runs the identical reset on the next frame. */
+	public relayPoleCancel(liveBall: any, group: any): void {
+		try {
+			if (!this.playerFxRelayAllowed()) return;
+			if (!liveBall || typeof group !== 'string' || !group) return;
+			const me: any = (ig.game as any).playerEntity;
+			if (!me) return;
+			let root: any = null;
+			try { root = liveBall.getCombatantRoot ? liveBall.getCombatantRoot() : (liveBall.combatant || null); } catch (_) { root = liveBall.combatant || null; }
+			if (root !== me) {
+				const botOk = !!(this.main && typeof (this.main as any).ownedBotNameOf === 'function'
+					&& (this.main as any).ownedBotNameOf(root));
+				if (!botOk) return;
+			}
+			const conn: any = this.main.connection;
+			if (!conn || (typeof conn.isOpen === 'function' && !conn.isOpen()) || typeof conn.sendPuzzleFx !== 'function') return;
+			conn.sendPuzzleFx({ pl: this.main.name, k: 'poleCancel', g: group });
+		} catch (_) { /* never break the puzzle */ }
+	}
+
+	/** 1.76.x (Faj'ro puzzles, receive side). Kinds:
+	 *  - pole: resolve the torch by mapId and run pole.ballHit(fakeBall) — the
+	 *    fake carries the sender's element and a stable identity per (player,
+	 *    ball uid), mirroring the sender's real-ball object identity so the
+	 *    group's currentBall bookkeeping cancels/recharges exactly like vanilla.
+	 *  - poleCancel: flip the group's current (fake) ball to _killed; the local
+	 *    dest.update-driven onCancelCheck then resets the group identically.
+	 *  - ball: replay ballBounce / ballWallKill / ballAirKill on the streamed
+	 *    puppet at the thrower's exact impact point and wall angle; 'w'/'a' also
+	 *    land + detonate the puppet right there (silent — the relayed FX already
+	 *    played) instead of the old 180ms-late grace burst past the wall. */
+	private _mpPoleFakeBalls: any = {};
+	private _mpPoleFakeMap = '';
+	private applyPuzzleFx(data: any): void {
+		try {
+			if (!data || typeof data.pl !== 'string') return;
+			if (data.pl === this.main.name) return;
+			if (data.k === 'pole') {
+				const PoleCtor: any = (ig.ENTITY as any).ElementPole;
+				const game: any = ig.game;
+				const pole: any = (game && typeof game.getEntityByMapId === 'function' && typeof data.m === 'number')
+					? game.getEntityByMapId(data.m) : null;
+				if (!pole || !PoleCtor || !(pole instanceof PoleCtor) || pole._killed) return;
+				if (this._mpPoleFakeMap !== this.mapName) {
+					this._mpPoleFakeMap = this.mapName;
+					this._mpPoleFakeBalls = {};
+				}
+				const el = (typeof data.el === 'number' && data.el >= 0 && data.el <= 4) ? Math.floor(data.el) : 0;
+				const fkey = data.pl + '|' + (typeof data.bi === 'number' ? data.bi : 0);
+				let fake: any = this._mpPoleFakeBalls[fkey];
+				if (!fake) {
+					fake = {
+						_mpPoleFake: true, _killed: false, isBall: true, _mpFakeEl: 0,
+						party: (sc as any).COMBATANT_PARTY.PLAYER, timer: 1,
+						// 1.76.x: a real ball-sized coll.size is REQUIRED — a LONG
+						// (height-spanning) pole's ballHit reads it through
+						// ig.CollTools.getCenterXYAlignedPos (b.size.x); without it that
+						// call throws and the replay dies silently BEFORE chargeElement,
+						// so height-difference torches never lit on receivers (SHORT
+						// poles skip that block entirely, which is why they synced).
+						coll: { pos: { x: 0, y: 0, z: 0 }, size: { x: 8, y: 8, z: 8 } }, // Constants.BALL_SIZE / BALL_Z_HEIGHT
+						getElement: function (): number { return this._mpFakeEl | 0; },
+						getHitCenter: function (): any { return this._mpFakeCtr || { x: 0, y: 0, z: 0 }; },
+						cleanDirection: function (): void { /* puppet balls are stream-driven */ },
+						grabPoint: function (): void { /* no curl visuals on puppets */ },
+						addIgnore: function (): void { /* nothing to ignore */ },
+						resetTime: function (): void { /* the stream owns the puppet timer */ },
+					};
+					this._mpPoleFakeBalls[fkey] = fake;
+				}
+				fake._mpFakeEl = el;
+				fake._killed = false; // same uid again = a fresh throw after entity-id recycling
+				try {
+					const pc: any = (typeof pole.getCenter === 'function') ? pole.getCenter() : (pole.coll && pole.coll.pos);
+					if (pc) {
+						fake._mpFakeCtr = { x: pc.x, y: pc.y, z: pc.z };
+						fake.coll.pos.x = pc.x; fake.coll.pos.y = pc.y; fake.coll.pos.z = pc.z;
+					}
+					// 1.76.x: a LONG pole picks the charge FX direction (Up/Down ring)
+					// and its grab end from the ball's z vs the pole's mid height. Borrow
+					// the streamed puppet's live z (~the sender's ball z at impact) so the
+					// receiver picks the same direction; fall back to the pole center
+					// (Up) when the puppet is already gone. _mpFakeCtr keeps the pole
+					// center so the wrong-element flash stays anchored on the pole.
+					const pup: any = this.projectiles['pb_' + data.pl + '_' + (typeof data.bi === 'number' ? data.bi : 0)];
+					const pz: any = pup && !pup._killed && pup.coll && pup.coll.pos && pup.coll.pos.z;
+					if (typeof pz === 'number' && isFinite(pz)) fake.coll.pos.z = pz;
+				} catch (_) { /* keep the old center */ }
+				pole.ballHit(fake);
+				return;
+			}
+			if (data.k === 'poleCancel') {
+				const Groups: any = (sc as any).ElementPoleGroups;
+				const g = (Groups && Groups.groups && typeof data.g === 'string') ? Groups.groups[data.g] : null;
+				if (g && g.currentBall) g.currentBall._killed = true;
+				return;
+			}
+			if (data.k === 'ball') {
+				const t = data.t;
+				if (t !== 'b' && t !== 'w' && t !== 'a') return;
+				const pkey = 'pb_' + data.pl + '_' + data.i;
+				const e: any = this.projectiles[pkey];
+				if (!e || e._killed || !e.effects || typeof e.effects.spawnFixed !== 'function') return;
+				const x = Number(data.x), y = Number(data.y), z = Number(data.z);
+				if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;
+				const ek = e.effectKeys || {};
+				const fxKey = t === 'b' ? (ek.bounce || 'ballBounce') : (t === 'w' ? (ek.wall || 'ballWallKill') : (ek.air || 'ballAirKill'));
+				try {
+					if (e.effects.hasEffect && !e.effects.hasEffect(fxKey)) return;
+					const opts: any = (t !== 'a' && typeof data.ang === 'number' && isFinite(data.ang))
+						? { angle: data.ang } : undefined;
+					e.effects.spawnFixed(fxKey, x, y, z, null, opts);
+				} catch (_) { /* visual only */ }
+				if (t === 'b') {
+					// snap on the next streamed block so the puppet visibly rebounds
+					// off the wall instead of phasing past it between blocks
+					e._mpSnapNext = true;
+				} else {
+					// final death: land the puppet ON the impact point, two-stage kill
+					// WITHOUT the default ballAirKill burst (the relayed FX played)
+					try {
+						const cp = e.coll && e.coll.pos;
+						if (cp) {
+							if ('xProtected' in cp) { cp.xProtected = x; cp.yProtected = y; cp.zProtected = z; }
+							else { cp.x = x; cp.y = y; cp.z = z; }
+						}
+					} catch (_) { /* ignore */ }
+					this.detonateBallPuppet(e, pkey, false);
+				}
+				return;
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
 	/** 1.75.x (boss attack camera sync): wrap FOCUS_CAMERA / RESET_CAMERA action
 	 * steps so the host relays them for its real enemies. Member puppets never run
 	 * actions, so the relay is one-way and cannot echo. */
@@ -10507,7 +10893,12 @@ export class NetSync {
 			const p: any = {};
 			if (params && typeof params === 'object') {
 				const keep = ['offset', 'rotOffset', 'align', 'angle', 'flipX', 'rotateFace',
-					'flipLeftFace', 'duration', 'group', 'noMultiGroup', 'partName', 'fixPos'];
+					'flipLeftFace', 'duration', 'group', 'noMultiGroup', 'partName', 'fixPos',
+					// ROUND 148: spriteFilter selects WHICH sprite of a multi-sprite enemy the
+					// effect applies to (the Pada Moth's wall-cocoon is sprite 1 — its TurnOn
+					// mothGlow white flash COPY_SPRITEs sprite 1; stripped here, the member's
+					// replay copied the invisible flying-moth sprite 0 and showed nothing).
+					'spriteFilter'];
 				for (const k of keep) if (params[k] !== undefined) p[k] = params[k];
 			}
 			const conn: any = this.main.connection;
@@ -11874,7 +12265,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	// The HOST scales every enemy it spawns (n = players currently in the room):
 	//   maxHp'     = maxHp * (1 + hpScale * (n - 1)) — currentHp likewise
 	//                (1.76.x: BOSS enemies — enemyType.boss — use hpScaleBoss, a
-	//                separate increment, config monsterBossHpPerPlayer default 0.9)
+	//                separate increment, config monsterBossHpPerPlayer default 1.0)
 	//   stat'      = stat * (1 + statScale * (n - 1)) for attack/defense/focus
 	//   resistance R = 1 - elemFactor; R' = (R + flat*(n-1)) * (positive ? 1+pct*(n-1)
 	//   : 1) — the percentage boost never touches a weakness.
@@ -11898,7 +12289,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * Both clamp to >= 0 (a negative would disable-by-meaning; the server already
 	 * clamps too — this is the client-side belt-and-braces). */
 	public setPerfectGuardComp(baseMs: number, pingFactor: number): void {
-		this._mpPgBaseMs = (typeof baseMs === 'number' && isFinite(baseMs)) ? Math.max(0, baseMs) : 30;
+		this._mpPgBaseMs = (typeof baseMs === 'number' && isFinite(baseMs)) ? Math.max(0, baseMs) : 10;
 		this._mpPgPingF = (typeof pingFactor === 'number' && isFinite(pingFactor)) ? Math.max(0, pingFactor) : 0.6;
 		try { console.log('[netsync] perfect-guard comp: base=' + this._mpPgBaseMs + 'ms pingF=' + this._mpPgPingF); } catch (_) { /* ignore */ }
 	}
@@ -11926,11 +12317,20 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	private _mpPgLocalPerfectActive(p: any): boolean {
 		try {
 			const list = p && p.shieldsConnections;
-			if (!list || !list.length) return false;
-			for (let i = list.length; i--;) {
-				const c = list[i];
-				if (c && typeof c.isPerfect === 'function' && c.isPerfect()) return true;
+			if (list && list.length) {
+				for (let i = list.length; i--;) {
+					const c = list[i];
+					if (c && typeof c.isPerfect === 'function' && c.isPerfect()) return true;
+				}
 			}
+			// 1.76.x (hold-guard perfect fix): frame-safe fallback — a genuine perfect
+			// press may not have attached its shield connection yet when the guard
+			// edge fires. _mpGuardStartMs is ONLY written by PERFECT_GUARD presses
+			// (see the addShield wrap), so a fresh timestamp within the window is the
+			// same vanilla judgement. Plain GUARD presses and skill shields never
+			// refresh it, so merely HOLDING guard can never satisfy this check.
+			if (this._mpGuardStartMs > 0 && this._mpGuardWindowSec > 0
+				&& Date.now() - this._mpGuardStartMs < this._mpGuardWindowSec * 1000) return true;
 		} catch (_) { /* ignore */ }
 		return false;
 	}
@@ -11945,7 +12345,15 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	private _mpPgApplyPerfect(p: any, hit: any, atkType: number, auid?: number): void {
 		try { (ig as any).vars.add('playerVar.input.perfectShield', 1); } catch (_) { /* ignore */ }
 		try { (sc as any).stats.addMap('combat', 'perfectShield', 1); } catch (_) { /* ignore */ }
-		try { if (typeof p.perfectGuardCooldown === 'number') p.perfectGuardCooldown = 0; } catch (_) { /* ignore */ }
+		// 1.76.x: reset the perfect cooldown ONLY with the vanilla PERFECT_GUARD_RESET
+		// skill (the engine's own rule on a landed perfect). The old unconditional
+		// reset re-armed PERFECT_GUARD for every following press, feeding the
+		// hold-guard-immunity loop.
+		try {
+			const prMod = (p.params && typeof p.params.getModifier === 'function')
+				? (Number(p.params.getModifier('PERFECT_GUARD_RESET')) || 0) : 0;
+			if (prMod >= 1 && typeof p.perfectGuardCooldown === 'number') p.perfectGuardCooldown = 0;
+		} catch (_) { /* ignore */ }
 		p.invincibleTimer = Math.max(p.invincibleTimer || 0, 0.4);
 		try {
 			const scAny: any = sc as any;
@@ -11979,6 +12387,15 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
 			const p: any = (ig as any).game && (ig as any).game.playerEntity;
 			if (!p || !p.params || p._killed || this._mpDead) { this._mpPgPending.length = 0; return; }
+			// 1.76.x (hold-guard perfect fix): convert ONLY when the LOCAL player's
+			// own vanilla perfect window is genuinely open at this moment (a real
+			// just-in-time press). The old code converted on ANY guard-state rising
+			// edge — and handleGuard flips a.guarding false on every frame the guard
+			// is momentarily impossible (shield bar broken, action blocked, ...), so
+			// a member merely HOLDING guard converted every deferred verdict into a
+			// PERFECT guard and took no damage at all. Without an open local window
+			// the pending stays and expires into normal damage (guard -> chip).
+			if (!this._mpPgLocalPerfectActive(p)) return;
 			const now = Date.now();
 			let idx = -1;
 			for (let i = this._mpPgPending.length; i--;) {
@@ -12058,7 +12475,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	/** Store the server-provided per-extra-member BOSS-only HP fraction
 	 * (clamped [0, 10]). */
 	public setHpScaleBoss(f: number): void {
-		let v = (typeof f === 'number' && isFinite(f)) ? f : 0.9;
+		let v = (typeof f === 'number' && isFinite(f)) ? f : 1.0;
 		v = Math.max(0, Math.min(10, v));
 		this._mpHpScaleBoss = v;
 	}
@@ -12775,6 +13192,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// without this its stageBossDefeatCinematic no-ops and the boss vanishes on
 			// the member instead of playing the scripted defeat cinematic.
 			mk: (typeof e.manualKill === 'string' && e.manualKill && e.manualKill.length <= 96) ? e.manualKill : undefined,
+			// ROUND 147: TTL'd appear-effect flag (see IEnemySnap.af). Deliberately
+			// NOT part of enemySnapChanged — an expiring flag must never force a
+			// full snap on its own; it only rides along while fresh.
+			af: (e._mpAppearFx && Date.now() - e._mpAppearFx < 4000) ? 1 : undefined,
 		};
 		const prev = deltaMap.get(e.uid);
 		// ROUND 61 (fix A): a burrowed/phased/hidden enemy (hillkat earthIn/earthOut) can
@@ -13747,6 +14168,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		// point when the host's final kill has no packet. If the host ever stops
 		// streaming, reapStaleProjectiles removes it shortly after the window cap.
 		const projBlend = Math.min(1, ig.system.tick * 14);
+		// 1.76.x (ball trail fix): player-ball puppets (pb_*) track their target
+		// DIRECTLY. Their target is already a smooth linear extrapolation from the
+		// freshest stream sample (base + vel*age), so the 14x/second exponential
+		// smoothing only added a steady-state visual trail of tau*velocity ~
+		// 70ms * 600px/s = ~43px: the ball visibly turned away from walls ~40px
+		// early (the bounce block reversed the target while the visual still
+		// trailed behind it) and vanished short of enemies whenever a kill branch
+		// fired on the lagged position. Host projectiles keep the smoothing —
+		// their target is window-capped, not a straight line.
+		const pbFollow = 1;
 		for (const pk in this.projectiles) {
 			const e = this.projectiles[pk];
 			if (!e || e._killed || !e.coll || typeof e._mpProjBaseX !== 'number') continue;
@@ -13798,9 +14229,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				cpp.xProtected = tx; cpp.yProtected = ty; cpp.zProtected = tz;
 				continue;
 			}
-			if (dx !== 0) cpp.xProtected = cpp.xProtected + dx * projBlend;
-			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * projBlend;
-			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * projBlend;
+			const follow = isPb ? pbFollow : projBlend;
+			if (dx !== 0) cpp.xProtected = cpp.xProtected + dx * follow;
+			if (dy !== 0) cpp.yProtected = cpp.yProtected + dy * follow;
+			if (dz !== 0) cpp.zProtected = cpp.zProtected + dz * follow;
 		}
 	}
 
@@ -14364,6 +14796,24 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * proxy data), position, and 2D velocity (flight angle only). Presence-driven:
 	 * emits only while an enemy projectile is alive.
 	 */
+	/** ROUND 148: a proxy spawned from INSIDE another proxy's action (SHOOT_PROXY /
+	 * SHOOT_PROXY_RANGE in a GENERIC shell's action, or a Ball's destroyProxy) carries
+	 * combatant = the SHELL/BALL entity, which has no .proxies map — the reverse-lookup
+	 * then produced src=0/pn='' and members could never rebuild the visual (the Pada
+	 * Moth's fireball/fireBallBig, shot by its fireBallProxy shells, plus the big
+	 * fireball's `boom` explosion, were all invisible to members). ProxyTools.getProxy
+	 * itself resolves through getCombatantRoot(), so the shell's data objects ARE the
+	 * root enemy's — walk up and the animSheet/data identity lookups hold there. */
+	private resolveProxyOwner(combatant: any): any {
+		try {
+			if (combatant && !combatant.proxies && typeof combatant.getCombatantRoot === 'function') {
+				const root = combatant.getCombatantRoot();
+				if (root && root.proxies) return root;
+			}
+		} catch (_) { /* fall through with the original combatant */ }
+		return combatant;
+	}
+
 	private sendProjectileBlock(): void {
 		try {
 			const conn = this.main.connection;
@@ -14381,7 +14831,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				if (!(e instanceof Projectile) || e._killed || !e.coll) continue;
 				if (e.party !== EnemyParty) continue;          // only ENEMY projectiles (not player throws)
 				if (e._mpMirror || e._mpProj) continue;       // never re-stream a visual copy
-				const combatant = e.combatant;
+				// ROUND 148: walk to the combatant ROOT when the direct owner has no
+				// proxies map (a SHOOT_PROXY inside a GENERIC shell's action carries
+				// combatant = the shell — the Pada Moth's fireballs were invisible).
+				const combatant = this.resolveProxyOwner(e.combatant);
 				let src = 0;
 				let pn = '';
 				if (combatant && typeof combatant.uid === 'number' && combatant.proxies) {
@@ -14394,6 +14847,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						if (p && p.data && p.data.animation === e.animSheet) { pn = name; break; }
 					}
 				}
+				// ROUND 148: a Ball whose proxy name can't be resolved is unbuildable on
+				// members (spawnProjectilePuppet needs pn) — don't stream it at all.
+				if (!pn) continue;
 				const vel = e.coll.vel || { x: 0, y: 0 };
 				list.push({
 					i: e.uid,
@@ -14423,7 +14879,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// them too, identified by the spawn-stamped proxy data; proxies flagged
 					// `invisible` (the diggingbot's rockLine spawner) stay skipped.
 					if (!e.animSheet && !(e._mpProxyData && !e._mpProxyData.invisible)) continue;
-					const combatant = e.combatant;
+					// ROUND 148: same root-walk as the Ball branch — a shell-spawned proxy
+					// (the big fireball's `boom` explosion is spawned by the BALL itself)
+					// carries the shell/ball as combatant, which has no proxies map.
+					const combatant = this.resolveProxyOwner(e.combatant);
 					let src = 0;
 					let pn = '';
 					if (combatant && typeof combatant.uid === 'number' && combatant.proxies) {
@@ -14934,6 +15393,12 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					: ((e.coll && typeof e.coll.maxVel === 'number' && e.coll.maxVel > 0) ? e.coll.maxVel : 0);
 				let nvx = vxRaw, nvy = vyRaw;
 				if (rawLen > 0 && spd > 0 && spd !== rawLen) { nvx = vxRaw / rawLen * spd; nvy = vyRaw / rawLen * spd; }
+				// 1.76.x (crisp wall bounce): a >90deg velocity flip between streamed
+				// blocks is a wall/obstacle bounce — snap to this block instead of
+				// letting the pre-bounce extrapolation dip one block into the wall.
+				const ovx = (typeof e._mpProjVelX === 'number') ? e._mpProjVelX : 0;
+				const ovy = (typeof e._mpProjVelY === 'number') ? e._mpProjVelY : 0;
+				if ((ovx !== 0 || ovy !== 0) && (ovx * nvx + ovy * nvy) < 0) e._mpSnapNext = true;
 				e._mpProjVelX = nvx; e._mpProjVelY = nvy;
 				if (e.coll && e.coll.vel) { e.coll.vel.x = nvx; e.coll.vel.y = nvy; }
 				const prevAt: number = (typeof e._mpProjBaseAt === 'number' && e._mpProjBaseAt > 0) ? e._mpProjBaseAt : 0;
@@ -18572,10 +19037,48 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				enemyInfo,
 				skipHook: true,
 			} as any);
+			// ROUND 147: the host spawned this enemy with its appear fade-in (af) —
+			// replay the materialize FX so the member sees the same gradual spawn.
+			if (e && s.af === 1) this.playPuppetAppearFx(e);
 			return e || null;
 		} catch (_) {
 			delete this.pendingTypes[s.t];
 			return null;
+		}
+	}
+
+	/** ROUND 147 (encounter/wave fade-in on members): replay the native spawn
+	 * fade-in on a freshly created puppet. Vanilla Enemy.show(appear) zeroes
+	 * animState.alpha and spawns the enemy's startEffect (or the teleport sheet's
+	 * "showDefault": CHANGE_ALPHA 0->1 + WIPE + FLASH + the teleport-1s sound) on
+	 * the enemy. On the host that ran inside spawnEntity BEFORE the first state
+	 * block, so the enemyFx relay always dropped it (no puppet to anchor to yet).
+	 * Reproduce the vanilla fallback path at puppet-creation time. The effect is a
+	 * standalone entity anchored to the puppet, so the mpAnim setAction pin can
+	 * never cancel it mid-fade — unlike the enemy's appearAction, which we
+	 * deliberately do NOT run on puppets (a mid-action cancel could strand the
+	 * puppet at alpha 0). */
+	private playPuppetAppearFx(e: any): void {
+		try {
+			if (!e || e._killed || !e.animState) return;
+			e.animState.alpha = 0; // vanilla pre-zero: no one-frame flash before CHANGE_ALPHA
+			let played = false;
+			try {
+				if (e.startEffect && typeof e.startEffect.spawnOnTarget === 'function') {
+					e.startEffect.spawnOnTarget(e);
+					played = true;
+				}
+			} catch (_) { /* fall through to the teleport sheet */ }
+			if (!played) {
+				const fx: any = (ig.game as any) && (ig.game as any).effects && (ig.game as any).effects.teleport;
+				if (fx && typeof fx.spawnOnTarget === 'function') {
+					fx.spawnOnTarget('showDefault', e);
+					played = true;
+				}
+			}
+			if (!played) e.animState.alpha = 1; // no sheet — never strand an invisible puppet
+		} catch (_) {
+			try { if (e && e.animState) e.animState.alpha = 1; } catch (__) { /* ignore */ }
 		}
 	}
 

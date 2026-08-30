@@ -406,7 +406,7 @@ export class SocketIoConnector implements IConnection {
                 softDeathReviveTimeNormal?: number,
                 softDeathReviveTimeBoss?: number,
                 // Perfect-guard compensation (member side): base grace ms + ping
-                // factor x RTT. Older servers omit both -> client defaults 30/0.6.
+                // factor x RTT. Older servers omit both -> client defaults 10/0.6.
                 perfectGuardBaseMs?: number,
                 perfectGuardPingFactor?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
@@ -1029,6 +1029,12 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('playerFx', data);
 	}
 
+	/** 1.76.x (Faj'ro puzzles): torch hits (ElementPole) and streamed-ball wall
+	 * FX — validated server-side, relayed to the instance minus the sender. */
+	public sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number }): void {
+		this.syncEmit('puzzleFx', data);
+	}
+
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
 	 * relay a cosmetic notice so every OTHER member replays the hurt FX on its puppet. */
 	public emitEnemyHurt(hit: { uid: number, type?: number, attackElement?: number, critical?: boolean, attacker?: string, damage?: number, shield?: number, weak?: boolean, off?: number, def?: number, hx?: number, hy?: number }): void {
@@ -1303,6 +1309,41 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
+	// 1.77.x (water-bubble host authority): host -> instance state stream.
+	public bubbleState(map: string, entries: any[]): void {
+		this.syncEmit('bubbleState', { map, entries });
+	}
+	public onBubbleState(callback: (data: { map: string, entries: any[] }) => void): void {
+		this.socket.on('bubbleState', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
+			callback({ map: data.map, entries: data.entries });
+		});
+	}
+	/** 1.77.x: host -> instance one-shot bubble/disk/coals transition relay. */
+	public bubbleEvent(pkt: any): void {
+		this.syncEmit('bubbleEvent', pkt);
+	}
+	public onBubbleEvent(callback: (data: any) => void): void {
+		this.socket.on('bubbleEvent', (data: any) => {
+			if (!data || typeof data.map !== 'string' || typeof data.k !== 'number') return;
+			// Identity is a panel mi OR an enemy-shot sid (server whitelists both).
+			if (typeof data.mi !== 'number' && typeof data.sid !== 'string') return;
+			callback(data);
+		});
+	}
+	/** 1.77.x: member -> instance host forwarded bubble/disk ball-hit ingredients. */
+	public bubbleHit(pkt: any): void {
+		this.syncEmit('bubbleHit', pkt);
+	}
+	public onBubbleHit(callback: (data: any) => void): void {
+		this.socket.on('bubbleHit', (data: any) => {
+			if (!data || typeof data.map !== 'string' || typeof data.tgt !== 'number') return;
+			// Identity is a panel mi OR an enemy-shot sid (server whitelists both).
+			if (typeof data.mi !== 'number' && typeof data.sid !== 'string') return;
+			callback(data);
+		});
+	}
+
 	// ROUND 133: quest-world spawn-driving var relay (chest spawnCondition visibility).
 	public spawnVar(map: string, list: any[]): void {
 		this.syncEmit('spawnVar', { map, list });
@@ -1540,6 +1581,12 @@ export class SocketIoConnector implements IConnection {
 	public onPlayerFx(callback: (data: any) => void): void {
 		this.socket.on('playerFx', (data: any) => {
 			if (data && typeof data.pl === 'string') callback(data);
+		});
+	}
+	/** 1.76.x (Faj'ro puzzles): a teammate's torch hit / ball wall FX arrived. */
+	public onPuzzleFx(callback: (data: any) => void): void {
+		this.socket.on('puzzleFx', (data: any) => {
+			if (data && typeof data.pl === 'string' && typeof data.k === 'string') callback(data);
 		});
 	}
 	/** ROUND 45 (Gap A, host origin): the host relayed a member's hit on a real enemy —

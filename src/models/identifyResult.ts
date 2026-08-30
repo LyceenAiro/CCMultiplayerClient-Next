@@ -12,7 +12,7 @@ interface IIdentifyResult {
      * count (1.75.x: room-based, not party-roster-based). */
     hpScale?: number;
     /** 1.76.x: the same scheme, but ONLY for boss enemies (enemyType.boss) —
-     * config.json monsterBossHpPerPlayer, default 0.9 = +90% HP per extra
+     * config.json monsterBossHpPerPlayer, default 1.0 = +100% HP per extra
      * player in the room. Regular enemies keep hpScale. */
     hpScaleBoss?: number;
     /** Same scheme for the hit-count break threshold (config.json

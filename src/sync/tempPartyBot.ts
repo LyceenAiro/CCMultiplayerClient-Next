@@ -15,7 +15,10 @@ import { Multiplayer } from '../multiplayer';
  * This module makes those scenes playable WITHOUT the bot in the party:
  *   1. `party.has.X`/`party.alive.X` var reads report TRUE for an absent
  *      official companion while connected (alive keeps the native dungeon
- *      block), so companion-gated triggers fire at all;
+ *      block), so companion-gated triggers fire at all — and `party.size`
+ *      (a pure script var; engine code uses getPartySize() directly) reports
+ *      a FULL vanilla party (3) so size-routed scenes take the "companions
+ *      present" variant consistently with the faked has/alive answers;
  *   2. when the RUNNING scene then resolves the bot's entity by name and finds
  *      nothing, a TEMPORARY PartyMemberEntity is spawned on the spot
  *      (vanilla `_spawnPartyMemberEntity` — pops in next to the player, no
@@ -90,24 +93,35 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 					} catch (_) { /* never break entity resolution */ }
 					return null;
 				},
-				// Trigger / IF conditions reading party.has.X / party.alive.X:
-				// report an absent official companion as present while connected,
-				// so bot-gated story triggers fire. Never overrides a natively
-				// true answer; index-based party.size is untouched on purpose
-				// (Member2/Member3 fetches have no temp counterpart).
+				// Trigger / IF conditions reading party state: report absent
+				// official companions as present while connected, so bot-gated
+				// story triggers fire. Never overrides a natively true answer.
 				onVarAccess(this: any, a: any, b: any) {
-					const r = this.parent(a, b);
 					try {
-						if (r) return r;
-						if (!b || b[0] !== 'party') return r;
-						const kind = b[1];
-						if (kind !== 'has' && kind !== 'alive') return r;
-						if (!self.shouldCover(this, b[2])) return r;
-						// "alive" keeps the native dungeon block: follower bots
-						// never appear inside dungeons, so dungeon scenes stay
-						// untouched.
-						return kind === 'has' ? true : !this.dungeonBlocked;
-					} catch (_) { return r; }
+						if (b && b[0] === 'party') {
+							const kind = b[1];
+							// party.size feeds ONLY script branch routing — nothing in
+							// the engine reads the var (elevators, combat, aggro pools
+							// all call sc.party.getPartySize() directly and stay
+							// truthful). While temp cover is active, answer with a FULL
+							// vanilla party (player + 2 companions = 3) so size==3 /
+							// size==2 routing chains resolve the "everyone's here"
+							// variant, consistently with the faked has/alive answers.
+							// (The Faj'ro door otherwise saw size==2 with both has.*
+							// true and played BOTH "bring the other one" warnings.)
+							if (kind === 'size') return self.shouldCoverAny(this) ? 3 : this.parent(a, b);
+							if (kind === 'has' || kind === 'alive') {
+								const r = this.parent(a, b);
+								if (r) return r; // natively satisfied — never override a real member
+								if (!self.shouldCover(this, b[2])) return r;
+								// "alive" keeps the native dungeon block: follower bots
+								// never appear inside dungeons, so dungeon scenes stay
+								// untouched.
+								return kind === 'has' ? true : !this.dungeonBlocked;
+							}
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(a, b);
 				},
 			});
 			console.log('[mptempbot] temporary cutscene companion support installed');
@@ -132,6 +146,25 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 				return out;
 			} catch (e) { return null; }
 		};
+	}
+
+	/** True while connected and AT LEAST ONE official companion is absent and
+	 * temp-coverable (in practice: whenever connected — some companion is
+	 * almost always missing). Drives the party.size script-var answer. */
+	public shouldCoverAny(party: any): boolean {
+		try {
+			if (!this.connected()) return false;
+			if (!party || !party.models) return false;
+			const opts: string[] = (sc as any).PARTY_OPTIONS || [];
+			for (const name of opts) {
+				if (!name || name === 'Lea') continue;
+				const model = party.models[name];
+				if (!model || model._mpName) continue;
+				if (party.currentParty && party.currentParty.indexOf(name) !== -1) continue;
+				return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
 	}
 
 	/** Official, non-network, currently-absent companion eligible for temp cover. */

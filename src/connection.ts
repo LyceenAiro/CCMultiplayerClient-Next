@@ -176,6 +176,13 @@ export interface IConnection {
      * and the hover drag-back pose+ring (kind 'hover') so teammates see the
      * effect too. */
     sendPlayerFx(data: { pl: string, kind: 'ar' | 'flash' | 'hover', label?: any, time?: number, mode?: number, color?: number, sheet?: string, key?: string, x?: number, y?: number, z?: number }): void;
+    /** 1.76.x (Faj'ro puzzles): relay a local-only puzzle moment so teammates
+     * replay it — 'pole' = one of my real balls hit an ElementPole torch
+     * (receivers run the same ballHit charge chain), 'poleCancel' = my ball died
+     * with the group mid-charge, 'ball' = my streamed ball bounced / wall-died /
+     * expired (receivers spawn ballBounce / ballWallKill / ballAirKill on their
+     * puppet at my exact impact point). */
+    sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number }): void;
     /** Round 17: HOST -> all — one of my real enemies started an attack (fresh attack
      * anim edge at block cadence). Members replay it on their puppet toward the local
      * player (member puppets no longer run local AI). Round 22 (RC1): `t` is the
@@ -282,6 +289,31 @@ export interface IConnection {
     slidingPush(map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number): void;
     /** 1.74.0: a same-instance peer relayed a sliding-block push. */
     onSlidingPush(callback: (data: { map: string, mi: number, dx: number, dy: number, hx?: number, hy?: number, vx?: number, vy?: number }) => void): void;
+    /** 1.77.x (water-bubble host authority): the instance host streams its
+     * per-panel bubble phase (none/bubble/ice disk/cooled coals), state and —
+     * while anything flies — position + velocity. Members mirror it onto their
+     * local puppet copies. */
+    bubbleState(map: string, entries: Array<{ mi?: number, sid?: string, ph: number, st?: number, p?: [number, number, number], v?: [number, number, number] }>): void;
+    /** 1.77.x: a same-instance host relayed its water-bubble state snapshot. */
+    onBubbleState(callback: (data: { map: string, entries: Array<any> }) => void): void;
+    /** 1.77.x: the host's bubble/disk/coals ran an effect-producing transition
+     * (bounce/blink/steam/burst/ice/melt/break/coals/consume) or a judged ball
+     * impact flash — replay the same native method/FX on every member's puppet.
+     * k: 1=bounce 2=lastSecond 3=steam 4=circularSteam 5=burst 6=turnIce
+     * 7=instantKill 8=iceSlide 9=iceMelt 10=iceBreak 11=coals 12=coalsMelt
+     * 13=hitFx(el/at/x/y/z) 14=iceConsume. x/y/z = entity center + coll z.
+     * Identity: mi (panel mapId) OR sid (enemy-shot chain "<uid>.<seq>"). */
+    bubbleEvent(pkt: { map: string, mi?: number, sid?: string, k: number, x?: number, y?: number, z?: number, vx?: number, vy?: number, el?: number, at?: number }): void;
+    /** 1.77.x: a same-instance peer (the host) relayed a bubble transition. */
+    onBubbleEvent(callback: (data: any) => void): void;
+    /** 1.77.x: a member's LOCAL ball hit a puppet bubble/ice disk — forward the
+     * hit ingredients (element, STEAM/CHARGED hints, hit velocity + point) to the
+     * instance host, which re-judges the transition on its authoritative entity
+     * (tgt: 1=bubble 2=ice disk). The member predicts the outcome natively and
+     * dedups the host's echoed event. */
+    bubbleHit(pkt: { map: string, mi?: number, sid?: string, tgt: number, el: number, stm?: number, chg?: number, vx?: number, vy?: number, hx?: number, hy?: number, hz?: number }): void;
+    /** 1.77.x: a same-instance member forwarded a bubble/disk ball hit (host applies). */
+    onBubbleHit(callback: (data: any) => void): void;
     /** ROUND 133: relay a quest-world spawn-driving map/tmp var (chest spawnCondition)
      * so same-instance members' hidden chests appear too — even outside side-quest sync. */
     spawnVar(map: string, list: Array<{ b: string, k: string, v: any }>): void;
@@ -542,6 +574,9 @@ export interface IConnection {
      * replay the AR window on their mirror / the barrier flash at the fixed
      * position (see NetSync.applyPlayerFx). */
     onPlayerFx(callback: (data: any) => void): void;
+    /** 1.76.x (Faj'ro puzzles): a teammate's ball hit a torch / bounced / died
+     * at a wall (see NetSync.applyPuzzleFx). */
+    onPuzzleFx(callback: (data: any) => void): void;
     /** Round 23: the host killed a real enemy — grant the relayed credits to our own
      * player and roll the RAW drop table with OUR stats (applyLoot). Server-relayed
      * via broadcastHostState. */
