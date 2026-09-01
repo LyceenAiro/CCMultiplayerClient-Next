@@ -15394,7 +15394,18 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (ProxyEnt) {
 				for (let i = 0; i < entities.length; i++) {
 					const e: any = entities[i];
-					if (!(e instanceof ProxyEnt) || e._killed || !e.coll) continue;
+					if (!(e instanceof ProxyEnt)) continue;
+					// DIAG (heat-dng midboss): every live CombatProxyEntity, before the gates.
+					if (this._mpProjDiagMap() && !e._killed) {
+						const dk = 's' + e.uid;
+						if (!this._mpProjDiagLog[dk]) {
+							this._mpProjDiagLog[dk] = true;
+							console.log('[mpproj] host CPE uid=' + e.uid + ' party=' + e.party + ' (need ' + EnemyParty + ')'
+								+ ' coll=' + !!e.coll + ' mirror=' + !!e._mpMirror + ' proj=' + !!e._mpProj
+								+ ' cmb=' + (e.combatant ? (e.combatant.uid + '/' + (e.combatant.enemyName || e.combatant.name || '?')) : 'NULL'));
+						}
+					}
+					if (e._killed || !e.coll) continue;
 					if (e.party !== EnemyParty) continue;
 					if (e._mpMirror || e._mpProj) continue;
 					// ROUND 143 (drill-trail sync): effect-only proxies (the scorpion's
@@ -16606,6 +16617,15 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				// (and its premature boom) until the grace expires.
 				if (e && !e._killed && e._mpBombCopy && typeof e._mpBombHandoffUntil === 'number' && now < e._mpBombHandoffUntil) continue;
 				if (e._killed || (typeof e._mpProjSeen === 'number' && now - e._mpProjSeen > 200)) {
+					// DIAG (heat-dng midboss): report early reaps of stream copies (age since spawn).
+					if (this._mpProjDiagMap() && e._mpProj && typeof e._mpProjBorn === 'number') {
+						const dk = 'r' + uid;
+						if (!this._mpProjDiagLog[dk]) {
+							this._mpProjDiagLog[dk] = true;
+							console.log('[mpproj] member reap uid=' + uid + ' killed=' + !!e._killed
+								+ ' ageMs=' + (now - e._mpProjBorn) + ' staleMs=' + (typeof e._mpProjSeen === 'number' ? (now - e._mpProjSeen) : -1));
+						}
+					}
 					if (!e._killed) {
 						// 1.74.x (ball impact feel): a player-ball puppet reaped right
 						// around its impact — play the ball's OWN element-colored kill
