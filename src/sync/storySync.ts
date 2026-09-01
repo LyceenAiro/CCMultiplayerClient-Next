@@ -408,6 +408,16 @@ export class StorySyncController {
 	private partyStoryMarkerInstalled = false;
 	private storyIntegrityCheckedAt = 0;
 	private storyIntegrityToastAt = 0;
+	/** ROUND 154: first tick where the Maroon Valley intro tail looked lost
+	 * (plot.line stuck in [4300,4320), no event running). 0 = not stuck. */
+	private maroonIntroStuckSince = 0;
+	/** ROUND 154: cutscene wedge watchdog state — the blocking event call's
+	 * innermost-step signature, when that step first stalled, how many action
+	 * cancels we already nudged it with, and the 1s pump rate limiter. */
+	private cutsceneWedgeSig = '';
+	private cutsceneWedgeSince = 0;
+	private cutsceneWedgeNudges = 0;
+	private cutsceneWedgeCheckedAt = 0;
 
 	constructor(main: any) {
 		this.main = main;
@@ -480,13 +490,48 @@ export class StorySyncController {
 		};
 	// 1.70.83: force-run the main-story dead-lock repair once (F8 console) and
 	// print the before/after plot.line + party state.
-	(window as any).__mpstoryfix = () => {
+	(window as any).__mpstoryfix = (force?: any) => {
 		try {
 			const before = self.mainPlotLine();
 			const party: any = (sc as any).party;
 			console.log('[mpstoryfix] before plot=' + before + ' emilieInParty='
 				+ !!(party && typeof party.isPartyMember === 'function' && party.isPartyMember('Emilie'))
 				+ ' followSchneider=' + self.permaTaskFollowsSchneiderHq());
+			// ROUND 154: dump the blocking event call (the wedged cutscene) — which
+			// event it is and the step types on its stack — so a frozen scene tells
+			// us exactly where it stopped. __mpstoryfix(1) additionally FORCE-ENDS
+			// the wedged call (engine _endEventCall: setDone -> onEnd -> enterGame)
+			// and, inside the Maroon intro window, applies the lost tail immediately
+			// so the ALWAYS IntroScene trigger cannot simply refire the scene.
+			const evm: any = (ig.game as any) && (ig.game as any).events;
+			const call = evm && (typeof evm.getBlockingEventCall === 'function' ? evm.getBlockingEventCall() : evm.blockingEventCall);
+			if (call) {
+				const frames = ((call.stack || []) as any[]).map((fr: any) => {
+					const sd = fr && fr.stepData;
+					const ent = sd && sd._actionEntity;
+					return self.eventStepName(fr && fr.currentStep)
+						+ (fr && fr.event && fr.event.name ? '@' + fr.event.name : '')
+						+ (ent ? '(' + String(ent.name || ent.partyMemberName || '?')
+							 + (ent.coll ? ' ' + Math.round(ent.coll.pos.x) + ',' + Math.round(ent.coll.pos.y) + ',' + Math.round(ent.coll.pos.z) : '')
+							 + (ent.currentAction ? ' action=running' : ' action=none') + ')' : '');
+				});
+				console.warn('[mpstoryfix] BLOCKING EVENT RUNNING (wedged?): name='
+					+ String((call.event && call.event.name) || '(unnamed)')
+					+ ' done=' + !!call.done + ' steps=' + JSON.stringify(frames)
+					+ ' runningCalls=' + (evm.runningEventCalls ? evm.runningEventCalls.length : -1));
+				if (force) {
+					console.warn('[mpstoryfix] FORCE-ENDING the wedged event call');
+					try { if (typeof evm._endEventCall === 'function') evm._endEventCall(call); } catch (e2) { console.warn('[mpstoryfix] force-end failed', e2); }
+					const lineNow = Number((ig as any).vars && (ig as any).vars.get('plot.line')) || 0;
+					if (lineNow >= 4300 && lineNow < 4320) {
+						if (self.applyMaroonIntroTail()) console.warn('[mpstoryfix] Maroon intro tail applied after force-end');
+					}
+				} else {
+					console.warn('[mpstoryfix] a scene is still running — if it is frozen, run __mpstoryfix(1) to force-end it');
+				}
+			} else {
+				console.log('[mpstoryfix] no blocking event call running');
+			}
 			self.repairBrokenMainStoryState();
 			const after = self.mainPlotLine();
 			console.log('[mpstoryfix] after plot=' + after + ' emilieInParty='
@@ -1864,6 +1909,7 @@ export class StorySyncController {
 		try {
 			this.ensureEngineHooks();
 			this.ensureStoryIntegrity();
+			this.checkCutsceneWedge();
 			// 1.76.x: the 轻锐小队/满编小队 milestone banner runs OUTSIDE the active
 			// gate — it is a party-size announcement, not a story-sync feature.
 			this.checkPartyMilestoneBanner();
@@ -3552,6 +3598,9 @@ export class StorySyncController {
 			this.partyStoryMarkerInstalled = true;
 			PM.inject({
 				addPartyMember(this: any, a: any, b: any, c: any, d: any, i: any) {
+					// ROUND 154: capture the pre-call membership so the duplicate-call
+					// rescue below can tell a real no-op apart from a fresh add.
+					const already = !!(this.currentParty && this.currentParty.indexOf(a) !== -1);
 					const r = this.parent(a, b, c, d, i);
 					try {
 						const model: any = (sc as any).model;
@@ -3560,6 +3609,35 @@ export class StorySyncController {
 							if (mdl) mdl._mpStoryAdded = true;
 						}
 					} catch (_) { /* marker must never break the native call */ }
+					// ROUND 154 (Maroon Valley intro / Emilie): a story conversion call
+					// (ADD_PARTY_MEMBER with npc:{global:...}) no-ops natively when the
+					// name is already in currentParty — and in MP that happens every
+					// time the leader's partyBots stream beats the member's replayed
+					// cutscene to the same add. The native early-return then skips the
+					// NPC -> follower conversion ENTIRELY: the named NPC stays standing
+					// (a duplicate) and the follower entity the scene expects at the
+					// NPC's spot never exists. Finish the handover by hand: ensure the
+					// follower entity, then hide the source NPC exactly like the native
+					// conversion does. Offline this path can never trigger (the
+					// duplicate only arises via the network bot stream).
+					try {
+						if (already && b) {
+							let spawned = false;
+							try {
+								const cur = this.partyEntities && this.partyEntities[a];
+								if ((!cur || cur._killed) && typeof this._spawnPartyMemberEntity === 'function') {
+									this._spawnPartyMemberEntity(a, true, false, b); // native path hides b
+									spawned = true;
+								}
+							} catch (_) { /* ignore */ }
+							if (!spawned && !b._hidden) {
+								try {
+									if (typeof b.onPartySwapHide === 'function') b.onPartySwapHide();
+									else if (typeof b.hide === 'function') b.hide();
+								} catch (_) { /* ignore */ }
+							}
+						}
+					} catch (_) { /* the rescue must never break the native call */ }
 					return r;
 				},
 			});
@@ -3602,13 +3680,197 @@ export class StorySyncController {
 		} catch (_) { return false; }
 	}
 
+	/** Reverse-lookup an event-step instance's ig.EVENT_STEP name (steps carry
+	 * no type field — the class registry is the only way back). */
+	public eventStepName(st: any): string {
+		try {
+			if (!st) return '(none)';
+			const ES: any = (ig as any).EVENT_STEP || {};
+			for (const k in ES) { if (ES[k] && st instanceof ES[k]) return k; }
+			} catch (_) { /* ignore */ }
+			return '(?)';
+	}
+
+	/** ROUND 154: cutscene wedge watchdog. MP-only failure mode (reported at
+	 * the Maroon Valley IntroScene, stuck on DO_ACTION): a scripted
+	 * DO_ACTION wait=true exact-point walk never completes when the body's
+	 * position drifted from the authored spot (low-FPS timed walks, regroup
+	 * teleports, extra network entities standing on the target) — the event
+	 * call then hangs forever with the letterbox on. Once a second the
+	 * innermost step of the blocking event call is examined:
+	 *   - the step ADVANCES            -> reset;
+	 *   - message/choice steps         -> wait on the reader by design, ignore;
+	 *   - DO_ACTION / WAIT_UNTIL_ACTION_DONE stalled 12s -> CANCEL the stuck
+	 *     entity's action: the step's run() (currentAction == this.action)
+	 *     then reports done and the scene CONTINUES normally — positions a
+	 *     few pixels off, story intact (up to 3 nudges, 12s apart);
+	 *   - same step for 45s            -> force-end the call via the engine's
+	 *     own _endEventCall (setDone -> onEnd -> enterGame) and, inside the
+	 *     Maroon intro window, apply the lost tail so the ALWAYS IntroScene
+	 *     trigger cannot refire the scene from the top. */
+	private checkCutsceneWedge(): void {
+		try {
+			const now = Date.now();
+			if (now - this.cutsceneWedgeCheckedAt < 1000) return;
+			this.cutsceneWedgeCheckedAt = now;
+			const evm: any = (ig.game as any) && (ig.game as any).events;
+			const call = evm && evm.blockingEventCall;
+			if (!call || call.done || !call.stack || !call.stack.length) {
+				this.cutsceneWedgeSig = ''; this.cutsceneWedgeSince = 0; this.cutsceneWedgeNudges = 0;
+				return;
+			}
+			const fr = call.stack[call.stack.length - 1];
+			const st = fr && fr.currentStep;
+			const type = this.eventStepName(st);
+			// Waiting on the READER is normal — never treat as a wedge.
+			if (type === 'SHOW_MSG' || type === 'SHOW_SIDE_MSG' || type === 'SHOW_CENTER_MSG'
+				|| type === 'SHOW_CHOICE' || type === 'SHOW_MODAL_CHOICE' || type === 'SHOW_AR_MSG'
+				|| type === 'SHOW_GET_MSG' || type === 'SHOW_LEARN_MSG') {
+				this.cutsceneWedgeSig = ''; this.cutsceneWedgeSince = 0; this.cutsceneWedgeNudges = 0;
+				return;
+			}
+			const sd = fr && fr.stepData;
+			const ent = sd && sd._actionEntity;
+			const sig = type + '@' + String((fr && fr.event && fr.event.name) || (call.event && call.event.name) || '')
+				+ '@' + String((ent && (ent.name || ent.partyMemberName)) || '');
+			if (sig !== this.cutsceneWedgeSig) {
+				this.cutsceneWedgeSig = sig;
+				this.cutsceneWedgeSince = now;
+				this.cutsceneWedgeNudges = 0;
+				return;
+			}
+			const stalled = now - this.cutsceneWedgeSince;
+			// Phase 1: cancel the stuck action so the wait step completes and the
+			// scene continues. One nudge per 12s of stall, up to three.
+			if (this.cutsceneWedgeNudges < 3 && stalled >= (this.cutsceneWedgeNudges + 1) * 12000
+				&& (type === 'DO_ACTION' || type === 'WAIT_UNTIL_ACTION_DONE')
+				&& ent && typeof ent.cancelAction === 'function') {
+				this.cutsceneWedgeNudges++;
+				console.warn('[storysync] cutscene step ' + sig + ' stalled ' + Math.round(stalled / 1000)
+					+ 's — cancelling the stuck action (nudge ' + this.cutsceneWedgeNudges + '/3)');
+				try { ent.cancelAction(); } catch (_) { /* ignore */ }
+				return;
+			}
+			// Phase 2: still the same step after 45s — the scene is dead. Force-end
+			// the event call through the engine's own end path.
+			if (stalled < 45000) return;
+			console.warn('[storysync] cutscene wedged at ' + sig + ' for ' + Math.round(stalled / 1000)
+				+ 's — force-ending the event call');
+			this.cutsceneWedgeSig = ''; this.cutsceneWedgeSince = 0; this.cutsceneWedgeNudges = 0;
+			try {
+				if (typeof evm._endEventCall === 'function') evm._endEventCall(call);
+			} catch (e) { console.warn('[storysync] wedge force-end failed', e); return; }
+			const line = Number((ig as any).vars && (ig as any).vars.get('plot.line')) || 0;
+			if (line >= 4300 && line < 4320) {
+				if (this.applyMaroonIntroTail()) console.warn('[storysync] Maroon intro tail applied after wedge force-end');
+			}
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** ROUND 154: apply the Maroon Valley IntroScene tail by hand — Emilie
+	 * joins (story-added + locked), plot.line -> 4320, the Ba'kii Kum perma
+	 * task (inline LangLabel — same text the scene's SET_PERMA_TASK stores).
+	 * Shared by the integrity repair pump and the __mpstoryfix(1) force-end
+	 * escape hatch. The caller guarantees no event is currently running. */
+	private applyMaroonIntroTail(): boolean {
+		try {
+			const vars: any = (ig as any).vars;
+			const party: any = (sc as any).party;
+			const model: any = (sc as any).model;
+			if (!vars || typeof vars.set !== 'function') return false;
+			if (party && typeof party.isPartyMember === 'function' && !party.isPartyMember('Emilie')
+				&& party.models && party.models['Emilie']) {
+				try {
+					party.models['Emilie']._mpStoryAdded = true;
+					party.addPartyMember('Emilie', null, true, false);
+					try { if (typeof party.setLocked === 'function') party.setLocked('Emilie', true); } catch (_) { /* ignore */ }
+				} catch (_) { /* ignore */ }
+			}
+			vars.set('plot.line', 4320);
+			try {
+				if (model && typeof model.setPermaTask === 'function' && (ig as any).LangLabel) {
+					model.setPermaTask(new (ig as any).LangLabel({
+						en_US: 'Travel to \\c[3]Ba\'kii Kum\\c[0] together with Emilie.',
+						de_DE: 'Reise mit Emilie gemeinsam nach \\c[3]Ba\'kii Kum\\c[0].',
+						zh_CN: '和艾米莉一起前往\\c[3]巴基库姆\\c[0]。',
+						zh_TW: '和艾米莉一起前往\\c[3]巴基庫姆\\c[0]。',
+						ja_JP: 'エミリーと一緒に\\c[3]バキーイ・クム\\c[0]へ行こう。',
+						ko_KR: '에밀리와 함께 \\c[3]바키 쿰\\c[0]으로 이동하세요.',
+					}));
+				}
+			} catch (_) { /* ignore */ }
+			try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+			return true;
+		} catch (_) { return false; }
+	}
+
 	private repairBrokenMainStoryState(): void {
 		const vars: any = (ig as any).vars;
 		if (!vars || typeof vars.get !== 'function' || typeof vars.set !== 'function') return;
 		let line = Number(vars.get('plot.line'));
 		if (!isFinite(line)) return;
-		if (!this.permaTaskFollowsSchneiderHq()) return;
 		let fixed = false;
+		// ROUND 154 (Maroon Valley intro): the IntroScene tail — ADD_PARTY_MEMBER
+		// Emilie, SET_MEMBER_LOCKED, plot.line=4320, the Ba'kii Kum perma task —
+		// can be lost on a client whose cutscene ended early (a member's replayed
+		// event cut short, or a wedged event the player reloaded out of). Repair
+		// the two broken END states only, and never while an event is running
+		// (a live scene must own the tail itself):
+		if (line >= 4300 && line < 4360) {
+			const model0: any = (sc as any).model;
+			const inCutscene = !!(model0 && typeof model0.isCutscene === 'function' && model0.isCutscene());
+			const ev0: any = (ig.game as any) && (ig.game as any).events;
+			const busy = !!(ev0 && (ev0.blockingEventCall || (ev0.runningEventCalls && ev0.runningEventCalls.length)));
+			const party0: any = (sc as any).party;
+			const emilieMissing = !!(party0 && typeof party0.isPartyMember === 'function'
+				&& !party0.isPartyMember('Emilie') && party0.models && party0.models['Emilie']);
+			if (!inCutscene && !busy) {
+				// (a) the scene completed (the plot moved on) but Emilie never joined.
+				if (line >= 4320 && emilieMissing) {
+					try {
+						party0.models['Emilie']._mpStoryAdded = true;
+						party0.addPartyMember('Emilie', null, true, false);
+						try { if (typeof party0.setLocked === 'function') party0.setLocked('Emilie', true); } catch (_) { /* ignore */ }
+						fixed = true;
+						console.warn('[storysync] repaired missing Emilie after Maroon Valley intro (plot.line ' + line + ')');
+					} catch (_) { /* ignore */ }
+				}
+				// (b) the tail never ran: plot.line stuck in [4300,4320) with no event
+				// running. The IntroScene trigger is triggerType ALWAYS — it fires
+				// within about a second of the map becoming event-ready, so five
+				// quiet seconds in this window mean the scene is gone for good.
+				// Complete the tail by hand: Emilie, plot.line 4320, the Ba'kii Kum
+				// perma task (inline LangLabel — same text the scene's
+				// SET_PERMA_TASK step stores).
+				if (line >= 4300 && line < 4320) {
+					if (!this.maroonIntroStuckSince) this.maroonIntroStuckSince = Date.now();
+					if (Date.now() - this.maroonIntroStuckSince >= 5000) {
+						if (this.applyMaroonIntroTail()) {
+							fixed = true;
+							this.maroonIntroStuckSince = 0;
+							console.warn('[storysync] completed lost Maroon Valley intro tail (plot.line -> 4320, Emilie joined, Ba\'kii Kum task set)');
+						}
+					}
+				} else {
+					this.maroonIntroStuckSince = 0;
+				}
+			} else {
+				// A live (or wedged) scene owns this window — never fight it.
+				this.maroonIntroStuckSince = 0;
+			}
+		} else {
+			this.maroonIntroStuckSince = 0;
+		}
+		if (!this.permaTaskFollowsSchneiderHq()) {
+			if (fixed) {
+				try { if ((ig.game as any).varsChangedDeferred) (ig.game as any).varsChangedDeferred(); } catch (_) { /* ignore */ }
+				if (Date.now() - this.storyIntegrityToastAt > 8000) {
+					this.storyIntegrityToastAt = Date.now();
+					showMpToast({ title: t('storyIntegrityFixedTitle'), subtitle: t('storyIntegrityFixedBody') });
+				}
+			}
+			return;
+		}
 		// The meeting scene normally ends at 3710 (Schneider spawns on
 		// autumn.path-3-1 from 3710 on). A snapshot rollback can leave the task
 		// text behind while plot.line sits below that.

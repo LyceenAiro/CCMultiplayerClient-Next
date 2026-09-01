@@ -38,6 +38,28 @@ import { Multiplayer } from '../multiplayer';
  * vanished. PushPullDest entities are therefore NEVER networked, and a box
  * whose own destination is already placed in THIS save neither sends nor
  * receives position — every player solves that particular box themselves.
+ *
+ * 1.77.x — heat-dng.f1.room-02 steam/touch LORRIES are host-managed (scoped to
+ * that one map): every client used to simulate its own platforms from its own
+ * per-player tmp.platformMove, so the steam platform was at a different rail
+ * position (or never moving) on every machine and riders fell through. Now:
+ *   - the map-instance HOST is the only lorry authority: it streams position
+ *     (30Hz while moving, 1Hz full snapshots otherwise) + move state;
+ *   - member copies are frozen puppets (_mpLorryHostDriven suppresses
+ *     moveLorry/varsChanged/resetPos/collideWith); the move state is applied
+ *     via the NATIVE setMove() so members see the exact same effects as the
+ *     host (lorryRuns flame + light + activate/deactivate bursts);
+ *   - the propeller OneTimeSwitches that feed tmp.platformMove stay locally
+ *     responsive on every client, but members ALSO ship their on-state plus
+ *     the remaining countdown (hits, deciseconds) — the HOST replays the
+ *     native activation against its own copy (vars + timer + fx), so the
+ *     host's steam var only ever changes on the host;
+ *   - the ON_TOUCH_MOVE_ONCE lorry (lorry2) reacts to MEMBER riders through a
+ *     lightweight heartbeat: a member standing on a host-managed lorry sends
+ *     { mi, own: <name> } (~3Hz, long-whitelisted server field), the host
+ *     runs the native touch-start and keeps the platform moving at end-of-rail
+ *     pauses while a remote rider is aboard (vanilla only checks its LOCAL
+ *     player).
  */
 
 const PUZZLE_SCAN_INTERVAL = 0.1;   // seconds — change scan
@@ -91,6 +113,8 @@ let shared: PuzzleSync | null = null;
  * resetGroup wrap must not rebroadcast it back (echo loop). */
 let bounceFxReplayDepth = 0;
 let bounceFxHooksInstalled = false;
+/** 1.77.x: Lorry motion/touch suppression hooks (heat-dng.f1.room-02). */
+let lorryHooksInstalled = false;
 
 export function installPuzzleSync(getMain: () => Multiplayer | undefined): IPuzzleSync {
 	if (!shared) shared = new PuzzleSync(getMain);
@@ -121,6 +145,14 @@ class PuzzleSync implements IPuzzleSync {
 	private _varLogSeen = new Set<string>();
 	/** 1.76.x: per-group timestamp of the last relayed fail-flash replay (spam guard). */
 	private bounceResetFxAt = new Map<string, number>();
+	/** 1.77.x: member-side rider heartbeat throttle for host-managed lorries
+	 * (mapId -> last send time). */
+	private riderSentAt = new Map<number, number>();
+	/** 1.77.x: set once a lorry packet from the host has actually been applied —
+	 * the member-side freeze waits for this, so a lobby whose HOST runs an older
+	 * build (no lorry stream) keeps the old per-player behaviour instead of
+	 * freezing the member's platforms in place. */
+	private lorryStreamAt = 0;
 
 	constructor(private getMain: () => Multiplayer | undefined) {
 		(window as any).__mppuzzle = () => this.dump();
@@ -143,6 +175,7 @@ class PuzzleSync implements IPuzzleSync {
 		}
 		this.installPushPullHooks();
 		this.installBounceFxHooks();
+		this.installLorryHooks();
 	}
 
 	public tick(): void {
@@ -151,7 +184,7 @@ class PuzzleSync implements IPuzzleSync {
 		const g: any = ig.game;
 		if (!g || !g.playerEntity || g.isTeleporting()) return;
 		if (!this.inDungeon()) {
-			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size || this.placedBoxIds.size || this.followers.size) {
+			if (this.seen.size || this.lastSig.size || this.interp.size || this.remoteOwners.size || this.placedBoxIds.size || this.followers.size || this.riderSentAt.size) {
 				this.seen.clear();
 				this.lastSig.clear();
 				this.lastMap = '';
@@ -161,6 +194,7 @@ class PuzzleSync implements IPuzzleSync {
 				this.ownHeartbeat.clear();
 				this.placedBoxIds.clear();
 				this.followers.clear();
+				this.riderSentAt.clear();
 			}
 			return;
 		}
@@ -176,8 +210,13 @@ class PuzzleSync implements IPuzzleSync {
 			this.ownHeartbeat.clear();
 			this.placedBoxIds.clear();
 			this.followers.clear();
+			this.riderSentAt.clear();
+			this.lorryStreamAt = 0;
 		}
 		this.expireRemoteOwners((g.entities as any[]) || []);
+		// 1.77.x: flag/unflag the room-02 lorries as host-driven puppets (members)
+		// or hand them back to native var-driven behaviour (host migration).
+		this.syncLorryFlags((g.entities as any[]) || []);
 		// Fast 30Hz stream for MOVING pushable pillars/boxes (idle ones stay at the
 		// 1Hz full snapshot). Runs on its own timer, independent of the 10Hz scan.
 		this.fastTimer -= ig.system.tick;
@@ -213,6 +252,16 @@ class PuzzleSync implements IPuzzleSync {
 			// half-finished transition back, which made the Temple Chamber 1 pillars
 			// oscillate at ~80% and never reach their final height.
 			if (!m.host && this.isMovingPlatform(e)) continue;
+			// 1.77.x (host-managed room-02 lorries): members never publish the
+			// platforms — the host streams the one true position + move state.
+			if (!m.host && this.isHostManagedLorry(e)) continue;
+			// 1.77.x: a MOVING host-managed lorry rides the 30Hz fast stream
+			// (scanFast); the 10Hz scan leaves it alone so the two streams share
+			// the server's per-socket puzzleState budget (raised 20/s -> 60/s in
+			// 1.77.x for exactly this stream) instead of competing for it. Idle
+			// lorries keep the normal 10Hz/1Hz path (stop/state changes flush
+			// within 100ms via the sig diff).
+			if (m.host && this.isHostManagedLorry(e) && e.moving) continue;
 			// Ball-pushed ice pillars are host-authoritative too: members must not echo
 			// their own (slightly-ahead) slide — the host's copy moves via the synced
 			// ball and streams the one true position back.
@@ -302,15 +351,23 @@ class PuzzleSync implements IPuzzleSync {
 				if (!e || e._killed || typeof mi !== 'number' || !mi) continue;
 				const push = this.isPushPull(e);
 				const sliding = this.isSlidingBlock(e);
-				if (!push && !sliding) continue;
-				if (!this.isPushableMoving(e)) continue;
-				// Same authority fence as the 10Hz scan (see tick).
-				if (sliding && !m.host) continue;
-				if (push && this.placedBoxIds.has(mi)) continue;
-				if (push && this.remoteOwners.has(mi)) continue;
-				if (push && !m.host && !this.isLocalGripping(e) && !this.ownedLast.has(mi)) continue;
+				const lorry = this.isHostManagedLorry(e);
+				if (!push && !sliding && !lorry) continue;
+				if (lorry) {
+					// Host-managed room-02 lorries ride the 30Hz stream while moving
+					// so riders glide; idle lorries fall back to the 1Hz full
+					// snapshot. Only the host publishes (members are puppets).
+					if (!m.host || !e.moving) continue;
+				} else {
+					if (!this.isPushableMoving(e)) continue;
+					// Same authority fence as the 10Hz scan (see tick).
+					if (sliding && !m.host) continue;
+					if (push && this.placedBoxIds.has(mi)) continue;
+					if (push && this.remoteOwners.has(mi)) continue;
+					if (push && !m.host && !this.isLocalGripping(e) && !this.ownedLast.has(mi)) continue;
+				}
 				const entry = this.encode(e);
-				if (push && this.isLocalGripping(e)) {
+				if (!lorry && push && this.isLocalGripping(e)) {
 					if (typeof (e as any)._mpPuzzleGripAt !== 'number') (e as any)._mpPuzzleGripAt = Date.now();
 					entry.own = myName || 'unknown';
 					entry.ot = (e as any)._mpPuzzleGripAt;
@@ -318,6 +375,9 @@ class PuzzleSync implements IPuzzleSync {
 				}
 				entries.push(entry);
 			}
+			// 1.77.x: member standing on a host-managed lorry -> heartbeat to the
+			// host so ON_TOUCH_MOVE_ONCE platforms react to remote riders.
+			this.lorryRiderHeartbeat();
 			if (!entries.length) return;
 			try { m.connection.puzzleState(map, entries); } catch (_) { /* ignore */ }
 		} catch (_) { /* never break the frame */ }
@@ -652,6 +712,10 @@ class PuzzleSync implements IPuzzleSync {
 		// for the whole party). Scoped strictly to this one map so every other
 		// dungeon switch keeps syncing.
 		if (this.isLocalOnlyFloorSwitch(e)) return false;
+		// 1.77.x (heat-dng.f1.room-02 host-managed steam/touch lorries — header):
+		// scoped strictly to that one map; every other map's lorries stay
+		// per-player and untouched.
+		if (this.isHostManagedLorry(e)) return true;
 		// NOTE (1.71.3): PushPullDest is deliberately NOT listed here — its
 		// raised/lowered height is a per-player SAVE mechanism. A solved player's
 		// lowered plate must never be broadcast over an unsolved player's raised
@@ -706,6 +770,190 @@ class PuzzleSync implements IPuzzleSync {
 		const E: any = (ig.ENTITY as any);
 		if (!E) return false;
 		return (E.DynamicPlatform && e instanceof E.DynamicPlatform);
+	}
+
+	/** 1.77.x: true only on heat-dng.f1.room-02 (dot map name) — the one room
+	 * whose lorries are host-managed. Everything lorry-related is scoped here. */
+	private isLorryRoom(): boolean {
+		try { return (((ig.game as any) && (ig.game as any).mapName) || '') === 'heat-dng.f1.room-02'; } catch (_) { return false; }
+	}
+
+	/** A Lorry on the host-managed room. Lorries anywhere else stay per-player. */
+	private isHostManagedLorry(e: any): boolean {
+		try {
+			const L: any = (ig.ENTITY as any).Lorry;
+			return !!(L && e instanceof L && this.isLorryRoom());
+		} catch (_) { return false; }
+	}
+
+	/** A propeller OneTimeSwitch feeding the room-02 steam var (tmp.platformMove*). */
+	private isLorryRoomSwitch(e: any): boolean {
+		try {
+			const OT: any = (ig.ENTITY as any).OneTimeSwitch;
+			return !!(OT && e instanceof OT && this.isLorryRoom()
+				&& typeof e.addValue === 'string' && e.addValue.indexOf('tmp.platformMove') === 0);
+		} catch (_) { return false; }
+	}
+
+	/** HOST side of a member's propeller hit: replay the native ballHit
+	 * activation against the host's own copy — vars (+1), isOn, countdown timer,
+	 * on-fx/anim and the hit sounds. The shooter's client already validated the
+	 * hit, so no hitCondition check here. Re-hits while on only refresh the
+	 * countdown (like native) without restarting fx/anims. */
+	private hostActivateLorrySwitch(e: any, remainSec?: number): void {
+		try {
+			const fresh = !e.isOn;
+			const full = e.activeTime ? e.activeTime / (e.fastMode ? 1 : (sc as any).options.get('assist-puzzle-speed')) : 0;
+			const rem = (typeof remainSec === 'number' && isFinite(remainSec) && remainSec > 0) ? remainSec : full;
+			if (fresh) {
+				try { (ig as any).vars.set(e.variable, true); } catch (_) { /* ignore */ }
+				try { (ig as any).vars.add(e.addValue, 1); } catch (_) { /* ignore */ }
+				e.isOn = true;
+				try { (ig as any).SoundHelper.playAtEntity(e.sounds.hit, e); } catch (_) { /* ignore */ }
+				try { (ig as any).SoundHelper.playAtEntity(e.sounds.bing, e); } catch (_) { /* ignore */ }
+				if (e.activeTime) {
+					e.timer = rem;
+					try { if (typeof e.setTempOn === 'function') e.setTempOn(false); } catch (_) { /* ignore */ }
+				} else {
+					try { if (typeof e.setOn === 'function') e.setOn(); } catch (_) { /* ignore */ }
+				}
+			} else if (e.activeTime && rem > 0) {
+				e.timer = Math.max(e.timer || 0, rem);
+			}
+		} catch (_) { /* never break the apply */ }
+	}
+
+	/** HOST side of a member's switch expiry: mirror the native timer-expiry tail
+	 * (update()): zero the countdown FIRST (so the native update can't setOff a
+	 * second time and double-decrement the steam var), then setOff + fx/anim. */
+	private hostDeactivateLorrySwitch(e: any): void {
+		try {
+			e.timer = 0;
+			try { if (typeof e.setOff === 'function') e.setOff(); } catch (_) { /* ignore */ }
+			try { if (e.fxHandle) { e.fxHandle.stop(); e.fxHandle = null; } } catch (_) { /* ignore */ }
+			try { if (e.fx && e.fx.tmpOnEnd) e.fx.tmpOnEnd.spawnOnTarget(e); } catch (_) { /* ignore */ }
+			try {
+				const off = typeof e.getOffAnim === 'function' ? e.getOffAnim() : 'off';
+				if (e.animSheet && typeof e.animSheet.hasAnimation === 'function' && e.animSheet.hasAnimation('tmpOnEnd')) e.setCurrentAnim('tmpOnEnd', true, off);
+				else e.setCurrentAnim(off);
+			} catch (_) { /* ignore */ }
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Every-frame room-02 lorry role maintenance: members flag their lorries as
+	 * host-driven puppets (the hooks below freeze their native behaviour); if
+	 * this client IS the host (or became it mid-room via host migration), clear
+	 * the flag and re-evaluate the steam var so native motion resumes sanely. */
+	private syncLorryFlags(entities: any[]): void {
+		try {
+			if (!this.isLorryRoom()) return;
+			const m = this.getMain();
+			const host = !!(m && m.host);
+			const L: any = (ig.ENTITY as any).Lorry;
+			if (!L) return;
+			for (const e of entities) {
+				if (!e || e._killed || !(e instanceof L)) continue;
+				if (host) {
+					if (e._mpLorryHostDriven) {
+						e._mpLorryHostDriven = false;
+						try { e.varsChanged(); } catch (_) { /* ignore */ }
+					}
+				} else if (!e._mpLorryHostDriven && this.lorryStreamAt) {
+					// Freeze only once the host's lorry stream is actually flowing
+					// (mixed-version lobby with an old host -> stay per-player).
+					e._mpLorryHostDriven = true;
+				}
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Member side: while the local player STANDS on a host-managed lorry, send
+	 * a throttled rider heartbeat ({ mi, own: name }) so the host runs the touch
+	 * logic (ON_TOUCH_MOVE_ONCE) and keeps the platform moving at end-of-rail
+	 * pauses. onMemberLorryTouch bypasses the throttle for an instant first
+	 * packet. */
+	private lorryRiderHeartbeat(): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen() || m.host) return;
+			if (!this.isLorryRoom()) return;
+			const g: any = ig.game;
+			const player = g && g.playerEntity;
+			if (!player) return;
+			const ET: any = (ig as any).EntityTools;
+			const ground = ET && typeof ET.getGroundEntity === 'function' ? ET.getGroundEntity(player) : null;
+			if (!ground || typeof ground.mapId !== 'number' || !ground.mapId) return;
+			const L: any = (ig.ENTITY as any).Lorry;
+			if (!L || !(ground instanceof L)) return;
+			const mi = ground.mapId;
+			const now = Date.now();
+			if (now - (this.riderSentAt.get(mi) || 0) < 300) return;
+			this.riderSentAt.set(mi, now);
+			m.connection.puzzleState(g.mapName || '', [{ mi, own: (m.name || 'unknown') }]);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Instant heartbeat when the local player first collides with a puppet
+	 * lorry (called from the collideWith hook). */
+	public onMemberLorryTouch(lorry: any): void {
+		try {
+			if (lorry && typeof lorry.mapId === 'number') this.riderSentAt.delete(lorry.mapId);
+			this.lorryRiderHeartbeat();
+		} catch (_) { /* ignore */ }
+	}
+
+	/** 1.77.x hooks: member-side puppets skip native motion/var/respawn (the
+	 * host stream is the single authority) and report player touches instead;
+	 * the host-side update wrap restarts an ON_TOUCH_MOVE_ONCE lorry that
+	 * stopped at an end-of-rail pause while a REMOTE rider is still aboard
+	 * (vanilla only checks its LOCAL player). */
+	private installLorryHooks(): void {
+		if (lorryHooksInstalled) return;
+		lorryHooksInstalled = true;
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const self = this;
+		try {
+			const L: any = (ig.ENTITY as any).Lorry;
+			if (!L || !L.prototype) return;
+			const skip = ['moveLorry', 'varsChanged', 'resetPos'];
+			for (const name of skip) {
+				const orig = L.prototype[name];
+				if (typeof orig !== 'function') continue;
+				L.prototype[name] = function (this: any) {
+					if (this._mpLorryHostDriven) return undefined;
+					return orig.apply(this, arguments as any);
+				};
+			}
+			const origCollide = L.prototype.collideWith;
+			if (typeof origCollide === 'function') {
+				L.prototype.collideWith = function (this: any, a: any) {
+					if (this._mpLorryHostDriven) {
+						try { if (a && a.isPlayer && self) self.onMemberLorryTouch(this); } catch (_) { /* ignore */ }
+						return;
+					}
+					return origCollide.apply(this, arguments as any);
+				};
+			}
+			const origUpdate = L.prototype.update;
+			if (typeof origUpdate === 'function') {
+				L.prototype.update = function (this: any) {
+					const wasMoving = !!this.moving;
+					const r = origUpdate.apply(this, arguments as any);
+					try {
+						if (wasMoving && !this.moving && !this._mpLorryHostDriven
+							&& this.moveType && this.moveType.onPauseFreeStop
+							&& typeof this._mpRemoteRiderUntil === 'number' && Date.now() < this._mpRemoteRiderUntil) {
+							// Remote rider still aboard: the native pause check only saw
+							// the (absent) local player — keep going like vanilla would.
+							this.pauseTimer = 0.4;
+							this.setMove(true);
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				};
+			}
+			console.log('[puzzlesync] lorry host-management hooks installed');
+		} catch (e) { console.warn('[puzzlesync] lorry hooks failed', e); }
 	}
 
 	/** Ball-pushed sliding blocks (cold-dng ice pillars): host-authoritative position.
@@ -1024,6 +1272,18 @@ class PuzzleSync implements IPuzzleSync {
 		if (typeof e.phased === 'boolean') s.ph = e.phased ? 1 : 0;
 		if (e.pushPullable && typeof e.pushPullable.active === 'boolean') s.act = e.pushPullable.active ? 1 : 0;
 		if (typeof e.moving === 'boolean') s.mv = e.moving ? 1 : 0;
+		// 1.77.x (room-02 steam valves): ship the remaining countdown in
+		// deciseconds via `hits` (OneTimeSwitch never uses that field) so member
+		// re-hits keep refreshing the HOST's timer — isOn alone never changes on
+		// a re-hit and the host's copy would expire mid-puzzle otherwise.
+		{
+			// Only the member->host direction needs the countdown (it refreshes the
+			// host's timer). The host's own echo is cosmetic on members and would
+			// just spend 10/s of its puzzleState budget competing with the 30Hz
+			// lorry stream — so the host ships edges + 1Hz fulls only.
+			const m = this.getMain();
+			if (this.isLorryRoomSwitch(e) && e.activeTime && !(m && m.host)) s.hits = Math.round(((e.timer || 0) as number) * 10);
+		}
 		if (e._hidden) s.hd = 1;
 		return s;
 	}
@@ -1033,6 +1293,35 @@ class PuzzleSync implements IPuzzleSync {
 		// state — a peer standing on their copy must never drop OUR wall (mixed
 		// client versions / the host full snapshot may still carry it).
 		if (this.isLocalOnlyFloorSwitch(e)) return;
+		// 1.77.x (host-managed room-02 lorries): fully self-contained branch.
+		// Host: consumes member rider heartbeats (own = rider name) and ignores
+		// everything else (it is the authority). Members: follow the host's
+		// position stream and mirror the move state through NATIVE setMove() so
+		// the flame/light/activate/deactivate effects match the host exactly.
+		const LR: any = (ig.ENTITY as any).Lorry;
+		if (LR && e instanceof LR && this.isHostManagedLorry(e)) {
+			if (this.isInstanceHost()) {
+				if (typeof s.own === 'string' && s.own) {
+					try { (e as any)._mpRemoteRiderUntil = Date.now() + 900; } catch (_) { /* ignore */ }
+					try {
+						if (e.moveType && e.moveType.onTouchStart && !e.moving
+							&& e.moveCondition && e.moveCondition.evaluate()) {
+							e.pauseTimer = 0.4;
+							e.setMove(true);
+						}
+					} catch (_) { /* ignore */ }
+				}
+				return;
+			}
+			this.lorryStreamAt = Date.now();
+			try { (e as any)._mpLorryHostDriven = true; } catch (_) { /* ignore */ }
+			if (s.p && e.coll) this.setInterpTarget(e, s.p[0], s.p[1], s.p[2]);
+			if (typeof s.mv === 'number') {
+				const want = s.mv === 1;
+				if (!!e.moving !== want) { try { e.setMove(want); } catch (_) { /* ignore */ } }
+			}
+			return;
+		}
 		// Box authority: the gripping client never accepts box echoes (server
 		// already excludes the sender, but a different client's 1Hz host snapshot
 		// or a stale non-owner packet can still arrive), and follower copies only
@@ -1128,6 +1417,24 @@ class PuzzleSync implements IPuzzleSync {
 					else if (typeof e.state === 'number' && typeof e.turnIce !== 'function') e.state = s.st;
 				} catch (_) { /* ignore */ }
 			}
+		}
+		// 1.77.x (room-02 steam valves): on the HOST a member's propeller packet
+		// (on=1 + remaining countdown in hits) replays the NATIVE activation against
+		// the host's own copy — tmp.platformMove only ever changes on the host, the
+		// sole lorry authority. Members keep the generic path (purely cosmetic
+		// on/anim mirror; their local native hit already gave local feedback).
+		// MUST run before the generic s.on block below: that block flips e.isOn on
+		// the host copy WITHOUT adding the steam var, which would swallow the
+		// off->on edge (hostActivateLorrySwitch's fresh check) and the host's
+		// lorry would never start on a member's hit.
+		if (this.isLorryRoomSwitch(e) && this.isInstanceHost()) {
+			if (typeof s.on === 'number') {
+				const want = s.on === 1;
+				const rem = typeof s.hits === 'number' ? s.hits / 10 : undefined;
+				if (want) this.hostActivateLorrySwitch(e, rem);
+				else if (e.isOn) this.hostDeactivateLorrySwitch(e);
+			}
+			return;
 		}
 		if (typeof s.on === 'number' && (typeof e.isOn === 'boolean' || typeof e.isOn === 'number')) {
 			try {

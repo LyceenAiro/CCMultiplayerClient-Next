@@ -55,6 +55,17 @@ interface IIdentifyResult {
      * 0; older servers omit both -> client falls back to the defaults 30 / 0.6. */
     perfectGuardBaseMs?: number;
     perfectGuardPingFactor?: number;
+    /** 1.77.x (player trading): master switch + the exchange LOSS ratio —
+     * what the RECEIVER gets is floor(given / ratio) (default 2 = give 6,
+     * partner receives 3). Older servers omit both -> client defaults true/2. */
+    tradeEnabled?: boolean;
+    tradeRatio?: number;
+    /** Anti-dupe: remaining trade lockout in ms (0/omitted = free to trade).
+     * Set server-side after a save import or mirror rollback. */
+    tradeLockMs?: number;
+    /** Anti-dupe: the server's CONFIGURED lockout duration in hours (default 48,
+     * 0 = restriction disabled). Used for message text; older servers omit it. */
+    tradeLockHours?: number;
     /** 1.71.0: save-mirror metadata in mirror-rollback mode (newest first). */
     mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>;
 }

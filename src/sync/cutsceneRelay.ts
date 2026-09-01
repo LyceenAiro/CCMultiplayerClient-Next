@@ -22,11 +22,18 @@ import { Multiplayer } from '../multiplayer';
  *     style events never gather the party);
  *   - triggerType must be ONCE (map._entity<id>_triggered) — per-entry
  *     (tmp.*) and ALWAYS triggers are excluded, so walking into a map never
- *     chain-teleports anyone;
+ *     chain-teleports anyone (the heat-dng midboss arena intro is the one
+ *     scoped exception: an ALWAYS trigger keyed by map+name+condition, see
+ *     isMidbossIntroTrigger — its arming var is per-client, so without the
+ *     relay the party never gathers for the boss cutscene);
  *   - the trigger must have a real startCondition — condition-less entry
  *     cutscenes fire per-player on arrival by design;
  *   - while main-story sync is active, story sync owns trigger authority and
- *     this relay stays out of the way (both directions).
+ *     this relay stays out of the way (both directions);
+ *   - a relay received while the LOCAL player is mid-cutscene / blocking event
+ *     is DEFERRED until the scene ends (never teleport+start on top of a
+ *     running scene — the miners-bombquest-1 mid-dialogue arena yank wedged
+ *     players inside the sealing bug chamber).
  */
 
 interface ICutsceneRelayPacket {
@@ -98,6 +105,11 @@ class CutsceneRelay implements ICutsceneRelay {
 	private qualifies(trig: any): boolean {
 		try {
 			if (!trig || trig._killed) return false;
+			// heat-dng midboss intro (ALWAYS trigger — no map._entity var):
+			// qualified through the scoped special case, and only while the
+			// local fight has not started (a genuine first start always passes;
+			// the engine's endCondition blocks every later native fire anyway).
+			if (this.isMidbossIntroTrigger(trig)) return !this.midbossFightStarted();
 			const EVT: any = (ig as any).EVENT_TYPE || {};
 			const isCutscene = trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE;
 			// Encounter-battle intros are PARALLEL events carrying the dramatic
@@ -277,6 +289,43 @@ class CutsceneRelay implements ICutsceneRelay {
 		} catch (_) { return false; /* quest-gated and unverifiable: skip, never wedge */ }
 	}
 
+	/** heat-dng midboss intro: the arena cutscene ("enter", mapId 43) is an
+	 * ALWAYS trigger gated by the persistent map var map.battleStart, which the
+	 * door TouchTrigger sets PER CLIENT — so the generic relay (ONCE triggers
+	 * only) never picks it up, and a teammate already inside the room (their
+	 * own battleStart still false) neither gets gathered nor ever plays the
+	 * intro. Scoped exactly like the drill-boss case: map + name + condition. */
+	private isMidbossIntroTrigger(trig: any): boolean {
+		try {
+			if (!trig || trig._killed) return false;
+			const mapName: string = ((ig.game as any).mapName || '') as string;
+			if (mapName !== 'heat-dng/f1/midboss' && mapName !== 'heat-dng.f1.midboss') return false;
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			if (trig.eventType !== EVT.CUTSCENE) return false;
+			const raw = trig._mpCsSettings;
+			if (!raw || raw.name !== 'enter') return false;
+			const cond = typeof raw.startCondition === 'string' ? raw.startCondition.trim() : '';
+			return cond === 'map.battleStart';
+		} catch (_) { return false; }
+	}
+
+	/** True once the midboss fight chain has started (or finished) on THIS
+	 * client. The engine's own endCondition (map.bossIntro >= 1) already keeps
+	 * "enter" from re-firing natively, so these are pure belt-and-braces: a
+	 * relayed intro must never gather/start on top of an ongoing or cleared
+	 * fight (the mid-fight yank), and a replayed relay landing right after our
+	 * own native intro (simultaneous door crossing) must be dropped too. */
+	private midbossFightStarted(): boolean {
+		try {
+			const vars: any = (ig as any).vars;
+			if (!vars || typeof vars.get !== 'function') return false;
+			if (vars.get('map.bossIntro')) return true;
+			if (vars.get('map.battleDone')) return true;
+			if (vars.get('tmp.barrierUp')) return true;
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
 	private markEncounterFade(trig: any): void {
 		try {
 			const EVT: any = (ig as any).EVENT_TYPE || {};
@@ -353,11 +402,31 @@ class CutsceneRelay implements ICutsceneRelay {
 	}
 
 	/** A relay that arrived while we were momentarily busy (teleporting / event
-	 * not start-ready) is retried briefly instead of being dropped forever —
-	 * the engine's own trigger retry covers the var-synced native path, but the
-	 * relay is the only carrier when that path never engaged. */
-	private pendingRelay: { data: ICutsceneRelayPacket, until: number } | null = null;
+	 * not start-ready / mid-cutscene) is retried briefly instead of being dropped
+	 * forever — the engine's own trigger retry covers the var-synced native path,
+	 * but the relay is the only carrier when that path never engaged. `until` is
+	 * the plain retry window; while a LOCAL cutscene is still running the window
+	 * is refreshed (player-paced dialogue can last minutes) up to the absolute
+	 * `dropAt` cap, after which the relay is dropped for good. */
+	private pendingRelay: { data: ICutsceneRelayPacket, until: number, dropAt: number } | null = null;
 	private pendingTimer: any = null;
+
+	/** True while a cutscene / blocking event is running LOCALLY. The engine's
+	 * isEventStartReady() is hard-coded `return true` in the baked game
+	 * (verified against game.compiled.js), so the old busy check NEVER deferred
+	 * a relay just because we were mid-scene — the gather teleport then yanked
+	 * the player out of their own cutscene (miners-bombquest-1: straight into
+	 * the sealing bug arena) and the stacked second cutscene wedged both event
+	 * calls ("卡死在剧情中"). */
+	private localSceneBusy(): boolean {
+		try {
+			const mdl: any = (sc as any).model;
+			if (mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene()) return true;
+			const ev: any = (ig.game as any) && (ig.game as any).events;
+			if (ev && typeof ev.getBlockingEventCall === 'function' && ev.getBlockingEventCall()) return true;
+		} catch (_) { /* ignore */ }
+		return false;
+	}
 
 	public onRelay(data: ICutsceneRelayPacket): void {
 		try {
@@ -367,10 +436,19 @@ class CutsceneRelay implements ICutsceneRelay {
 			const g: any = ig.game;
 			if (!g || !g.playerEntity) return;
 			if ((g.mapName || '') !== data.map) return; // different block — not for us
-			if (g.isTeleporting() || (typeof g.isEventStartReady === 'function' && !g.isEventStartReady())) {
-				// Busy right now — retry for up to 10s instead of losing the moment.
-				this.logOnce('busy:' + data.mi, 'relay mi=' + data.mi + ' deferred (busy), retrying');
-				this.pendingRelay = { data, until: Date.now() + 10000 };
+			if (g.isTeleporting() || this.localSceneBusy() || (typeof g.isEventStartReady === 'function' && !g.isEventStartReady())) {
+				// Busy right now — retry for up to 30s (kept alive while a local
+				// cutscene runs, capped at 5 minutes) instead of losing the moment.
+				// Never teleport+start on top of a running scene: that is exactly the
+				// mid-dialogue arena yank that wedged players in miners-bombquest-1.
+				this.logOnce('busy:' + data.mi, 'relay mi=' + data.mi + ' deferred (busy' + (this.localSceneBusy() ? ': in cutscene' : '') + '), retrying');
+				const prevPend = this.pendingRelay;
+				const samePend = !!(prevPend && prevPend.data.map === data.map && prevPend.data.mi === data.mi);
+				this.pendingRelay = {
+					data,
+					until: Date.now() + 30000,
+					dropAt: samePend ? (prevPend as any).dropAt : (Date.now() + 5 * 60000),
+				};
 				this.armPendingRetry();
 				return;
 			}
@@ -412,6 +490,32 @@ class CutsceneRelay implements ICutsceneRelay {
 			// quest data is missing locally and we'd be stuck.
 			if (this.hasQuestGate(trig) && !this.questGateMet(trig)) {
 				this.logOnce('quest:' + data.mi, 'relay mi=' + data.mi + ' skipped: local quest condition not met');
+				return;
+			}
+			// heat-dng midboss intro (ALWAYS trigger — no triggerVar to consume):
+			// the door TouchTrigger arms map.battleStart for the crossing player
+			// ONLY, so this relay is the party's one gather+intro carrier. The
+			// receiver replays "enter" locally (walk-in + camera + map.bossIntro=1,
+			// which then fires their own bossAppars natively); the jellyfish adds
+			// stay host-owned (netSync kills member-side event spawns). Skipped
+			// once the local fight already started — both players crossing the door
+			// together each play their own native intro, and a late deferred retry
+			// landing after our scene ended must not replay a second one.
+			if (this.isMidbossIntroTrigger(trig)) {
+				if (this.midbossFightStarted()) { this.logOnce('done:' + data.mi, 'midboss intro skipped: fight already started locally'); return; }
+				if (trig.eventCall && trig.eventCall.isRunning()) { this.logOnce('run:' + data.mi, 'midboss intro already running natively'); return; }
+				const ev = this.eventOf(trig);
+				if (!ev) {
+					console.warn('[cutscenerelay] no event object for midboss intro mi=' + data.mi);
+					return;
+				}
+				try { g.playerEntity.setPos(data.p[0], data.p[1], data.p[2]); } catch (_) { /* ignore */ }
+				this.applying = true;
+				try {
+					(sc as any).Cutscene.startEvent(trig.eventType, ev);
+					console.log('[cutscenerelay] started relayed midboss intro mi=' + data.mi
+						+ ' from=' + (data.from || '?'));
+				} finally { this.applying = false; }
 				return;
 			}
 			// We already consumed it (we were standing in the zone ourselves, or
@@ -486,10 +590,14 @@ class CutsceneRelay implements ICutsceneRelay {
 		this.pendingTimer = setInterval(() => {
 			try {
 				const p = self.pendingRelay;
-				if (!p || Date.now() > p.until) { self.pendingRelay = null; return; }
+				if (!p || Date.now() > p.dropAt) { self.pendingRelay = null; return; }
 				const g: any = ig.game;
 				if (!g || !g.playerEntity || g.isTeleporting()) return;
 				if ((g.mapName || '') !== p.data.map) { self.pendingRelay = null; return; }
+				// A local cutscene is still running: keep the relay alive (refreshed
+				// window, bounded by dropAt) — it must apply only AFTER the scene ends.
+				if (self.localSceneBusy()) { p.until = Date.now() + 10000; return; }
+				if (Date.now() > p.until) { self.pendingRelay = null; return; }
 				if (typeof g.isEventStartReady === 'function' && !g.isEventStartReady()) return;
 				const data = p.data;
 				self.pendingRelay = null;

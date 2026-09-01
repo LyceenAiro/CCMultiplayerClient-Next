@@ -83,6 +83,13 @@ interface IEnemySnap {
 	                  // annotate.passive === VULNERABLE (the meerkat's 2s "charge light"
 	                  // red-flash window where a charged ball breaks it). The member's
 	                  // puppet mirrors this as the red BLINK_COLOR flash it never showed.
+	inv?: number;     // ROUND 153: invincibleTimer !== 0 on the host enemy (the
+	                  // sandshark's SET_INVINCIBLE -1 while swimming / 0 mid-jump —
+	                  // ACTION-carried, so the ss state stream can't see it). Mirrored
+	                  // onto the puppet as invincibleTimer -1/0 (see applyEntityState) —
+	                  // without it a member's adopted shark kept a stuck -1 from its
+	                  // local pre-adoption AI and was NEVER hittable (the local
+	                  // invincible gate swallowed every hit before the forward).
 	abs?: number;     // ROUND 135: ABSORBED — 1 while this enemy is stored inside another
 	                  // enemy via STORE_IN_COLLAB_PARTNER (the Digmo's BOT_BUG_FETCH fleas).
 	                  // Hidden-but-alive on the host (never killed), so the member must
@@ -327,6 +334,14 @@ export class NetSync {
 	 * `blockInterval` (the option-driven 怪物同步频率, default 1/30) so the projectile
 	 * stream matches the hostile enemy-block rate instead of a hardcoded 15Hz. */
 	private _mpProjSendTimer = 0;
+	/** DIAG (heat-dng midboss proxies): once-per-key log dedupe + map gate. */
+	private _mpProjDiagLog: { [k: string]: boolean } = Object.create(null);
+	private _mpProjDiagMap(): boolean {
+		try {
+			const m = ((ig.game as any) && (ig.game as any).mapName) || '';
+			return m === 'heat-dng/f1/midboss' || m === 'heat-dng.f1.midboss';
+		} catch (_) { return false; }
+	}
 	/** Round 62: stale-reap accumulator for visual projectile copies (member side). */
 	private _mpProjReapTimer = 0;
 	/** ROUND 132: accumulator for the LOCAL player's thrown-ball position stream
@@ -339,6 +354,9 @@ export class NetSync {
 	/** 1.74.x: cached ball-changer FX sheet (fresh EffectSheet instances are
 	 * NOT loaded at spawn time — the first spawnOnTarget silently returns null). */
 	private _mpBallConvertSheet: any = null;
+	/** 1.77.x: cached quicksand FX sheet (sandTrail loop on sinking mirrors).
+	 * Pre-created in installPuzzleFxHooks — a fresh sheet's first spawn no-ops. */
+	private _mpSandSheet: any = null;
 	/** 1.74.x: ball-death tracking for the playerBall stream (uid alive last
 	 * block → dead marker next block) + per-map reset guard. */
 	private _mpBallStreamAlive: { [uid: string]: number } = {};
@@ -3497,6 +3515,13 @@ export class NetSync {
 			// its own copy too (drops + propsDestroyed count + respawn var). The receiver
 			// sets _mpSyncedDestroy before calling destroy() — that flag suppresses the
 			// re-broadcast here, so the sync can never loop.
+			// 1.76.x (plant-bug adoption): a MEMBER breaker pre-rolls the enemy-spawn
+			// outcome (memberPreRollPlantSpawn) and suppresses the LOCAL spawn — the
+			// vanilla roll inside destroy() would create a member-local dynamic enemy
+			// (mapId 0) that the host-sync reap culls instantly ("the plant bug dies
+			// immediately"). The outcome rides the plantBreak relay (es) and the HOST
+			// spawns the authoritative enemy, which the enemy stream delivers back to
+			// everyone — breaker included — as a regular puppet.
 			try {
 				const IDProto: any = (ig.ENTITY as any).ItemDestruct && (ig.ENTITY as any).ItemDestruct.prototype;
 				if (IDProto && typeof IDProto.destroy === 'function' && !IDProto._mpDestructWrapped) {
@@ -3505,10 +3530,14 @@ export class NetSync {
 					IDProto.destroy = function (this: any) {
 						const synced = !!this._mpSyncedDestroy;
 						this._mpSyncedDestroy = false;
+						const m0 = (window as any).__mpMain;
+						const ns0: any = m0 && m0.netSync;
+						const rolled = !synced && ns0 && typeof ns0.memberPreRollPlantSpawn === 'function'
+							&& ns0.memberPreRollPlantSpawn(this);
 						const r = origDestroy.call(this);
+						if (rolled && ns0 && typeof ns0.memberRestorePlantSpawn === 'function') ns0.memberRestorePlantSpawn(this);
 						try {
-							const m = (window as any).__mpMain;
-							if (!synced && m && m.netSync) m.netSync.broadcastPlantBreak(this);
+							if (!synced && ns0) ns0.broadcastPlantBreak(this);
 						} catch (_) { /* never break the destroy chain */ }
 						return r;
 					};
@@ -3520,6 +3549,7 @@ export class NetSync {
 			// their destroy chain only on the client that triggered them. Relay the stable
 			// mapId on destroy() so every other client destroys its own copy through the
 			// vanilla boom/debris/vars chain (suppressed re-broadcast via _mpSyncedDestroy).
+			// 1.76.x (plant-bug adoption): same member pre-roll as the ItemDestruct wrap.
 			try {
 				const DEProto: any = (ig.ENTITY as any).Destructible && (ig.ENTITY as any).Destructible.prototype;
 				if (DEProto && typeof DEProto.destroy === 'function' && !DEProto._mpDestruct2Wrapped) {
@@ -3528,10 +3558,14 @@ export class NetSync {
 					DEProto.destroy = function (this: any) {
 						const synced = !!this._mpSyncedDestroy;
 						this._mpSyncedDestroy = false;
+						const m0 = (window as any).__mpMain;
+						const ns0: any = m0 && m0.netSync;
+						const rolled = !synced && ns0 && typeof ns0.memberPreRollPlantSpawn === 'function'
+							&& ns0.memberPreRollPlantSpawn(this);
 						const r = origDestroy2.call(this);
+						if (rolled && ns0 && typeof ns0.memberRestorePlantSpawn === 'function') ns0.memberRestorePlantSpawn(this);
 						try {
-							const m = (window as any).__mpMain;
-							if (!synced && m && m.netSync) m.netSync.broadcastPlantBreak(this);
+							if (!synced && ns0) ns0.broadcastPlantBreak(this);
 						} catch (_) { /* never break the destroy chain */ }
 						return r;
 					};
@@ -3709,6 +3743,17 @@ export class NetSync {
 						const r = origSpawn.call(this, type, x, y, z, settings, ...rest);
 						try {
 							const Enemy = (ig.ENTITY as any).Enemy;
+							// 1.76.x (heat-dng midboss co-op intro): a member's own event-spawned
+							// jellyfish adds are killed silently inside — the HOST's real copies
+							// (streamed via the normal block) are the killable ones. skipHook mod
+							// spawns (typed puppets incl. those very host jellyfish) never enter.
+							const mSpawn: any = (window as any).__mpMain;
+							if (r && r instanceof Enemy && !r._mpMirror
+								&& !(settings && settings.skipHook)
+								&& mSpawn && mSpawn.netSync && typeof mSpawn.netSync.suppressMidbossAddSpawn === 'function'
+								&& mSpawn.netSync.suppressMidbossAddSpawn(r, settings)) {
+								return r;
+							}
 							if (r && r instanceof Enemy && !r._mpMirror
 								&& !(settings && settings.skipHook)
 								&& !(settings && settings.boostable)
@@ -4449,14 +4494,31 @@ export class NetSync {
 	private processLocalEnemyHits(): void { /* removed in round 27 — host-authoritative */ }
 
 	/**
-	 * HOST side: an enemy just hit a remote player's mirror. The mirror's hp is
+	 * A player-originated attack just hit a remote player's mirror. The mirror's hp is
 	 * owner-driven (the owner's playerState overwrites it every frame), so we don't
 	 * damage the mirror — instead forward the hit to the owner, whose client applies
 	 * it to their real player. Called from the Enemy.onPreDamageModification hook.
 	 * `dmg` is the damageResult (u); we read damage/element/critical off it.
 	 */
 	public forwardMirrorHit(mirror: any, dmg: any, attacker?: any): void {
-		if (!this.main.host) return;                 // only the host computes enemy hits
+		// 1.77.x (member-originated hit forwarding): was host-only. A MEMBER now
+		// forwards too — but ONLY hits whose combatant root is our OWN player.
+		// The WaterBlock steam force (party OTHER) exists solely on the steamer's
+		// client: receivers replay the cloud FX-only via steam(null,null), so if
+		// the steamer's client doesn't forward the connect, the victim NEVER
+		// takes the scald (the "steam shows damage only on my screen" report).
+		// No double-hit: the host runs no copy of a member-steamed force, and the
+		// victim's own client spawned none either. Enemy/monster attackers stay
+		// dropped here (host-authoritative via recomputeHostMonsterHit), and the
+		// caller's ROUND-26 gate already rejected puppet/mirror/non-PLAYER roots.
+		if (!this.main.host) {
+			let ownHit = false;
+			try {
+				const rootO: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
+				ownHit = !!(rootO && ig.game.playerEntity && rootO === ig.game.playerEntity);
+			} catch (_) { ownHit = false; }
+			if (!ownHit) return;
+		}
 		if (!mirror || !mirror.name) return;
 		// Round 19 (Part 4): never forward a hit to a cutscene-bound member — their
 		// mirror is cosmetic during the story sequence, and applying real damage
@@ -4471,41 +4533,121 @@ export class NetSync {
 		const now = Date.now();
 		if (mirror._mpLastHitFwd && now - mirror._mpLastHitFwd < 150) return;
 		mirror._mpLastHitFwd = now;
+		const ai: any = attacker && attacker.attackInfo ? attacker.attackInfo : null;
 		// Round 11: the attacking enemy's position rides along so the owner's client
 		// can knock the player away from the hit (projectiles resolve via combatant root).
+		// 1.77.x (steam knockback anchor): a fixed-position CombatForce (the WaterBlock
+		// / water-bubble steam cloud carries an explicit `pos`) knocks the victim away
+		// from the FORCE center, not from the steamer's player — vanilla getHitDir
+		// anchors on the force position. Pos-less forces (melee sweeps) keep the old
+		// root anchor, which equals their vanilla fallback (_getPos = combatant pos).
 		let ax: number | undefined;
 		let ay: number | undefined;
 		try {
-			const root: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
-			const c = root && root.coll;
-			if (c && c.pos) {
-				ax = c.pos.x + (c.size ? c.size.x / 2 : 0);
-				ay = c.pos.y + (c.size ? c.size.y / 2 : 0);
+			const fp: any = attacker && attacker.pos;
+			if (fp && typeof fp.x === 'number' && isFinite(fp.x) && typeof fp.y === 'number' && isFinite(fp.y)) {
+				ax = fp.x; ay = fp.y;
+			} else {
+				const root: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
+				const c = root && root.coll;
+				if (c && c.pos) {
+					ax = c.pos.x + (c.size ? c.size.x / 2 : 0);
+					ay = c.pos.y + (c.size ? c.size.y / 2 : 0);
+				}
 			}
 		} catch (_) { /* ignore */ }
 		// Round 20 (fix 1): the attacker's attack stat rides along so the OWNER's guard
 		// can reduce the forwarded damage with the engine's PLAYER-shield formula — the
 		// host already reduced the number against the mirror's stats, but the member's
-		// guard needs the attacker's real attack value.
+		// guard needs the attacker's real attack value. 1.77.x: a CombatForce carries
+		// no `.params` of its own — read the AttackInfo's attackerParams (the steamer's
+		// real params) so steam scald hits stop shipping attack:0.
 		let atk = 0;
 		try {
-			if (attacker && attacker.params && typeof attacker.params.getStat === 'function') {
-				const a = attacker.params.getStat('attack');
+			const psrc: any = (attacker && attacker.params && typeof attacker.params.getStat === 'function') ? attacker.params
+				: (ai && ai.attackerParams && typeof ai.attackerParams.getStat === 'function') ? ai.attackerParams : null;
+			if (psrc) {
+				const a = psrc.getStat('attack');
 				if (typeof a === 'number' && a > 0) atk = a;
 			}
 		} catch (_) { /* ignore */ }
+		// 1.77.x (steam knockback): the attack's real ATTACK_TYPE rides along so the
+		// victim's client maps it to the genuine fly level — steam is MASSIVE, and the
+		// old typeless packet silently fell back to LIGHT, which is why a scalded
+		// member never visibly got knocked back.
+		let attackType = 0;
+		try {
+			const vt: any = ai && (typeof ai.visualType === 'number' && ai.visualType > 0 ? ai.visualType : ai.type);
+			if (typeof vt === 'number' && vt > 0) attackType = vt;
+		} catch (_) { /* ignore */ }
+		// 1.77.x (steam scald damage): the engine computed dmg.damage against the
+		// MIRROR HUSK's stats (multiplayer.json def ~40), which inflates steam hits far
+		// past the vanilla number for any decently-armored member. STEAM-hint forces
+		// (WaterBlock / water-bubble evaporation, MASSIVE/HEAT — MASSIVE pierces the
+		// player guard, so no guard pipeline applies) recompute here against the
+		// victim's STREAMED real stats, same formula replica as recomputeHostMonsterHit:
+		// PERCENTAGE(atk, def x defenseFactor) x g (victim damageFactor x elemFactor)
+		// x k (damageFactor x crit rolled on real focus) x o (global party factor) x
+		// the engine's ±5% roll. Any read failure falls back to the engine's number.
+		let outDamage: number = dmg.damage;
+		let critFlag = !!dmg.critical;
+		try {
+			if (ai && typeof ai.hasHint === 'function' && ai.hasHint('STEAM') && atk > 0) {
+				const pct = (a: number, d: number): number =>
+					a > d ? a * (1 + Math.pow(1 - d / a, 0.5) * 0.2) : a * Math.pow(a / d, 1.5);
+				const defEff = ((typeof mirror._mpDef === 'number' && mirror._mpDef > 0) ? mirror._mpDef : 40)
+					* ((typeof ai.defenseFactor === 'number' && ai.defenseFactor > 0) ? ai.defenseFactor : 1);
+				const base = Math.max(1, pct(atk, defEff));
+				let g = (typeof mirror._mpDf === 'number' && mirror._mpDf > 0) ? mirror._mpDf : 1;
+				const elNum = (typeof ai.element === 'number' && ai.element >= 1 && ai.element <= 4) ? ai.element : 0;
+				if (elNum > 0 && Array.isArray(mirror._mpEf) && mirror._mpEf.length >= elNum) {
+					const ef = Number(mirror._mpEf[elNum - 1]);
+					if (isFinite(ef) && ef > 0) g = g * ef;
+				}
+				let k = (typeof ai.damageFactor === 'number' && ai.damageFactor > 0) ? ai.damageFactor : 1;
+				critFlag = false; // re-roll on real focus below (the husk's roll is void)
+				try {
+					const critFactor = (typeof ai.critFactor === 'number') ? ai.critFactor : 1;
+					const memFocus = (typeof mirror._mpFocus === 'number' && mirror._mpFocus > 0) ? mirror._mpFocus : 0;
+					const atkP: any = ai.attackerParams || null;
+					if (memFocus > 0 && atkP && typeof atkP.getStat === 'function') {
+						const atkFocus = Number(atkP.getStat('focus')) || 0;
+						if (atkFocus > 0 && Math.random() <= (Math.pow(atkFocus / memFocus, 0.35) - 0.9) * critFactor) {
+							critFlag = true;
+							k = k * ((typeof atkP.criticalDmgFactor === 'number' && atkP.criticalDmgFactor > 0) ? atkP.criticalDmgFactor : 1.5);
+						}
+					}
+				} catch (_) { /* no crit on failure */ }
+				let o = 1;
+				try {
+					const scC: any = (sc as any).combat;
+					const atkRoot: any = attacker && attacker.getCombatantRoot ? (attacker.getCombatantRoot() || attacker) : attacker;
+					if (scC && typeof scC.getGlobalDmgFactor === 'function' && atkRoot) {
+						const og = Number(scC.getGlobalDmgFactor(atkRoot.party));
+						if (isFinite(og) && og > 0) o = og;
+					}
+				} catch (_) { o = 1; }
+				outDamage = Math.max(1, base * g * k * o * (0.95 + Math.random() * 0.1));
+			}
+		} catch (_) { /* forward the engine number as-is */ }
 		// PvP status: the engine already computed the FINAL inflict amount vs the
 		// mirror (dmg.status) using the attacker's real attackInfo — ship it as a
 		// pre-computed value (stb<0 marks 'final, apply directly') since the raw
-		// attackInfo isn't available on this path.
-		const preStatus = (dmg.element > 0 && typeof dmg.status === 'number' && dmg.status > 0) ? dmg.status : 0;
+		// attackInfo isn't available on this path. 1.77.x: the engine's damageResult
+		// carries NO element field (always undefined), so read the element from the
+		// AttackInfo first — the victim's heat hit-FX and status gate need it.
+		const outElement = (ai && typeof ai.element === 'number' && ai.element >= 0 && ai.element <= 4)
+			? ai.element
+			: (typeof dmg.element === 'number' ? dmg.element : 0);
+		const preStatus = (outElement > 0 && typeof dmg.status === 'number' && dmg.status > 0) ? dmg.status : 0;
 		this.main.connection.combatHit({
 			player: mirror.name,
-			damage: dmg.damage,
-			element: typeof dmg.element === 'number' ? dmg.element : 0,
-			critical: !!dmg.critical,
+			damage: outDamage,
+			element: outElement,
+			critical: critFlag,
 			ax, ay,
 			attack: atk,
+			attackType: attackType > 0 ? attackType : undefined,
 			stb: preStatus > 0 ? -preStatus : undefined,
 		});
 	}
@@ -6095,8 +6237,22 @@ export class NetSync {
 			// swallows the trigger's native update. Start the defeat cutscene DIRECTLY,
 			// under the same allow-token the blocker path uses, so the cinematic
 			// (diePre / dieExplosion / white overlay / slow-mo) really plays here.
-			this.startBossDefeatTriggerLocally(mk);
-			console.log('[netsync] boss defeat cinematic staged via ' + mk);
+			const cineStarted = this.startBossDefeatTriggerLocally(mk);
+			// 1.76.x (boss cinematic timing): _mpBossCineStarted gates the block-apply
+			// anim-replay suppression (see applyEntityState) — only when the cutscene is
+			// REALLY driving the puppet. Without a started trigger the suppression would
+			// freeze the puppet outright (no anim at all) until the 20s watchdog.
+			e._mpBossCineStarted = cineStarted ? true : undefined;
+			if (cineStarted) {
+				// 1.76.x: UNLOCK the puppet's anim/face/state so the cutscene drives it
+				// NATIVELY — its SET_ANIM / DO_ACTION steps write currentAnim/plain values,
+				// which the puppet's property lock silently discards. The host boss is
+				// frozen while dying, so the streamed position stays identical anyway.
+				try {
+					if (this.main && typeof (this.main as any).unlockEntity === 'function') (this.main as any).unlockEntity(e);
+				} catch (_) { /* the cinematic plays on regardless */ }
+			}
+			console.log('[netsync] boss defeat cinematic staged via ' + mk + (cineStarted ? ' (cutscene started)' : ' (no local trigger)'));
 			return true;
 		} catch (_) { return false; }
 	}
@@ -6109,7 +6265,7 @@ export class NetSync {
 	 * native update can't double-start it later. No-op when no matching trigger
 	 * exists on this client (the 20s watchdog in processDeathQueue still cleans
 	 * the puppet up). */
-	private startBossDefeatTriggerLocally(mk: string): void {
+	private startBossDefeatTriggerLocally(mk: string): boolean {
 		try {
 			const ET: any = (ig.ENTITY as any).EventTrigger;
 			const g: any = ig.game;
@@ -6152,10 +6308,11 @@ export class NetSync {
 					try { (ig.vars as any).set(trig.triggerVar, true); } catch (_) { /* ignore */ }
 				}
 				console.log('[netsync] boss defeat cutscene started locally via trigger ' + (trig.name || mk));
-				return;
+				return true;
 			}
 			console.log('[netsync] no EventTrigger found for manualKill var ' + mk + ' — cinematic relies on native trigger');
 		} catch (_) { /* ignore */ }
+		return false;
 	}
 
 	/** 1.74.x: a boss-flagged puppet whose HOST-streamed HP reached 0, with NO
@@ -8178,6 +8335,38 @@ export class NetSync {
 	 * AR pillars they range-kill) are the one exception — they stay strictly
 	 * per-player, so one player spending a dungeon key never removes another
 	 * player's locked block. */
+	/** 1.76.x (plant-bug adoption, member breaker): PRE-ROLL the ItemDestruct/
+	 * Destructible enemy-spawn outcome and SUPPRESS the local spawn. The vanilla
+	 * roll inside destroy() would create a member-local dynamic enemy (mapId 0)
+	 * that the host-sync reap culls instantly ("the plant bug dies immediately").
+	 * The outcome is stashed on the entity (_mpPlantRollHit) for
+	 * broadcastPlantBreak; the HOST spawns the authoritative enemy from the relay
+	 * and the enemy stream delivers the puppet back to everyone. Returns true
+	 * when the roll ran (caller must restore afterwards). */
+	public memberPreRollPlantSpawn(ent: any): boolean {
+		try {
+			const m = (window as any).__mpMain;
+			if (!ent || !m || m.host) return false;
+			if (!ent.enemyInfo || typeof ent.enemyChance !== 'number' || ent.enemyChance < 0) return false;
+			ent._mpPlantRollHit = Math.random() <= ent.enemyChance;
+			ent._mpPlantRollSavedEI = ent.enemyInfo;
+			ent._mpPlantRollSavedEC = ent.enemyChance;
+			ent.enemyInfo = null;
+			ent.enemyChance = -1;
+			return true;
+		} catch (_) { return false; }
+	}
+
+	/** 1.76.x (plant-bug adoption): restore the pre-rolled entity's enemyInfo so a
+	 * respawned plant can roll again on a later break. */
+	public memberRestorePlantSpawn(ent: any): void {
+		try {
+			if (!ent) return;
+			ent.enemyInfo = ent._mpPlantRollSavedEI;
+			ent.enemyChance = ent._mpPlantRollSavedEC;
+		} catch (_) { /* ignore */ }
+	}
+
 	public broadcastPlantBreak(plant: any): void {
 		try {
 			if (this.isKeyLockedDestructible(plant)) return; // key locks: local-only, never relayed
@@ -8192,7 +8381,22 @@ export class NetSync {
 			const conn = this.main.connection;
 			if (!conn || !conn.isOpen()) return;
 			if (typeof conn.plantBreak !== 'function') return;
-			conn.plantBreak({ map: this.mapName, mapId });
+			// 1.76.x (plant-bug adoption): carry the member breaker's pre-rolled enemy
+			// outcome — the HOST spawns the authoritative dynamic enemy from it
+			// (every receiver's own roll stays suppressed as before). Consumed here.
+			let es: any;
+			if (plant && (plant as any)._mpPlantRollHit === true && plant.enemyInfo) {
+				try {
+					const st = (typeof plant.enemyInfo.getSettings === 'function') ? plant.enemyInfo.getSettings() : null;
+					const t = (st && typeof st.type === 'string') ? st.type : '';
+					if (t) {
+						es = { t: t.slice(0, 64) };
+						if (st && typeof st.rank === 'number' && isFinite(st.rank)) es.rk = st.rank;
+					}
+				} catch (_) { es = undefined; }
+			}
+			try { if (plant) (plant as any)._mpPlantRollHit = undefined; } catch (_) { /* ignore */ }
+			conn.plantBreak({ map: this.mapName, mapId, es });
 		} catch (_) { /* never break the destroy chain */ }
 	}
 
@@ -8485,7 +8689,7 @@ export class NetSync {
 	 * 1.75.1: RegenDestruct (melt-and-reform ice pillars) rides the same relay — the
 	 * receiver melts its intact copy via its own destroy(), so the REFREEZE time is
 	 * still judged locally by the receiver's own regen timer. */
-	public applyPlantBreak(data: { map: string, mapId: number }): void {
+	public applyPlantBreak(data: { map: string, mapId: number, es?: { t: string, rk?: number } }): void {
 		try {
 			if (!data || typeof data.mapId !== 'number' || !isFinite(data.mapId)) return;
 			const ID: any = (ig.ENTITY as any).ItemDestruct;
@@ -8513,6 +8717,21 @@ export class NetSync {
 			if (data.map && data.map !== this.mapName) return; // a plant on a map we already left
 			if (!plant || (!(plant instanceof ID) && !(DE && plant instanceof DE) && !(RD && plant instanceof RD))) return;
 			if (plant._killed) return; // already destroyed — nothing to do
+			// 1.76.x (plant-bug adoption): the breaker pre-rolled an enemy spawn — the
+			// HOST is the enemy authority, so spawn the authoritative dynamic enemy
+			// HERE (position = the plant's spot, matching the vanilla inline spawn).
+			// Non-host receivers ignore es (their local spawn would be culled); the
+			// enemy stream delivers the puppet to everyone, breaker included.
+			if (this.main.host && data.es && typeof data.es.t === 'string' && data.es.t) {
+				try {
+					const pc0 = plant.coll && plant.coll.pos;
+					const ei: any = { type: data.es.t };
+					if (typeof data.es.rk === 'number' && isFinite(data.es.rk)) ei.rank = data.es.rk;
+					const spawnedBug: any = (ig.game as any).spawnEntity('Enemy',
+						pc0 ? pc0.x : 0, pc0 ? pc0.y : 0, pc0 ? pc0.z : 0, { enemyInfo: ei });
+					if (spawnedBug) { try { spawnedBug.invincibleTimer = 0.05; } catch (_) { /* ignore */ } }
+				} catch (_) { /* adoption spawn is best-effort */ }
+			}
 			// 1.75.1: melt-and-reform RegenDestruct — melt the still-intact copy, but let
 			// the receiver's own regenMaxTime decide when it refreezes (no regen relay).
 			if (RD && plant instanceof RD) {
@@ -9367,6 +9586,89 @@ export class NetSync {
 				};
 			}
 		} catch (e) { console.warn('[netsync] pole hooks failed', e); }
+		// 1.77.x (WaterBlock sync): frozen water blocks (冰柱) run fully LOCAL in
+		// vanilla — ballHit's steam/melt/turnIce/bounce chain and the combatant
+		// bump chain (collideWith: blockHit FX + hit flash on the bumper +
+		// knockback) only play on the interacting client's own copy; everyone
+		// else's copy sits untouched because remote balls are collision-less
+		// puppets and mirrors never physically bump props. Relay every
+		// player-triggered transition by mapId over the puzzleFx channel;
+		// receivers replay the same transition FX on their own copy
+		// (applyPuzzleFx 'wblock'). The steam damage force is NOT replayed — the
+		// steamer's own client spawns it (member damage rides the normal
+		// enemyDamage forwarding), so receivers pass a null combatant.
+		// Timer-driven melt/reform stay local per client (assist-puzzle-speed is
+		// per-player), the same rule as the RegenDestruct refreeze.
+		try {
+			const WBProto: any = (ig.ENTITY as any).WaterBlock && (ig.ENTITY as any).WaterBlock.prototype;
+			if (WBProto && typeof WBProto.ballHit === 'function' && !WBProto._mpWbBallHitWrapped) {
+				WBProto._mpWbBallHitWrapped = true;
+				const origWbHit = WBProto.ballHit;
+				WBProto.ballHit = function (this: any, b: any) {
+					const st0 = this.state;
+					const r = origWbHit.apply(this, arguments as any);
+					try {
+						const m = (window as any).__mpMain;
+						const ns: any = m && m.netSync;
+						if (ns && typeof ns.observeWaterBlockHit === 'function') ns.observeWaterBlockHit(this, b, st0, r);
+					} catch (_) { /* never break the block */ }
+					return r;
+				};
+			}
+			if (WBProto && typeof WBProto.collideWith === 'function' && !WBProto._mpWbCollideWrapped) {
+				WBProto._mpWbCollideWrapped = true;
+				const origWbColl = WBProto.collideWith;
+				WBProto.collideWith = function (this: any, b: any, c: any) {
+					const st0 = this.state;
+					const r = origWbColl.apply(this, arguments as any);
+					try {
+						const m = (window as any).__mpMain;
+						const ns: any = m && m.netSync;
+						if (ns && typeof ns.observeWaterBlockCollide === 'function') ns.observeWaterBlockCollide(this, b, c, st0);
+					} catch (_) { /* never break the bump */ }
+					return r;
+				};
+			}
+			if (WBProto && typeof WBProto.onGroundAdd === 'function' && !WBProto._mpWbGroundWrapped) {
+				WBProto._mpWbGroundWrapped = true;
+				const origWbGround = WBProto.onGroundAdd;
+				WBProto.onGroundAdd = function (this: any, a: any) {
+					const st0 = this.state;
+					const r = origWbGround.apply(this, arguments as any);
+					try {
+						const m = (window as any).__mpMain;
+						const ns: any = m && m.netSync;
+						if (ns && typeof ns.observeWaterBlockCollide === 'function') ns.observeWaterBlockCollide(this, a, null, st0);
+					} catch (_) { /* never break the landing */ }
+					return r;
+				};
+			}
+		} catch (e) { console.warn('[netsync] WaterBlock hooks failed', e); }
+		// 1.77.x (mirror quicksand): the vanilla ig.QuickSand influencer callback
+		// can never run correctly for remote mirrors — their coll.pos.z is a lerped
+		// network value (asymptotic, never exactly == baseZPos as the trigger
+		// requires) and their coll.level is stale (network writes bypass setZ), so
+		// the sink never starts; and if it ever did (exact snap onto sand), the
+		// 2s fall branch would call the nonexistent Enemy.quickFall and pop the
+		// sink in a loop. Skip mirrors here — netSync drives the sink visual
+		// itself (updateMirrorQuicksand). The LOCAL player is never _mpMirror, so
+		// solo/offline behavior is untouched.
+		try {
+			const QSProto: any = (ig as any).QuickSand && (ig as any).QuickSand.prototype;
+			if (QSProto && typeof QSProto.onUpdate === 'function' && !QSProto._mpQsWrapped) {
+				QSProto._mpQsWrapped = true;
+				const origQsUpdate = QSProto.onUpdate;
+				QSProto.onUpdate = function (this: any, b: any, a: any) {
+					if (a && a._mpMirror) return;
+					return origQsUpdate.apply(this, arguments as any);
+				};
+			}
+		} catch (e) { console.warn('[netsync] quicksand hook failed', e); }
+		// Pre-create the sand FX sheet here so it is LOADED by the time a mirror
+		// first sinks (a fresh EffectSheet's first spawnOnTarget silently no-ops).
+		try {
+			if (!this._mpSandSheet) this._mpSandSheet = new (ig as any).EffectSheet('puzzle.quicksand');
+		} catch (_) { /* sheet is cosmetic — the sink itself needs no assets */ }
 	}
 
 	/** 1.76.x (Faj'ro puzzles): is this ball one of the LOCAL player's own
@@ -9469,6 +9771,74 @@ export class NetSync {
 		} catch (_) { /* never break the puzzle */ }
 	}
 
+	/** 1.77.x (WaterBlock sync, SENDER): the local WaterBlock.ballHit wrap just
+	 * ran — work out from the state diff which transition (if any) the hit
+	 * caused and relay it. Only genuinely LOCAL attackers relay: the local
+	 * player's own real ball/melee or their owned party bots' — replayed
+	 * balls, puppets and mirrors never cross this channel. Kind mapping:
+	 * water->puddle = 'steam', frozen->water = 'melt', water->frozen = 'ice',
+	 * accepted hit with no state change = 'bounce' (blockHit FX + hit flash). */
+	public observeWaterBlockHit(block: any, attacker: any, st0: any, accepted: any): void {
+		try {
+			if (!block || !attacker) return;
+			if (attacker._mpPlayerBall || attacker._mpProj || attacker._mpMirror || attacker._mpPoleFake) return;
+			const me: any = (ig.game as any).playerEntity;
+			if (!me) return;
+			let root: any = null;
+			try { root = attacker.getCombatantRoot ? attacker.getCombatantRoot() : (attacker.combatant || null); } catch (_) { root = attacker.combatant || null; }
+			if (root !== me) {
+				const botOk = !!(this.main && typeof (this.main as any).ownedBotNameOf === 'function'
+					&& (this.main as any).ownedBotNameOf(root));
+				if (!botOk) return;
+			}
+			const st1 = block.state;
+			let kind: string | null = null;
+			if (st0 === 1 && st1 === 3) kind = 'steam';
+			else if (st0 === 2 && st1 === 1) kind = 'melt';
+			else if (st0 !== 2 && st1 === 2) kind = 'ice';
+			else if (accepted === true && st0 === st1) kind = 'bounce';
+			if (!kind) return;
+			this.relayWaterBlockFx(block, kind);
+		} catch (_) { /* never break the puzzle */ }
+	}
+
+	/** 1.77.x (WaterBlock sync, SENDER): the collideWith / onGroundAdd wrap just
+	 * ran. Two relayable outcomes: (a) an ice disk froze the block (turnIce) —
+	 * relayed only for REAL disks (host/solo); member-side disk puppets
+	 * (_mpShot) freeze the member's own copy natively and the host's relay
+	 * confirms it for everyone else, so a puppet relay would be pure noise.
+	 * (b) the LOCAL player physically bumped the block — the bump FX + hit
+	 * flash + knockback all played here; relay so teammates see the FX on our
+	 * mirror. Physics stay per-player: receivers never knock back their copy. */
+	public observeWaterBlockCollide(block: any, ent: any, collVec: any, st0: any): void {
+		try {
+			if (!block || !ent) return;
+			const IceDisk: any = (sc as any).IceDiskEntity;
+			if (IceDisk && ent instanceof IceDisk) {
+				if (ent._mpShot) return;
+				if (st0 === 1 && block.state === 2) this.relayWaterBlockFx(block, 'ice');
+				return;
+			}
+			const me: any = (ig.game as any).playerEntity;
+			if (!me || ent !== me) return;
+			if (!(st0 === 1 && collVec && (collVec.x || collVec.y))) return;
+			this.relayWaterBlockFx(block, 'bump');
+		} catch (_) { /* never break the bump */ }
+	}
+
+	/** 1.77.x (WaterBlock sync, SENDER): relay one water-block transition/FX
+	 * moment by mapId over the puzzleFx channel. */
+	public relayWaterBlockFx(block: any, kind: string): void {
+		try {
+			if (!this.playerFxRelayAllowed()) return;
+			const mapId = block && block.mapId;
+			if (typeof mapId !== 'number' || !isFinite(mapId)) return;
+			const conn: any = this.main.connection;
+			if (!conn || (typeof conn.isOpen === 'function' && !conn.isOpen()) || typeof conn.sendPuzzleFx !== 'function') return;
+			conn.sendPuzzleFx({ pl: this.main.name, k: 'wblock', m: mapId, s: kind } as any);
+		} catch (_) { /* visual only */ }
+	}
+
 	/** 1.76.x (Faj'ro puzzles, receive side). Kinds:
 	 *  - pole: resolve the torch by mapId and run pole.ballHit(fakeBall) — the
 	 *    fake carries the sender's element and a stable identity per (player,
@@ -9544,6 +9914,44 @@ export class NetSync {
 				const Groups: any = (sc as any).ElementPoleGroups;
 				const g = (Groups && Groups.groups && typeof data.g === 'string') ? Groups.groups[data.g] : null;
 				if (g && g.currentBall) g.currentBall._killed = true;
+				return;
+			}
+			if (data.k === 'wblock') {
+				// 1.77.x (WaterBlock sync, RECEIVER): a teammate steamed / melted / froze
+				// / bounced / bumped a water block — replay the same transition on OUR
+				// copy. The vanilla methods carry their own guards (turnIce no-ops on an
+				// already-frozen block, steam on an already-steamed one), so duplicate or
+				// crossed relays stay harmless. 'steam' replays FX-ONLY (null dir, null
+				// combatant): the damage force ran on the steamer's client and its enemy
+				// damage rides the normal forwarding — a replayed force would double-hit.
+				// 'bump' additionally replays the hit flash on the bumper's MIRROR; the
+				// knockback physics stay on the bumper's own client (their player, their
+				// block copy) and the launch shows through the position stream.
+				const WB: any = (ig.ENTITY as any).WaterBlock;
+				const game2: any = ig.game;
+				const wb: any = (game2 && typeof game2.getEntityByMapId === 'function' && typeof data.m === 'number')
+					? game2.getEntityByMapId(Math.round(data.m)) : null;
+				if (!wb || !WB || !(wb instanceof WB) || wb._killed) return;
+				const s = data.s;
+				try {
+					if (s === 'steam') {
+						if (wb.state !== 3 && typeof wb.steam === 'function') wb.steam(null, null);
+					} else if (s === 'melt') {
+						if (wb.state === 2 && typeof wb.melt === 'function') wb.melt();
+					} else if (s === 'ice') {
+						if (typeof wb.turnIce === 'function') wb.turnIce();
+					} else if (s === 'bounce') {
+						if (typeof wb.bounce === 'function') wb.bounce();
+					} else if (s === 'bump') {
+						if (typeof wb.bounce === 'function') wb.bounce();
+						const rec: any = this.main.players && this.main.players[data.pl];
+						const mir: any = rec && rec.entity;
+						if (mir && !mir._killed && mir.coll && (sc as any).combat && typeof (sc as any).combat.showHitEffect === 'function') {
+							const ctr: any = typeof mir.getAlignedPos === 'function' ? mir.getAlignedPos((ig as any).ENTITY_ALIGN.CENTER) : null;
+							if (ctr) (sc as any).combat.showHitEffect(mir, ctr, (sc as any).ATTACK_TYPE.LIGHT, (sc as any).ELEMENT.NEUTRAL, false, false, true);
+						}
+					}
+				} catch (_) { /* cosmetic — never break the frame */ }
 				return;
 			}
 			if (data.k === 'ball') {
@@ -9877,6 +10285,7 @@ export class NetSync {
 			const map = game.mapName || '';
 			if (map !== this.mapName) {
 				this.mapName = map;
+				this._mpProjDiagLog = Object.create(null);
 				this.puppets = Object.create(null);
 				this.lastAnim = Object.create(null);
 				this.pendingTypes = Object.create(null);
@@ -10039,6 +10448,10 @@ export class NetSync {
 			// glow blink) when a remote mirror bounces off a JumpPanel — the
 			// panel's engine trigger only runs for the LOCAL player.
 			this.updateMirrorJumpPanelFx();
+			// 1.77.x (mirror quicksand): drive the sink progress visual on remote
+			// mirrors — the vanilla influencer callback can't (lerped z, stale
+			// level, no quickFall on Enemy), so it is hook-disabled for mirrors.
+			this.updateMirrorQuicksand();
 			// 1.76.x (barrier denial FX): advance live hover drag-back replays —
 			// stop the pose + particle ring when the mirror lands.
 			this.updateMirrorHoverFx();
@@ -12253,6 +12666,108 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* visuals must never break sync */ }
 	}
 
+	/** 1.77.x (mirror quicksand sink progress): remote players sinking in
+	 * quicksand is now driven locally on every observing client. The vanilla
+	 * ig.QuickSand influencer callback cannot do it for mirrors — the trigger
+	 * needs coll.pos.z == coll.baseZPos EXACTLY (the mirror's z is an
+	 * asymptotically lerped network value that never reaches exact equality),
+	 * coll.level is stale (network writes bypass setZ), and the 2s fall branch
+	 * would call the nonexistent Enemy.quickFall. The vanilla callback is
+	 * hook-disabled for _mpMirror entities (installPuzzleFxHooks) and this pass
+	 * replicates the visuals from the streamed position:
+	 *   - standing check: QUICKSAND map terrain at the coll center on the level
+	 *     derived from the streamed z, with |z - levelHeight| <= 1 (lerp-safe
+	 *     stand-in for the vanilla z == baseZPos), plus the vanilla side-conditions
+	 *     (LOOSE groundConnect, terrain friction not ignored, not mid-death FX);
+	 *   - while standing: an ig.InfluenceEntry on the mirror whose groundSinkZ
+	 *     grows size.z * min(1, timer/2) — the engine's own sink rendering
+	 *     (updateSprites -> influencer.onPostSpriteUpdate) applies it — plus the
+	 *     looping sandTrail FX (sheet puzzle.quicksand), like vanilla;
+	 *   - leaving (walk-out, escape hop, quick-fall respawn snap, hole teleport):
+	 *     the terrain/level check simply goes false and the influence fades out
+	 *     over 0.1s exactly like vanilla's endQuicksand.
+	 * The fall/teleport itself is NOT simulated — it stays owner-driven through
+	 * the normal position stream. Timer skew vs the owner's real sink is bounded
+	 * by the position-stream latency (~100ms), invisible on a 2s sink. */
+	private updateMirrorQuicksand(): void {
+		try {
+			const TERR: any = (ig as any).TERRAIN;
+			const terrainApi: any = (ig as any).terrain;
+			const LOOSE: any = (ig as any).COLL_GROUND_CONNECT && (ig as any).COLL_GROUND_CONNECT.LOOSE;
+			if (!TERR || TERR.QUICKSAND === undefined || !terrainApi
+				|| typeof terrainApi.getMapTerrain !== 'function' || LOOSE === undefined) return;
+			const tick: number = ig.system.tick;
+			for (const name in this.main.players) {
+				const entry: any = this.main.players[name];
+				if (!entry) continue;
+				const e: any = entry.entity;
+				// A killed mirror takes its influence entries + attached FX handles
+				// down with it; the _mpSand record dies with the entity reference.
+				if (!e || e._killed || !e.coll || !e.influencer) continue;
+				const coll: any = e.coll;
+				const cpm: any = coll.pos;
+				const z: number = (typeof cpm.zProtected === 'number') ? cpm.zProtected : cpm.z;
+				let onSand = false;
+				try {
+					if (!e._mpDying && coll.groundConnect === LOOSE
+						&& !(coll.friction && coll.friction.ignoreTerrain)) {
+						// Derive the level from the STREAMED z ourselves — coll.level is
+						// stale on mirrors (network writes bypass setZ).
+						const level: number = (ig.game as any).getLevelIdx(z);
+						if (level >= 0) {
+							const groundZ: number = (ig.game as any).getLevelHeight(level);
+							if (Math.abs(z - groundZ) <= 1) {
+								const cx: number = cpm.x + coll.size.x / 2;
+								const cy: number = cpm.y + coll.size.y / 2;
+								onSand = terrainApi.getMapTerrain(cx, cy, level, 0, 0) === TERR.QUICKSAND;
+							}
+						}
+					}
+				} catch (_) { onSand = false; }
+				let st: any = e._mpSand;
+				if (onSand && !st) {
+					st = e._mpSand = { timer: 0, influence: null, fx: null };
+					try {
+						const inf: any = new (ig as any).InfluenceEntry();
+						inf.moveXYScale = 0.9; // vanilla initial value; cosmetic on a locked mirror
+						st.influence = inf;
+						e.influencer.addInfluence(inf);
+					} catch (_) { st.influence = null; }
+					try {
+						if (!this._mpSandSheet) this._mpSandSheet = new (ig as any).EffectSheet('puzzle.quicksand');
+						if (this._mpSandSheet && this._mpSandSheet.loaded) {
+							st.fx = this._mpSandSheet.spawnOnTarget('sandTrail', e, { duration: -1 });
+						}
+					} catch (_) { st.fx = null; }
+					// If the influence entry itself failed there is no sink to show —
+					// drop the whole state so a later frame can retry cleanly.
+					if (!st.influence) {
+						try { st.fx && st.fx.stop && st.fx.stop(); } catch (_) { /* ignore */ }
+						e._mpSand = undefined;
+						continue;
+					}
+				} else if (!onSand && st) {
+					// vanilla endQuicksand: 0.1s fade-out of the sink + stop the trail.
+					// The influencer splices the entry itself once the fade completes.
+					try { st.influence && st.influence.setFadeOut(0.1); } catch (_) { /* ignore */ }
+					try { st.fx && st.fx.stop && st.fx.stop(); } catch (_) { /* ignore */ }
+					e._mpSand = undefined;
+					st = null;
+				}
+				if (st && st.influence) {
+					st.timer += tick;
+					const c = Math.min(1, st.timer / 2); // vanilla: timer/2, capped at full sink
+					st.influence.groundSinkZ = coll.size.z * c;
+					st.influence.moveXYScale = 1 - c * 0.7;
+					// NOTE: vanilla would quickFall/teleport at timer >= 2. For a mirror
+					// we just HOLD the full sink — the owner's fall respawns/teleports
+					// them, the streamed position then fails the standing check above
+					// and the sink fades out here.
+				}
+			}
+		} catch (_) { /* visuals must never break sync */ }
+	}
+
 	// ---- round 16 (issue 4): monster stat scaling (HOST side only) ----
 	// 1.75.x: the base is the ROOM's player count, not the party roster — see
 	// currentExtraCount / updateRoomScaleWatcher.
@@ -13169,6 +13684,11 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			psv: this._mpEnemyPassive(e) ? 1 : 0,
 			abs: (this._mpStoredUidSet && this._mpStoredUidSet[e.uid]) ? 1 : 0,
 			vul: this.readEnemyVulnerable(e) ? 1 : 0,
+			// ROUND 153: ACTION-carried invincibility (SET_INVINCIBLE — the sandshark's
+			// swim(-1)/jump-window(0) cycle). The ss state stream can't see it (the
+			// state config never changes); mirrored onto the member's puppet as
+			// invincibleTimer -1/0 so member hits whiff/connect on host timing.
+			inv: e.invincibleTimer ? 1 : 0,
 			// 1.71.0: preserve AI state + targetOnSpawn across host handoff.
 			ss: typeof e.currentState === 'string' ? e.currentState : '',
 			tos: e.targetOnSpawn ? 1 : 0,
@@ -13505,6 +14025,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		// the enemy holds a still frame — ship them so the member sees the change.
 		if ((a.psv || 0) !== (b.psv || 0)) return true;
 		if ((a.vul || 0) !== (b.vul || 0)) return true;
+		// ROUND 153: the invincible flag flips mid-action while the enemy holds a
+		// still frame (the sandshark lands and sits invincible in the sand) — ship it
+		// so the member's puppet toggles its local invincible gate.
+		if ((a.inv || 0) !== (b.inv || 0)) return true;
 		// ROUND 135: the absorbed flag flips mid-fight (flea burrows INTO the Digmo,
 		// then is released later) — ship it so the member removes/re-adopts the puppet.
 		if ((a.abs || 0) !== (b.abs || 0)) return true;
@@ -14894,6 +15418,18 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 							if (p && p.data && ((e.animSheet && p.data.animation === e.animSheet) || (e._mpProxyData && p.data === e._mpProxyData))) { pn = name; break; }
 						}
 					}
+					// DIAG (heat-dng midboss): one line per live enemy proxy — pn=FAIL means
+					// the stream skips it and members can never rebuild the visual.
+					if (this._mpProjDiagMap()) {
+						const dk = 'h' + e.uid;
+						if (!this._mpProjDiagLog[dk]) {
+							this._mpProjDiagLog[dk] = true;
+							console.log('[mpproj] host proxy uid=' + e.uid + ' pn=' + (pn || 'FAIL')
+								+ ' party=' + e.party + ' sheet=' + !!e.animSheet + ' stamp=' + !!e._mpProxyData
+								+ ' cmb=' + (e.combatant && e.combatant.uid) + '/' + (e.combatant && e.combatant.enemyName)
+								+ (pn ? '' : ' root=' + (combatant && combatant.uid) + ' proxies=' + (combatant && combatant.proxies ? Object.keys(combatant.proxies).join(',') : 'NONE')));
+						}
+					}
 					if (!pn) continue;
 					const vel = e.coll.vel || { x: 0, y: 0 };
 					list.push({
@@ -14948,8 +15484,24 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						continue;
 					}
 					if (!e) {
+						// DIAG (heat-dng midboss): one line per received generic-proxy uid.
+						if (this._mpProjDiagMap()) {
+							const dk = 'm' + s.i;
+							if (!this._mpProjDiagLog[dk]) {
+								this._mpProjDiagLog[dk] = true;
+								console.log('[mpproj] member recv uid=' + s.i + ' pn=' + s.pn + ' src=' + s.src
+									+ ' puppet=' + !!this.puppets[s.src] + ' proxies=' + !!(this.puppets[s.src] && this.puppets[s.src].proxies));
+							}
+						}
 						e = this.spawnGenericProxyPuppet(s);
-						if (e) this.projectiles[s.i as any] = e;
+						if (this._mpProjDiagMap()) {
+							const dk = 'ms' + s.i;
+							if (!this._mpProjDiagLog[dk]) {
+								this._mpProjDiagLog[dk] = true;
+								console.log('[mpproj] member spawn uid=' + s.i + ' pn=' + s.pn + ' -> ' + (e ? 'OK' : 'NULL'));
+							}
+						}
+						if (e) { this.projectiles[s.i as any] = e; e._mpProjBorn = now; }
 					}
 					if (!e || e._killed) continue;
 					e._mpProjSeen = now;
@@ -18342,7 +18894,14 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			}
 			// Round 14 (fix 5): a _mpDying puppet is mid-death-FX — never re-issue a live
 			// anim onto it from the host block (it's already pinned to the damage anim).
-			if (isFull && s.a && !e._mpDying && this.lastAnim[s.i] !== s.a) {
+			// 1.76.x: a boss-defeat puppet whose local cutscene is RUNNING
+			// (_mpBossCineStarted) is driven by that cutscene (diePre / dieExplosion
+			// steps) — a streamed anim would clobber the death sequence every block, so
+			// the member's boss "played no death animation" until the host's cinematic
+			// ended and the reap popped a generic corpse death. A staged-but-not-started
+			// cinematic (no local trigger found) keeps the streamed anim — freezing the
+			// puppet outright would be worse.
+			if (isFull && s.a && !e._mpDying && !(e._mpBossCinematic && e._mpBossCineStarted) && this.lastAnim[s.i] !== s.a) {
 				this.lastAnim[s.i] = s.a;
 				e.currentAnim = { protected: s.a };
 				this.playAnim(e, s.a);
@@ -18480,6 +19039,29 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (isFull) {
 				const vulNow = (s.vul || 0) === 1;
 				if (e._mpVulSynced !== vulNow) e._mpVulSynced = vulNow;
+			}
+			// ROUND 153 (sandshark/骨鱼 untargetable on members): the cursed/heat
+			// sandshark's vulnerability is ACTION-carried, not state-carried — its
+			// jump actions SET_INVINCIBLE 0 for the airborne window and -1 while
+			// swimming, so the ss state stream never captures it. A member whose
+			// LOCAL shark had started the fight before adoption (the arena trigger
+			// fires for the local player too) froze mid-action with
+			// invincibleTimer=-1 stuck FOREVER (postActionUpdate is nulled and no
+			// later state change resets it): every member hit died in
+			// Combatant.damage's invincible gate (onPerfectDash, no number, no
+			// forward) — "始终无法攻击到". Mirror the host's invincibility onto the
+			// puppet: -1 while the host enemy is invincible, 0 otherwise. Member hits
+			// during a synced invincible phase now whiff exactly like the host
+			// player's do; window hits connect and forward. Flip-only writes — the
+			// first full snap after adoption always applies (undefined !== anything),
+			// which also heals the stuck-at-adoption value within one block.
+			if (isFull) {
+				const invNow = (s.inv || 0) === 1;
+				if ((e as any)._mpInvSynced !== invNow && !(e as any)._mpDying) {
+					(e as any)._mpInvSynced = invNow;
+					try { e.invincibleTimer = invNow ? -1 : 0; } catch (_) { /* ignore */ }
+					this._sfxLog('inv.sync', 'uid=' + s.i + ' inv=' + (invNow ? 1 : 0));
+				}
 			}
 			// ROUND 66 (poise/shield damage sync): mirror the host enemy's ACTIVE shields
 			// onto the puppet. Without them the puppet's native isShielded finds nothing,
@@ -18751,6 +19333,36 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* never break the show path */ }
 	}
 
+	/** heat-dng midboss co-op intro: the boss-appear chain (bossAppars /
+	 * jellyfishRespawn events) runs on EVERY client once the relayed intro
+	 * replay sets map.bossIntro locally, and it SPAWN_ENEMYs heat.jellyfish
+	 * adds. Only the HOST's copies are real, killable enemies (they reach
+	 * members through the normal enemy block) — a member's own copies would
+	 * fight the local player AND stream out as invincible csPuppet ghosts.
+	 * Called from the Game.spawnEntity wrap: when this returns true the spawn
+	 * was killed silently and must not be flagged/streamed. Suppression needs
+	 * the whole set: MEMBER side, midboss map, a heat.jellyfish event spawn,
+	 * the fight chain live locally (map.bossIntro set by enter/bossAppars on
+	 * any path), and the host present (fresh enemy blocks) — a member alone
+	 * on the map (host elsewhere, no blocks) keeps its own adds so the
+	 * member-owned solo fight stays vanilla-complete. */
+	public suppressMidbossAddSpawn(r: any, settings: any): boolean {
+		try {
+			if (!r || r._killed || this.main.host) return false;
+			const map = this.mapName || '';
+			if (map !== 'heat-dng/f1/midboss' && map !== 'heat-dng.f1.midboss') return false;
+			const t = (settings && settings.enemyInfo && typeof settings.enemyInfo.type === 'string')
+				? settings.enemyInfo.type : ((r && r.enemyName) || '');
+			if (t !== 'heat.jellyfish') return false;
+			const vars: any = (ig as any).vars;
+			if (!vars || typeof vars.get !== 'function' || !vars.get('map.bossIntro')) return false;
+			if (Date.now() - this._mpLastBlockAt > 3000) return false; // host not on this map
+			try { r.kill(true); } catch (_) { /* silent kill is best-effort */ }
+			console.log('[netsync] midboss jellyfish add suppressed (host owns the adds)');
+			return true;
+		} catch (_) { return false; }
+	}
+
 	/** mapIds of currently VISIBLE member-owned quest wave enemies. Snapshots for
 	 * those mapIds are skipped in applyEntityState so the host's (hidden) copy can't
 	 * re-adopt/re-hide the owner's live quest spawns. */
@@ -18966,6 +19578,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// so ig.ActorEntity.update's truthiness check (`if (this.postActionUpdate)`)
 			// skips it for puppets — they play only host-driven animations.
 			(e as any).postActionUpdate = null;
+			// ROUND 153 (sandshark fix, part 2): an ADOPTED map enemy can still carry a
+			// locally-started action from before the adoption — the member's own
+			// client fires the arena trigger too, so its local cursed sandshark runs
+			// AbsorbCoins/RandomJump (SET_INVINCIBLE -1) on its own. Nulling
+			// postActionUpdate stops NEW choices, but the RUNNING action keeps
+			// ticking and its SET_INVINCIBLE -1 then froze the puppet invincible
+			// forever. Cancel it and reset the timer; the inv stream re-asserts the
+			// host's true value within a block.
+			try { if ((e as any).currentAction && typeof (e as any).cancelAction === 'function') (e as any).cancelAction(); } catch (_) { /* ignore */ }
+			try { e.invincibleTimer = 0; } catch (_) { /* ignore */ }
 			// Clear any stale target the map enemy carried at adoption; the (now FULL,
 			// bot-like) AI re-acquires one on its next update — which is normally the
 			// local player, exactly like the game's own follower bots pick up their

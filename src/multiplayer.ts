@@ -40,6 +40,7 @@ import { NetSync } from './sync/netSync';
 import { StorySyncController, repairStuckQuestStages } from './sync/storySync';
 import { installPvpIsolation } from './sync/pvpIsolation';
 import { installGhostChests, IGhostChestsModule } from './sync/ghostChests';
+import { TradeSync } from './sync/tradeSync';
 import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
 import { installBubbleSync, IBubbleSync } from './sync/bubbleSync';
 import { installCutsceneRelay, ICutsceneRelay } from './sync/cutsceneRelay';
@@ -58,7 +59,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '2.2.0';
+export const MP_VERSION = '2.3.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -299,6 +300,16 @@ export class Multiplayer {
 	/** Round 20: GHOST CHESTS sync module (party-aware chest visibility). Installed
 	 * once; the session handle is re-bound every connect (initializeListeners). */
 	public ghostChests?: IGhostChestsModule;
+	/** 1.77.x (player trading): merchant mode + the server-brokered session. */
+	public tradeSync?: TradeSync;
+	/** Anti-dupe trade lockout deadline (local epoch ms): trading stays blocked
+	 * while Date.now() < this. Set from the handshake (tradeLockMs) and bumped
+	 * by the mirror-rollback result. 0 = free to trade. */
+	public tradeLockedUntil = 0;
+	/** Anti-dupe trade lockout DURATION in hours as configured on the server
+	 * (handshake tradeLockHours; default 48, 0 = restriction off). Message text
+	 * only — the enforcement itself is fully server-side. */
+	public tradeLockHours = 48;
 	public puzzleSync?: IPuzzleSync;
 public bubbleSync?: IBubbleSync;
 	public cutsceneRelay?: ICutsceneRelay;
@@ -487,6 +498,26 @@ public bubbleSync?: IBubbleSync;
 			if (this.netSync) {
 				const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
 				this.netSync.setPerfectGuardComp(num(result.perfectGuardBaseMs, 10), num(result.perfectGuardPingFactor, 0.6));
+			}
+		} catch (_) { /* ignore */ }
+
+		// 1.77.x (player trading): server config master switch + the exchange loss
+		// ratio (receiver gets floor(given / ratio)). Older servers omit both ->
+		// client defaults true / 2.
+		try {
+			if (this.tradeSync) {
+				this.tradeSync.enabled = result.tradeEnabled !== false;
+				const tr = Number(result.tradeRatio);
+				this.tradeSync.ratio = (isFinite(tr) && tr >= 1 && tr <= 1000) ? tr : 2;
+			}
+			// Anti-dupe: the server reports the remaining lockout in ms (clock-
+			// skew safe); convert it to a LOCAL deadline. 0/absent = free to trade.
+			const lh = Number((result as any).tradeLockHours);
+			if (isFinite(lh) && lh >= 0) this.tradeLockHours = lh;
+			const lm = Number(result.tradeLockMs);
+			this.tradeLockedUntil = (isFinite(lm) && lm > 0) ? Date.now() + lm : 0;
+			if (this.tradeLockedUntil > 0) {
+				console.log('[multiplayer] trade locked for another ' + Math.ceil(lm / 3600000) + 'h (save import / mirror rollback)');
 			}
 		} catch (_) { /* ignore */ }
 
@@ -1129,6 +1160,11 @@ public bubbleSync?: IBubbleSync;
 		// The module is process-once; install() re-binds the listener to this socket.
 		if (!this.puzzleSync) this.puzzleSync = installPuzzleSync(() => this);
 		try { this.puzzleSync.install(); } catch (e) { console.warn('[multiplayer] puzzle sync install failed', e); }
+		// 1.77.x (player trading): merchant mode + the trade session. One instance
+		// per client process (engine hooks are once-guarded); install() re-binds
+		// the listeners to the current socket every connect.
+		if (!this.tradeSync) this.tradeSync = new TradeSync(this);
+		try { this.tradeSync.install(); } catch (e) { console.warn('[multiplayer] trade sync install failed', e); }
 		// 1.77.x: host-authoritative water bubble / ice disk / cooled coals sync.
 		// Same process-once shape as the puzzle sync: install() re-binds the
 		// listeners to the current socket every connect.
@@ -1534,6 +1570,13 @@ public bubbleSync?: IBubbleSync;
 			if (data && data.blocked === 'combat') {
 				console.log('[multiplayer] regroup refused: target is in an encounter/boss fight (' + (data.leader || '?') + ')');
 				try { showMpToast({ title: t('teleportInCombat') }); } catch (_) { /* ignore */ }
+				return;
+			}
+			// Solo-only zones (monastery trial caves): the target is inside a
+			// single-player trial; the server refuses the regroup. Toast + stay put.
+			if (data && data.blocked === 'soloZone') {
+				console.log('[multiplayer] regroup refused: target is in a solo-only trial zone (' + (data.leader || '?') + ')');
+				try { showMpToast({ title: t('teleportSoloZone') }); } catch (_) { /* ignore */ }
 				return;
 			}
 			this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos);
@@ -3786,6 +3829,32 @@ public bubbleSync?: IBubbleSync;
 						const al = (sc as any).map && (sc as any).map.activeLandmarks;
 						if (al) landmarks = JSON.stringify(al);
 					} catch (_) { /* ignore */ }
+					// ROUND 155 (two save-flow fixes):
+					//  - the first 30s after login: the server-save RESTORE jumps the player
+					//    to the saved map/area and that artificial "area change" used to fire
+					//    an immediate auto-save+upload on every join. Consume baseline
+					//    changes silently during the window — real exploration saves resume
+					//    afterwards (user request: no auto-save right after joining).
+					//  - never auto-save MID-CUTSCENE: the poll fires seconds after a map
+					//    load, exactly when an entry cutscene runs (Maroon Valley
+					//    IntroScene). That save captured a mid-scene plot.line with the
+					//    player parked at a scripted position; restoring it re-fired the
+					//    scene from off-script coordinates and the exact-point walks wedged
+					//    (the reported Emilie soft-lock loop). Skip WITHOUT updating the
+					//    baselines so the save still fires right AFTER the scene ends.
+					const mdl: any = (sc as any).model;
+					const inScene = !!(mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene());
+					const evm: any = g.events;
+					const evtBusy = !!(evm && evm.blockingEventCall);
+					if (inScene || evtBusy) return;
+					if (now < this._saveSuppressUntil + 25000) {
+						if ((lastArea && area !== lastArea) || (lastLandmarks && landmarks !== lastLandmarks)) {
+							console.debug('[multiplayer] post-login auto-save skipped (join/restore window)');
+						}
+						lastArea = area;
+						lastLandmarks = landmarks;
+						return;
+					}
 					if (lastArea && area !== lastArea) {
 						this.saveNow('area changed: ' + area);
 					} else if (lastLandmarks && landmarks !== lastLandmarks) {
@@ -4354,6 +4423,15 @@ public bubbleSync?: IBubbleSync;
 		};
 		try {
 			if (!cmd || typeof cmd.kind !== 'string') { ack(false, 'bad command'); return; }
+			// ROUND 151: admin cleared this account's anti-dupe trade lockout while
+			// we were online — pure local state (the requestMerchant gate reads
+			// tradeLockedUntil), so it works even before entering the game world,
+			// unlike the give*/teleport commands below.
+			if (cmd.kind === 'clearTradeLock') {
+				this.tradeLockedUntil = 0;
+				try { showMpToast({ title: t('adminTradeLockCleared') }); } catch (_) { /* ignore */ }
+				ack(true); return;
+			}
 			const game: any = (ig as any).game;
 			const pm: any = (sc as any).model && (sc as any).model.player;
 			if (!game || !pm || !game.playerEntity) { ack(false, '玩家未进入游戏'); return; }
@@ -5448,11 +5526,17 @@ public bubbleSync?: IBubbleSync;
 				console.log('[multiplayer] mirror picker cancelled — disconnected');
 				reject('cancelled');
 			};
-			const resultCb = (r: { ok: boolean, reason?: string, index?: number }): void => {
+			const resultCb = (r: { ok: boolean, reason?: string, index?: number, tradeLockMs?: number }): void => {
 				if (settled) return;
 				if (!r.ok) {
 					fail(r.reason === 'notFound' ? t('mirrorNotFound') : r.reason === 'noSave' ? t('mirrorNoSave') : t('mirrorInvalid'));
 					return;
+				}
+				// Anti-dupe: a real rollback (index >= 0) carries the fresh trade
+				// lockout; apply it immediately so THIS session is already blocked.
+				if (typeof r.tradeLockMs === 'number' && r.tradeLockMs > 0) {
+					this.tradeLockedUntil = Date.now() + r.tradeLockMs;
+					console.log('[multiplayer] mirror rollback: trade locked for ' + Math.ceil(r.tradeLockMs / 3600000) + 'h');
 				}
 				cleanup();
 				resolve();

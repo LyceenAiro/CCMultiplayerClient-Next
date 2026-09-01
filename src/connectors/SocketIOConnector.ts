@@ -409,13 +409,21 @@ export class SocketIoConnector implements IConnection {
                 // factor x RTT. Older servers omit both -> client defaults 10/0.6.
                 perfectGuardBaseMs?: number,
                 perfectGuardPingFactor?: number,
+                // 1.77.x (player trading): master switch + loss ratio.
+                tradeEnabled?: boolean,
+                tradeRatio?: number,
+                // Anti-dupe: remaining trade lockout (ms) after save import /
+                // mirror rollback; 0/omitted = free to trade.
+                tradeLockMs?: number,
+                // ...and the CONFIGURED duration in hours (message text; default 48).
+                tradeLockHours?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, tradeEnabled: data.tradeEnabled !== false, tradeRatio: (typeof data.tradeRatio === 'number' && isFinite(data.tradeRatio) && data.tradeRatio >= 1) ? data.tradeRatio : 2, tradeLockMs: (typeof data.tradeLockMs === 'number' && isFinite(data.tradeLockMs) && data.tradeLockMs > 0) ? data.tradeLockMs : 0, tradeLockHours: (typeof data.tradeLockHours === 'number' && isFinite(data.tradeLockHours) && data.tradeLockHours >= 0) ? data.tradeLockHours : 48, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -1031,8 +1039,79 @@ export class SocketIoConnector implements IConnection {
 
 	/** 1.76.x (Faj'ro puzzles): torch hits (ElementPole) and streamed-ball wall
 	 * FX — validated server-side, relayed to the instance minus the sender. */
-	public sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number }): void {
+	public sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball' | 'wblock', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number, s?: string }): void {
 		this.syncEmit('puzzleFx', data);
+	}
+
+	// ---- 1.77.x (player trading): merchant presence + the session protocol ----
+	public tradeMerchant(on: boolean): void {
+		this.syncEmit('tradeMerchant', on === true);
+	}
+	public onTradeMerchant(callback: (data: { pl: string, on: boolean }) => void): void {
+		this.socket.on('tradeMerchant', (data: any) => {
+			if (data && typeof data.pl === 'string') callback({ pl: data.pl, on: data.on === true });
+		});
+	}
+	public tradeInvite(to: string): void {
+		this.syncEmit('tradeInvite', { to });
+	}
+	public onTradeInvite(callback: (data: { from: string }) => void): void {
+		this.socket.on('tradeInvite', (data: any) => {
+			if (data && typeof data.from === 'string') callback(data);
+		});
+	}
+	public tradeAccept(from: string): void {
+		this.syncEmit('tradeAccept', { from });
+	}
+	public tradeKnown(sid: number, ids: string[]): void {
+		this.syncEmit('tradeKnown', { sid, ids });
+	}
+	public onTradeKnown(callback: (data: { sid: number, from: string, ids: string[] }) => void): void {
+		this.socket.on('tradeKnown', (data: any) => {
+			if (data && typeof data.sid === 'number' && Array.isArray(data.ids)) callback(data);
+		});
+	}
+	public onTradeOpen(callback: (data: { sid: number, a: string, b: string, ratio: number }) => void): void {
+		this.socket.on('tradeOpen', (data: any) => {
+			if (data && typeof data.sid === 'number' && typeof data.a === 'string' && typeof data.b === 'string') callback(data);
+		});
+	}
+	public tradeOffer(sid: number, items: Array<{ id: string, n: number }>): void {
+		this.syncEmit('tradeOffer', { sid, items });
+	}
+	public tradeReady(sid: number, on: boolean): void {
+		this.syncEmit('tradeReady', { sid, on });
+	}
+	public onTradeState(callback: (data: any) => void): void {
+		this.socket.on('tradeState', (data: any) => {
+			if (data && typeof data.sid === 'number') callback(data);
+		});
+	}
+	public onTradeApply(callback: (data: any) => void): void {
+		this.socket.on('tradeApply', (data: any) => {
+			if (data && typeof data.sid === 'number' && Array.isArray(data.lose) && Array.isArray(data.gain)) callback(data);
+		});
+	}
+	public tradeApplied(sid: number): void {
+		this.syncEmit('tradeApplied', { sid });
+	}
+	public onTradeDone(callback: (data: { sid: number }) => void): void {
+		this.socket.on('tradeDone', (data: any) => {
+			if (data && typeof data.sid === 'number') callback(data);
+		});
+	}
+	public tradeCancel(sid: number, reason?: string): void {
+		this.syncEmit('tradeCancel', { sid, reason });
+	}
+	public onTradeClosed(callback: (data: { sid: number, reason: string }) => void): void {
+		this.socket.on('tradeClosed', (data: any) => {
+			if (data && typeof data.sid === 'number') callback(data);
+		});
+	}
+	public onTradeRejected(callback: (data: { reason: string, self?: boolean, name?: string, lockMs?: number }) => void): void {
+		this.socket.on('tradeRejected', (data: any) => {
+			if (data && typeof data.reason === 'string') callback(data);
+		});
 	}
 
 	/** ROUND 45 (Gap A, host origin): the host applied a member's hit to a real enemy;
@@ -1144,7 +1223,9 @@ export class SocketIoConnector implements IConnection {
 	// ROUND 74 (plant destruct sync): any client -> its instance — the local player just
 	// destroyed a map destructible; every other same-instance client destroys its own copy
 	// at the same mapId (see NetSync.applyPlantBreak). syncEmit: solo-instance skip.
-	public plantBreak(data: { map: string, mapId: number }): void {
+	// 1.76.x (plant-bug adoption): es carries the breaker's pre-rolled enemy outcome —
+	// the HOST spawns the authoritative enemy from it (receivers stay suppressed).
+	public plantBreak(data: { map: string, mapId: number, es?: { t: string, rk?: number } }): void {
 		this.syncEmit('plantBreak', data);
 	}
 	/** ROUND 141 (prop hit-FX sync): relay a local destructible-hit impact flash to
@@ -1837,13 +1918,16 @@ export class SocketIoConnector implements IConnection {
 	public saveMirrorRestore(index: number): void {
 		this.socket.emit('saveMirrorRestore', { index });
 	}
-	public onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number }) => void): void {
+	public onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number, tradeLockMs?: number }) => void): void {
 		this.socket.on('saveMirrorRestoreResult', (data: any) => {
 			if (!data || typeof data.ok !== 'boolean') return;
 			callback({
 				ok: data.ok,
 				reason: typeof data.reason === 'string' ? data.reason : undefined,
 				index: typeof data.index === 'number' ? data.index : undefined,
+				// Anti-dupe: present on a real rollback (index >= 0) — remaining
+				// trade lockout in ms after it.
+				tradeLockMs: typeof data.tradeLockMs === 'number' ? data.tradeLockMs : undefined,
 			});
 		});
 	}

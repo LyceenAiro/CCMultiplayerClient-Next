@@ -25,6 +25,7 @@ const enDict: { [key: string]: string } = {
     teleportBusy: 'In a cutscene — teleporting unavailable',
     teleportUnlocked: 'You have not unlocked that area yet',
     teleportInCombat: 'That player is in an encounter/boss fight — cannot teleport now',
+    teleportSoloZone: 'That player is inside a solo trial area — cannot teleport there',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: 'Online ',
@@ -45,6 +46,8 @@ const enDict: { [key: string]: string } = {
     // quickMenuInject.ts — quick-menu inspect boxes
     addFriend: 'Add Friend',
     friendReqSent: 'Friend request sent',
+    // ROUND 149 — pause-menu unstuck button (unstuckButton.ts)
+    unstuck: 'Unstuck',
     levelLabel: 'Lv ',
     expLabel: 'EXP ',
     hpLabel: 'HP ',
@@ -154,6 +157,7 @@ const enDict: { [key: string]: string } = {
     // 1.73.0 — server admin debug commands
     adminGiveExp: 'Admin granted {n} EXP',
     adminGiveCredits: 'Admin granted {n} credits',
+    adminTradeLockCleared: 'An admin lifted your trade restriction',
     adminGiveItem: 'Admin granted item #{id} ×{n}',
     adminTeleport: 'Admin teleported you',
     adminRenamed: 'An admin renamed you to {name} — please log in again',
@@ -376,6 +380,7 @@ const zhDict: { [key: string]: string } = {
     teleportBusy: '过场动画中，无法传送到队友身边',
     teleportUnlocked: '你尚未解锁该区域，无法传送到队友身边',
     teleportInCombat: '对方正在遭遇战/BOSS战中，无法传送',
+    teleportSoloZone: '对方正在单人试炼区域中（修道院试炼洞穴），无法传送过去',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
     onlineChip: '在线 ',
@@ -396,6 +401,8 @@ const zhDict: { [key: string]: string } = {
     // quickMenuInject.ts — quick-menu inspect boxes
     addFriend: '加好友',
     friendReqSent: '已发送好友请求',
+    // ROUND 149 — 暂停菜单脱离卡死按钮（unstuckButton.ts）
+    unstuck: '脱离卡死',
     levelLabel: '等级 ',
     expLabel: '经验 ',
     hpLabel: 'HP ',
@@ -505,6 +512,7 @@ const zhDict: { [key: string]: string } = {
     // 1.73.0 — 服务器管理调试命令
     adminGiveExp: '管理员给予你 {n} 点经验值',
     adminGiveCredits: '管理员给予你 {n} 信用点',
+    adminTradeLockCleared: '管理员已解除你的交易限制',
     adminGiveItem: '管理员给予你物品 #{id} ×{n}',
     adminTeleport: '管理员将你传送',
     adminRenamed: '管理员已将你的名字改为 {name}，请重新登录',

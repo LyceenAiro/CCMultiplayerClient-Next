@@ -120,6 +120,27 @@ export interface IConnection {
     /** Perfect-guard compensation: a member's deferred verdict converted to PERFECT
      * (server stamps `player` = the guarding member's name). Host-side handler. */
     onLatePerfectGuard(callback: (data: { player?: string, auid?: number }) => void): void;
+    /** 1.77.x (player trading): merchant-mode presence, invites, and the
+     * server-brokered session protocol (see sync/tradeSync.ts). */
+    tradeMerchant(on: boolean): void;
+    onTradeMerchant(callback: (data: { pl: string, on: boolean }) => void): void;
+    tradeInvite(to: string): void;
+    onTradeInvite(callback: (data: { from: string }) => void): void;
+    tradeAccept(from: string): void;
+    tradeKnown(sid: number, ids: string[]): void;
+    onTradeKnown(callback: (data: { sid: number, from: string, ids: string[] }) => void): void;
+    onTradeOpen(callback: (data: { sid: number, a: string, b: string, ratio: number }) => void): void;
+    tradeOffer(sid: number, items: Array<{ id: string, n: number }>): void;
+    tradeReady(sid: number, on: boolean): void;
+    onTradeState(callback: (data: { sid: number, side?: string, items?: Array<{ id: string, n: number }>, readyA: number, readyB: number }) => void): void;
+    onTradeApply(callback: (data: { sid: number, lose: Array<{ id: string, n: number }>, gain: Array<{ id: string, n: number }> }) => void): void;
+    tradeApplied(sid: number): void;
+    onTradeDone(callback: (data: { sid: number }) => void): void;
+    tradeCancel(sid: number, reason?: string): void;
+    onTradeClosed(callback: (data: { sid: number, reason: string }) => void): void;
+    /** Anti-dupe: a trade invite/accept was refused because one side is under
+     * the post-import/mirror-rollback lockout (self=true -> it is us). */
+    onTradeRejected(callback: (data: { reason: string, self?: boolean, name?: string, lockMs?: number }) => void): void;
     /** Member -> host: I dealt damage to your real enemy (uid); apply it so HP is shared.
      * ROUND 32 (item 3c): type/ball/charged/knockback carry the REAL attack's
      * interrupt/knockback strength so the host rebuilds the genuine reaction (weak
@@ -181,8 +202,11 @@ export interface IConnection {
      * (receivers run the same ballHit charge chain), 'poleCancel' = my ball died
      * with the group mid-charge, 'ball' = my streamed ball bounced / wall-died /
      * expired (receivers spawn ballBounce / ballWallKill / ballAirKill on their
-     * puppet at my exact impact point). */
-    sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number }): void;
+     * puppet at my exact impact point). 1.77.x: 'wblock' = my hit/bump/disk
+     * transitioned a WaterBlock (冰柱) — s: 'steam' | 'melt' | 'ice' | 'bounce' |
+     * 'bump', m = its mapId; receivers replay the same transition FX on their
+     * own copy (steam replays FX-only, without the damage force). */
+    sendPuzzleFx(data: { pl: string, k: 'pole' | 'poleCancel' | 'ball' | 'wblock', m?: number, el?: number, bi?: number, g?: string, t?: string, i?: number, x?: number, y?: number, z?: number, ang?: number, s?: string }): void;
     /** Round 17: HOST -> all — one of my real enemies started an attack (fresh attack
      * anim edge at block cadence). Members replay it on their puppet toward the local
      * player (member puppets no longer run local AI). Round 22 (RC1): `t` is the
@@ -251,8 +275,11 @@ export interface IConnection {
      * destroyed a map destructible (plant/bush/stone, ig.ENTITY.ItemDestruct). `map` = the
      * map it belonged to, `mapId` = the entity's stable mapId — identical map data on every
      * client, so it unambiguously identifies the same plant for everyone. The server relays
-     * it to the other same-instance members (sender excluded). */
-    plantBreak(data: { map: string, mapId: number }): void;
+     * it to the other same-instance members (sender excluded).
+     * 1.76.x (plant-bug adoption): `es` = the member breaker's pre-rolled enemy-spawn
+     * outcome ({t: enemy type, rk?: rank}) — the HOST spawns the authoritative dynamic
+     * enemy from it; receivers' own rolls stay suppressed. */
+    plantBreak(data: { map: string, mapId: number, es?: { t: string, rk?: number } }): void;
     /** ROUND 141 (prop hit-FX sync): any client -> its instance — the local player's
      * ball/melee hit a map destructible and played the vanilla impact flash; relay the
      * impact point (hit center + element + attack type) so every other same-instance
@@ -494,7 +521,7 @@ export interface IConnection {
      * -1 = fall back to the current latest save). */
     saveMirrorRestore(index: number): void;
     /** 1.71.0: the server accepted/rejected a saveMirrorRestore request. */
-    onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number }) => void): void;
+    onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number, tradeLockMs?: number }) => void): void;
     /** Round 27 (item 5): the server rejected/dropped a save upload (rate-limited,
      * corrupt stream, or area-change storm suppression). The exit-to-title upload
      * dialog resolves FAILURE on this so the player exits instead of waiting for the

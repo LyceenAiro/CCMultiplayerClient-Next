@@ -12,8 +12,10 @@ import { installChatBox } from './ui/chatBox';
 import { installItemUseIndicators } from './ui/itemUseIndicator';
 import { installHealSync } from './ui/healSync';
 import { installVersionDisplay } from './ui/versionDisplay';
+import { installUnstuckButton } from './ui/unstuckButton';
 import { installShopDiag } from './ui/shopDiag';
 import { installSkillGuard } from './sync/skillGuard';
+import { installDreamFxGuard } from './sync/dreamFxGuard';
 
 /**
  * CCLoader v2 entry point.
@@ -91,6 +93,11 @@ async function startMultiplayer(): Promise<void> {
 		// 看门狗检测 activeActions 与 skills[] 的背离并自动 updateStats() 修复。
 		installSkillGuard();
 
+		// 梦境剧情后虚化特效看门狗：dreamFx 暗角 / 名为 "dream" 的持续径向模糊 /
+		// 基础屏幕模糊只在整个游戏 reset 时才清除（地图切换不清），剧情链若在
+		// CLEAR 步骤前被打断（跳过、MP 事件中断）特效永久残留 —— 3s 无事件宽限后清除。
+		installDreamFxGuard();
+
 		// ROUND 95: item-use indicators — other players see the item icon pop above
 		// our head when we use a consumable (and vice versa).
 		installItemUseIndicators(() => multiplayer);
@@ -116,6 +123,11 @@ async function startMultiplayer(): Promise<void> {
 		// ROUND 79 (feature): "MP v{version}" line under the version/CCLoader text on
 		// the title screen and the pause screen.
 		installVersionDisplay();
+
+		// ROUND 149 (feature): pause-menu "脱离卡死" button at the top of the
+		// bottom-right list — water-fall damage + teleport next to a random hostile
+		// monster, for the locked-outside-the-encounter-door softlock.
+		installUnstuckButton(() => multiplayer);
 
 		multiplayer = new Multiplayer();
 

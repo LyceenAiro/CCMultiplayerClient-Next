@@ -28,9 +28,15 @@ import { getMpUiScale } from './uiScale';
  *  - Area map showed NOTHING: the old code drew inside sc.MapFloor's
  *    updateDrawables, but a floor's drawables render UNDERNEATH its children,
  *    and the children (sc.MapRoom) paint the opaque room tiles exactly where
- *    the icons landed — every icon was covered. Drawing is now injected into
- *    sc.MapRoom.updateDrawables AFTER the room's own tiles, so markers sit on
- *    top of the map. Icon alpha mirrors roomAlpha like the room tiles do.
+ *    the icons landed — every icon was covered.
+ *  - Area map heads got COVERED by other UI: drawing inside
+ *    sc.MapRoom.updateDrawables only beats the room's own tiles — everything
+ *    attached to the floor AFTER the rooms still paints over the heads (the
+ *    landmark/teleport sc.MapIcons, the current-room corner brackets
+ *    sc.MapCurrentRoomWrapper, even later sibling rooms). Drawing now happens
+ *    in a dedicated overlay child appended LAST in sc.MapFloor.onAttach, so
+ *    the heads render on top of the whole floor. Icon alpha still mirrors
+ *    roomAlpha like the room tiles do.
  *  - Area-map CENTRED markers sit one third down from the room's top edge
  *    (the 6px lift was not enough) — clear of the room-centre teleport icon.
  *  - Hover names never worked since this shipped: pump() saved the collected
@@ -171,12 +177,15 @@ function liveNormPos(m: Multiplayer, name: string): { x: number; y: number } | n
 	} catch (_) { return null; }
 }
 
-function drawRoomIcon(renderer: any, scr: any, alpha: number, cx: number, cy: number, name: string, centerAnchor?: boolean): void {
+/** ox/oy = the room's origin in FLOOR coordinates (roomGui.hook.pos) — markers
+ * are drawn from the floor-top overlay child, not inside the room itself.
+ * Hover hits stay room-local (scr is the room's own screenCoords). */
+function drawRoomIcon(renderer: any, scr: any, alpha: number, ox: number, oy: number, cx: number, cy: number, name: string, centerAnchor?: boolean): void {
 	const lx = Math.round(cx - ROOM_ICON.w / 2);
 	// Live markers float just ABOVE their exact point; centred markers anchor
 	// the head itself on the given point (the point IS where the icon sits).
 	const ly = centerAnchor ? Math.round(cy - ROOM_ICON.h / 2) : Math.round(cy - ROOM_ICON.h - 6);
-	renderer.addGfx(gfx, lx, ly, ROOM_ICON.x, ROOM_ICON.y, ROOM_ICON.w, ROOM_ICON.h).setAlpha(alpha);
+	renderer.addGfx(gfx, ox + lx, oy + ly, ROOM_ICON.x, ROOM_ICON.y, ROOM_ICON.w, ROOM_ICON.h).setAlpha(alpha);
 	if (scr) {
 		hits.push({
 			x: scr.x + lx - 2,
@@ -188,48 +197,59 @@ function drawRoomIcon(renderer: any, scr: any, alpha: number, cx: number, cy: nu
 	}
 }
 
-/** Drawn from inside sc.MapRoom.updateDrawables (AFTER the room tiles), so the
- * markers render on top of the area map. roomGui.room is the AreaRoomBounds
- * (name = dot map path, min/max in area tiles); the gui itself sits at
- * (min.x*8, min.y*8), so local (0,0) is the room's top-left corner. */
-function drawAreaRoomAvatars(roomGui: any, renderer: any): void {
+/** Drawn from the per-floor overlay child (appended LAST in sc.MapFloor.onAttach),
+ * so the markers render ABOVE the rooms, the current-room brackets and every
+ * landmark icon — nothing the floor adds later can cover the little heads.
+ * Iterates the floor's sc.MapRoom children; roomGui.room is the AreaRoomBounds
+ * (name = dot map path, min/max in area tiles) and the room hook's pos is the
+ * room's origin in floor coordinates. */
+function drawFloorAvatars(floorGui: any, renderer: any): void {
 	try {
 		const m = getMain && getMain();
-		if (!m || !roomGui || !roomGui.room) return;
+		if (!m || !floorGui || !floorGui.hook) return;
 		// While the world map is up the area container stays alive (shrunken and
 		// rotated behind the opaque world-map background); skip drawing AND hit
 		// collection so no stale hover targets survive on the world map.
 		const menuAny: any = (sc as any).menu;
 		if (menuAny && menuAny.mapWorldmapActive) return;
-		// Respect the vanilla fog of war: unexplored rooms paint no tiles, so a
-		// floating marker there would leak (and look broken).
-		if (!roomGui.unlocked) return;
-		const room = roomGui.room;
-		const here: string[] = [];
-		for (const mate of partyMembers(m)) {
-			if (mate.map === room.name) here.push(mate.name);
+		const Room: any = (sc as any).MapRoom;
+		const children: any[] = floorGui.hook.children || [];
+		for (let ci = 0; ci < children.length; ci++) {
+			const roomGui: any = children[ci] && children[ci].gui;
+			if (!roomGui || !roomGui.room) continue;
+			if (Room && !(roomGui instanceof Room)) continue;
+			// Respect the vanilla fog of war: unexplored rooms paint no tiles, so a
+			// floating marker there would leak (and look broken).
+			if (!roomGui.unlocked) continue;
+			const room = roomGui.room;
+			const here: string[] = [];
+			for (const mate of partyMembers(m)) {
+				if (mate.map === room.name) here.push(mate.name);
+			}
+			if (!here.length) continue;
+			const g: any = (ig as any).game;
+			const sameMap = !!(g && g.mapName && g.mapName === room.name);
+			const rw = Math.max(8, (room.max.x - room.min.x) * 8);
+			const rh = Math.max(8, (room.max.y - room.min.y) * 8);
+			const scr = seedScreenCoords(roomGui.hook);
+			const alpha = (typeof roomGui.roomAlpha === 'number') ? roomGui.roomAlpha : 1;
+			const ox = roomGui.hook.pos ? roomGui.hook.pos.x : 0;
+			const oy = roomGui.hook.pos ? roomGui.hook.pos.y : 0;
+			// Live mirrors go to their exact in-room spot; everyone else is centred
+			// and fanned out horizontally so stacked markers never overlap.
+			const centred: string[] = [];
+			for (const name of here) {
+				const pos = sameMap ? liveNormPos(m, name) : null;
+				if (pos) drawRoomIcon(renderer, scr, alpha, ox, oy, pos.x * rw, pos.y * rh, name);
+				else centred.push(name);
+			}
+			centred.forEach((name, i) => {
+				const off = (i - (centred.length - 1) / 2) * (ROOM_ICON.w + 2);
+				// One third down from the room's top edge — clear of the teleport /
+				// landmark icon sitting at the room centre.
+				drawRoomIcon(renderer, scr, alpha, ox, oy, rw / 2 + off, rh / 3, name, true);
+			});
 		}
-		if (!here.length) return;
-		const g: any = (ig as any).game;
-		const sameMap = !!(g && g.mapName && g.mapName === room.name);
-		const rw = Math.max(8, (room.max.x - room.min.x) * 8);
-		const rh = Math.max(8, (room.max.y - room.min.y) * 8);
-		const scr = seedScreenCoords(roomGui.hook);
-		const alpha = (typeof roomGui.roomAlpha === 'number') ? roomGui.roomAlpha : 1;
-		// Live mirrors go to their exact in-room spot; everyone else is centred
-		// and fanned out horizontally so stacked markers never overlap.
-		const centred: string[] = [];
-		for (const name of here) {
-			const pos = sameMap ? liveNormPos(m, name) : null;
-			if (pos) drawRoomIcon(renderer, scr, alpha, pos.x * rw, pos.y * rh, name);
-			else centred.push(name);
-		}
-		centred.forEach((name, i) => {
-			const off = (i - (centred.length - 1) / 2) * (ROOM_ICON.w + 2);
-			// One third down from the room's top edge — clear of the teleport /
-			// landmark icon sitting at the room centre.
-			drawRoomIcon(renderer, scr, alpha, rw / 2 + off, rh / 3, name, true);
-		});
 	} catch (_) { /* a map icon must never break the map draw */ }
 }
 
@@ -344,18 +364,31 @@ function pump(): void {
 
 function tryInstall(): boolean {
 	try {
-		const Room: any = (sc as any).MapRoom;
+		const Floor: any = (sc as any).MapFloor;
 		const World: any = (sc as any).MapWorldMap;
-		if (!Room || !World || typeof Room.inject !== 'function' || typeof World.inject !== 'function') return false;
+		if (!Floor || !World || typeof Floor.inject !== 'function' || typeof World.inject !== 'function') return false;
 		gfx = gfx || new (ig as any).Image('media/gui/menu.png');
-		if (!Room.prototype._mpTeamAvatars) {
-			Room.inject({
+		if (!Floor.prototype._mpTeamAvatars) {
+			// A dedicated LAST child of every floor: gui children render in attach
+			// order, so its drawables paint after the rooms, the current-room
+			// wrapper and all landmark icons — the party heads stay on top.
+			const Overlay: any = (ig as any).GuiElementBase.extend({
+				floorGui: null,
+				init(this: any, floorGui: any) {
+					this.parent();
+					this.floorGui = floorGui;
+				},
 				updateDrawables(this: any, renderer: any) {
-					this.parent(renderer);
-					drawAreaRoomAvatars(this, renderer);
+					drawFloorAvatars(this.floorGui, renderer);
 				},
 			});
-			Room.prototype._mpTeamAvatars = true;
+			Floor.inject({
+				onAttach(this: any) {
+					this.parent();
+					try { this.addChildGui(new Overlay(this)); } catch (_) { /* ignore */ }
+				},
+			});
+			Floor.prototype._mpTeamAvatars = true;
 		}
 		if (!World.prototype._mpTeamAvatars) {
 			World.inject({
@@ -366,7 +399,7 @@ function tryInstall(): boolean {
 			});
 			World.prototype._mpTeamAvatars = true;
 		}
-		if (!Room.prototype._mpTeamAvatars || !World.prototype._mpTeamAvatars) return false;
+		if (!Floor.prototype._mpTeamAvatars || !World.prototype._mpTeamAvatars) return false;
 		const s: any = (typeof simplify !== 'undefined') ? (simplify as any) : null;
 		if (s && typeof s.registerUpdate === 'function' && !(s as any)._mpMapTeamPump) {
 			(s as any)._mpMapTeamPump = true;
