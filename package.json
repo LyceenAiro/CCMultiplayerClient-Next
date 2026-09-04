@@ -1,7 +1,7 @@
 {
 	"name": "CCMultiplayerClient-Next",
 	"displayName": "CCMultiplayerClient-Next",
-	"version": "2.3.0",
+	"version": "0.2.4",
 	"description": "A multiplayer mod for CrossCode. Adds online co-op by synchronizing players, enemies and projectiles over a socket.io relay server.",
 	"license": "MIT",
 	"author": "CCDirectLink, LyceenAiro",

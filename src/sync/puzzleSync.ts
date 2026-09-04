@@ -60,6 +60,24 @@ import { Multiplayer } from '../multiplayer';
  *     runs the native touch-start and keeps the platform moving at end-of-rail
  *     pauses while a remote rider is aboard (vanilla only checks its LOCAL
  *     player).
+ *
+ * ROUND 170 — mechanism-STATE entities (one-time / toggle / floor / multi-hit /
+ * bounce / group switches, bounce blocks, water blocks, blockers — i.e. the
+ * torches & steam valves, buttons, barriers and walls) are EVENT-ONLY. Two
+ * entry-time force-sync vectors are removed:
+ *   1. the host's 1Hz FULL snapshot used to carry every switch's on-state, so a
+ *      player ENTERING the room instantly inherited solved mechanisms (and the
+ *      walls/barriers they hold open) — free progress it never earned;
+ *   2. map entry cleared lastSig, so the JOINER's very first scan re-broadcast
+ *      its FRESH (unsolved) state to everyone already inside, rolling their
+ *      triggered switches/plates back off.
+ * Now: the first sighting of such an entity after entering only SEEDS a
+ * baseline (never broadcast), the host full snapshot never carries them, and a
+ * state ships only when it genuinely changes on THIS client (the trigger).
+ * Positional entities (push/pull boxes, sliding blocks, circling platforms,
+ * host-managed lorries) are unaffected — they still need the snapshot
+ * self-heal. Receivers re-seed their signature from the applied state so a
+ * relayed event no longer echoes back out of the receiving client.
  */
 
 const PUZZLE_SCAN_INTERVAL = 0.1;   // seconds — change scan
@@ -307,6 +325,21 @@ class PuzzleSync implements IPuzzleSync {
 						force = true;
 					}
 				}
+			}
+			// ROUND 170: mechanism-state entities are EVENT-ONLY (header). The first
+			// sighting after a map change just seeds the baseline — never broadcast
+			// (this kills the joiner's fresh-state dump that rolled back the room's
+			// triggered switches) — and hostFull deliberately does NOT force them
+			// out either (that snapshot was what force-fed solved torches/buttons/
+			// barriers to every player entering the room). Only a genuine LOCAL
+			// state change (the trigger itself) ships.
+			if (this.isEventDrivenState(e)) {
+				const ssig = this.stateSignature(entry);
+				const prev = this.lastSig.get(mi);
+				this.lastSig.set(mi, ssig);
+				if (prev === undefined || prev === ssig) continue;
+				entries.push(entry);
+				continue;
 			}
 			const sig = this.signature(entry);
 			if (!force && !hostFull && this.lastSig.get(mi) === sig) continue;
@@ -634,6 +667,14 @@ class PuzzleSync implements IPuzzleSync {
 				}
 				if (push) this.applyOwnership(e, s);
 				this.applyEntry(e, s, push);
+				// ROUND 170: a peer's mechanism event just changed OUR local copy —
+				// re-seed its state signature from the LIVE entity so the next scan
+				// doesn't echo the applied state back to the room. Re-encoded AFTER
+				// the apply (not from the packet), so a blocked apply (monotonic
+				// one-time switch, per-player floor plate) can't fake a diff.
+				if (!e._killed && this.isEventDrivenState(e)) {
+					try { this.lastSig.set(s.mi, this.stateSignature(this.encode(e))); } catch (_) { /* ignore */ }
+				}
 			}
 		} catch (_) { /* never break the frame */ }
 		finally {
@@ -1781,5 +1822,35 @@ class PuzzleSync implements IPuzzleSync {
 
 	private signature(s: IPuzzleEntry): string {
 		return JSON.stringify(s);
+	}
+
+	/** ROUND 170: true for mechanism-STATE entities whose sync is event-only —
+	 * one-time / toggle / floor / multi-hit / bounce / group switches, bounce
+	 * blocks, water blocks and blockers/rotate blockers (the torches & steam
+	 * valves, buttons, barriers and walls). Positional entities (push/pull
+	 * boxes, sliding blocks, auto-circling platforms, host-managed lorries)
+	 * return false: they still ride the full snapshot / self-heal streams. */
+	private isEventDrivenState(e: any): boolean {
+		const E: any = (ig.ENTITY as any);
+		if (!E) return false;
+		if (this.isPushPull(e) || this.isSlidingBlock(e) || this.isMovingPlatform(e) || this.isHostManagedLorry(e)) return false;
+		const kinds = [E.WaterBlock, E.OneTimeSwitch, E.MultiHitSwitch, E.FloorSwitch, E.Switch,
+			E.BounceSwitch, E.BounceBlock, E.GroupSwitch, E.RotateBlocker, E.Blocker];
+		for (const k of kinds) {
+			if (k && e instanceof k) return true;
+		}
+		return false;
+	}
+
+	/** ROUND 170: signature over STATE fields only (no position, no anim), so
+	 * idle animation or position noise can never masquerade as a trigger event.
+	 * Keyed per-mapId via lastSig, so the entity's own id is not included. */
+	private stateSignature(s: IPuzzleEntry): string {
+		const on = typeof s.on === 'number' ? s.on : -1;
+		const hits = typeof s.hits === 'number' ? s.hits : -1;
+		const st = typeof s.st === 'number' ? s.st : -1;
+		const ph = typeof s.ph === 'number' ? s.ph : -1;
+		const hd = typeof s.hd === 'number' ? s.hd : -1;
+		return on + '|' + hits + '|' + st + '|' + ph + '|' + hd;
 	}
 }

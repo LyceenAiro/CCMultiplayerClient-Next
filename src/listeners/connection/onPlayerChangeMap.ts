@@ -4,14 +4,14 @@ import { IPlayer } from '../../player';
 import { dropNameTag, wipeAllNameTags } from '../../ui/mpOptions';
 
 export class OnPlayerChangeMapListener {
-	/** Pending load-complete waiters. A queue (not a single slot) so two players
-	 * entering during the same map load both get their mirror spawned — a single
-	 * shared `cb` would be overwritten by the second, silently dropping the first. */
-	private cbs: Array<() => void> = [];
-	/** Players who entered while we were mid-map-change; spawned on loadingComplete.
-	 * Each entry carries the relayed sub-map so the flush/reconcile can skip members
-	 * whose sub-map doesn't match ours (a town instance spans a whole area). */
-	private pendingSpawn: { [name: string]: { position: Vec3, map?: string } } = {};
+	/** Pending load-complete waiters + the mid-load enter queue live on
+	 * `main.pendingLoadCbs` / `main.pendingSpawn` — NOT on this listener. A NEW
+	 * listener is created on every (re)connect while the loadingComplete inject
+	 * below is installed once per process and bound to the FIRST instance, so a
+	 * per-listener queue split-brains after any reconnect: enters queue on the new
+	 * listener while the flush reads the old one's (empty) queue. That lost the
+	 * pendingSpawn merge in the roster reconcile -> empty playerMapByName -> the
+	 * followed host's playerStates were gated out for the whole map. */
 
 	constructor(
         private main: Multiplayer,
@@ -55,13 +55,13 @@ export class OnPlayerChangeMapListener {
 				// wipe+revive race), dropping this member and leaving isSoloInstance()
 				// stuck true. Queueing keeps them in playerMapByName so the full sync resumes
 				// and their mirror self-heals from their playerState.
-				this.pendingSpawn[player] = { position, map: map || '' };
+				this.main.pendingSpawn[player] = { position, map: map || '' };
 				this.spawnMirror(player, position);
 				return;
 			}
 			// Actual level load: queue for loadingComplete (spawning mid-load hangs/errs).
 			if (ig.game.isTeleporting() || ig.game.entities.length === 0) {
-				this.pendingSpawn[player] = { position, map: map || '' };
+				this.main.pendingSpawn[player] = { position, map: map || '' };
 				this.ensurePlayerRecord(player, position);
 				// ROUND 82: the load-complete spawn is a door/teleport arrival — fade it in.
 				this.main.pendingFadeIn[player] = true;
@@ -75,7 +75,7 @@ export class OnPlayerChangeMapListener {
 			}
 			if (!sameMap) {
 				// Off-map member: never mirror them; clear any stale mirror/tag first.
-				delete this.pendingSpawn[player];
+				delete this.main.pendingSpawn[player];
 				this.despawnMirror(player);
 				return;
 			}
@@ -105,7 +105,7 @@ export class OnPlayerChangeMapListener {
 			}
 			// A player LEFT our instance: despawn their mirror and drop any pending
 			// spawn / tracked record for them.
-			delete this.pendingSpawn[player];
+			delete this.main.pendingSpawn[player];
 			this.despawnMirror(player);
 			// Round 22: belt-and-braces tag wipe — a stale cached tag can be re-shown
 			// by addTagAt if a later name collides; mirrors the loadingComplete wipe.
@@ -179,12 +179,15 @@ export class OnPlayerChangeMapListener {
 				this.parent();
 				// Flush any deferred spawns (players who entered during the load), but
 				// only for members whose relayed sub-map matches ours (town spans an area).
-				const pending = instance.pendingSpawn;
-				instance.pendingSpawn = {};
+				// The queue lives on main (survives the per-reconnect listener swap — this
+				// inject is bound to the FIRST listener instance for the process' lifetime).
+				const pending = instance.main.pendingSpawn;
+				instance.main.pendingSpawn = {};
 				const flushMap = ig.game ? (ig.game as any).mapName : '';
 				for (const name in pending) {
 					const rec = pending[name];
 					if (rec && (!rec.map || rec.map === flushMap)) {
+						console.log('[multiplayer] loadingComplete: spawning deferred mirror for ' + name + ' (entered while we were loading)');
 						instance.spawnMirror(name, rec.position);
 					}
 				}
@@ -237,6 +240,22 @@ export class OnPlayerChangeMapListener {
 							if (pm === myMap) {
 								keep.add(n);
 								posByName[n] = rec.position;
+							}
+						}
+						// Fail-safe: merge prevPmap members KNOWN to be on our sub-map but missing
+						// from BOTH the roster and the pending queue (their enter event arrived,
+						// then the roster raced in empty or the queue was lost). The leave branch
+						// deletes pmap entries the moment an enters:false arrives, so a name still
+						// mapped to OUR map really is still here — dropping it would rebuild an
+						// incomplete playerMapByName and netSync would gate their playerStates for
+						// the whole map ("followed quickly, host invisible").
+						for (const n in prevPmap) {
+							if (pmap[n] === undefined && prevPmap[n] === myMap) {
+								pmap[n] = myMap;
+								keep.add(n);
+								const pr: any = instance.main.players[n];
+								if (pr && pr.position) posByName[n] = pr.position;
+								console.log('[multiplayer] reconcile: kept ' + n + ' via prevPmap (missing from roster+pendingSpawn)');
 							}
 						}
 						instance.main.reconcilePlayerMirrorsAfterMapChange(keep);
@@ -304,6 +323,8 @@ export class OnPlayerChangeMapListener {
 						console.log('[multiplayer] loadingComplete roster reconcile: roster='
 							+ (roster !== undefined ? String(roster.length) : 'none')
 							+ ' keep=' + Array.from(keep).join(',')
+							+ ' pending=' + Object.keys(pending).join(',')
+							+ ' pmap=' + Object.keys(pmap).map((n: string) => n + ':' + pmap[n]).join(',')
 							+ ' map=' + myMap);
 					} catch (_) { /* ignore */ }
 					// ROUND 84: proactively spawn every kept member that has no LIVE mirror.
@@ -330,8 +351,8 @@ export class OnPlayerChangeMapListener {
 				// reconciled roster on the next frame.
 				try { wipeAllNameTags(); } catch (_) { /* never break a map load */ }
 				// Flush any load-complete waiters (legacy path).
-				const cbs = instance.cbs;
-				instance.cbs = [];
+				const cbs = instance.main.pendingLoadCbs;
+				instance.main.pendingLoadCbs = [];
 				for (const cb of cbs) cb.call(instance);
 			},
 		});

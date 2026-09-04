@@ -59,6 +59,22 @@ export class OnEntitySpawnListener {
 		} catch (_) { /* diagnostics must never break a spawn */ }
 	}
 
+	/** ROUND 164 (ice-skill sync): neutralize a proxy spawned BY a replayed visual
+	 * copy (nested proxy-of-proxy). Same contract as
+	 * OnThrownBallListener.neutralizeProxyVisual — kept in sync by hand: marked for
+	 * the damage gates + 25s stale sweep, checkTackle/setTackle nooped, and a
+	 * non-null target fallback so the TACKLE step can't insta-end-shatter it. */
+	private neutralizeNestedProxyCopy(e: any): void {
+		if (!e) return;
+		try {
+			e._mpProxyVisual = true;
+			e._mpProxyVisualBorn = Date.now();
+			e.checkTackle = function (): boolean { return false; };
+			e.setTackle = function () { /* visual copy: tackle is motion-only */ };
+			if (!e.target) e.target = e.combatant || e;
+		} catch (_) { /* visuals must never break sync */ }
+	}
+
 	public onEntitySpawned(type: string | typeof ig.Entity,
 		x: number,
 		y: number,
@@ -95,6 +111,10 @@ export class OnEntitySpawnListener {
 			// don't spam a warning for those.
 			if (isLocalPlayerBall) {
 				const ballSettings = this.filterBall(settings);
+				// ROUND 164 (ice-skill sync diagnostics): opt-in [mpice] trace via
+				// window._mpIceDiag = true. One art cast then pinpoints whether the
+				// sender relay resolves the ball/proxy name at all.
+				try { if ((window as any)._mpIceDiag) console.log('[mpice] TX ball name=' + (ballSettings ? ballSettings.ballInfo : 'UNRESOLVED') + ' pos=' + (x | 0) + ',' + (y | 0) + ',' + (z | 0)); } catch (_) { /* ignore */ }
 				if (ballSettings) {
 					// 1.75.x: ship the engine's exact spawn coords. Skill bursts
 					// (SHOOT_PROXY_RANGE's startDist/offset — the Burn! flame cone)
@@ -132,11 +152,15 @@ export class OnEntitySpawnListener {
 		try {
 			const CPE: any = (sc as any).CombatProxyEntity;
 			if (CPE && (type as unknown) === CPE && settings) {
+				// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag = true logs
+				// every GENERIC proxy relay decision ([mpice] TX proxy ...). Logging only.
+				const iceDiag = !!(window as any)._mpIceDiag;
 				// 1.76.x (bot attack sync): a BOT-owned generic proxy (the bot's dash-art
 				// mines / walls) resolves against the BOT's own proxy set and relays
 				// with the bot name.
 				const botProxyName = this.main.ownedBotNameOf(settings.combatant);
 				if (botProxyName) {
+					let relayedName = ''; // ROUND 164
 					const botProxies: any = (settings.combatant as any).proxies || {};
 					for (const name in botProxies) {
 						const p: any = botProxies[name];
@@ -149,10 +173,13 @@ export class OnEntitySpawnListener {
 								pos: { x, y, z },
 								bn: botProxyName,
 							});
+							relayedName = name; // ROUND 164
 							break;
 						}
 					}
+					if (iceDiag) console.log('[mpice] TX proxy bot=' + botProxyName + ' name=' + (relayedName || 'NOMATCH') + ' pos=' + (x | 0) + ',' + (y | 0) + ',' + (z | 0));
 				} else if (settings.combatant === ig.game.playerEntity) {
+				let relayedName = ''; // ROUND 164
 				const proxies: any = (ig.game.playerEntity as any).proxies || {};
 				for (const name in proxies) {
 					const p: any = proxies[name];
@@ -166,14 +193,47 @@ export class OnEntitySpawnListener {
 							party: 0,
 							pos: { x, y, z },
 						});
+						relayedName = name; // ROUND 164
 						break;
 					}
 				}
+				if (iceDiag) console.log('[mpice] TX proxy player name=' + (relayedName || 'NOMATCH') + ' pos=' + (x | 0) + ',' + (y | 0) + ',' + (z | 0));
+				} else if (iceDiag) {
+					// ROUND 164: proxy owned by someone else (mirror replay copy, enemy,
+					// nested proxy-of-proxy) — never relayed by design. Describe the owner
+					// so we can tell a legit skip from a wrongly-classified player proxy.
+					let who = 'other';
+					try {
+						const c: any = settings.combatant;
+						if (c) {
+							if (c.isPlayer) who = 'player?';
+							else if ((c as any)._mpProxyVisual) who = 'replay-copy';
+							else if (c.enemyType || c.enemyName) who = 'enemy:' + (c.enemyName || '?');
+							else if ((c as any).multiplayerId !== undefined) who = 'mid:' + (c as any).multiplayerId;
+							else who = (c.constructor && (c.constructor as any).name) || 'entity';
+						} else who = 'null';
+					} catch (_) { /* ignore */ }
+					console.log('[mpice] TX proxy SKIP combatant=' + who + ' pos=' + (x | 0) + ',' + (y | 0) + ',' + (z | 0));
 				}
 			}
 		} catch (_) { /* the proxy relay must never break a spawn */ }
 
 		const entity = this.original.call(ig.game, type, x, y, z, settings, showAppearEffects) as IMultiplayerEntity;
+
+		// ROUND 164 (ice-skill sync): a replayed visual copy's NESTED spawns (the
+		// copy's own action SHOOT_PROXYs children — icicleBig → icicleSubLine → its
+		// icicle line) arrive here with combatant = the copy, so the relay above
+		// correctly skips them (they must not echo back over the wire). But they
+		// spawn as LIVE proxies — neutralize them like their parent copy: no live
+		// tackle and a guaranteed non-null target, or the TACKLE step's no-target
+		// insta-end (non-player combatant) would shatter them on their first frame.
+		try {
+			const CPE2: any = (sc as any).CombatProxyEntity;
+			if (CPE2 && (type as unknown) === CPE2 && entity && settings
+				&& settings.combatant && (settings.combatant as any)._mpProxyVisual) {
+				this.neutralizeNestedProxyCopy(entity);
+			}
+		} catch (_) { /* nested-copy neutralization must never break a spawn */ }
 
 		const realType = this.findEntityType(type);
 		if (realType === undefined) {

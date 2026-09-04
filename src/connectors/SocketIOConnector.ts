@@ -38,6 +38,9 @@ export class SocketIoConnector implements IConnection {
 	 * The reconnect handler consults it so the styled "server updated" popup is not
 	 * followed by the generic disconnect popup, and we stop socket.io reconnects. */
 	private _mpVersionMismatch = false;
+	/** 1.78.x: the session's account password (in-memory only) — set by identify,
+	 *  reused by the reconnect re-identify, updated by setPassword. */
+	private _mpPassword?: string;
 
 	// ---- Round 16: client-side latency probe ----
 	// The server echoes our `mpPing {t: Date.now()}` payload back verbatim
@@ -273,7 +276,7 @@ export class SocketIoConnector implements IConnection {
 			if (this.username && this.setHost) {
 				let result;
 				try {
-					result = await this.identify(this.username);
+					result = await this.identify(this.username, false, this._mpPassword);
 				} catch (e) {
 					// ROUND 86: a version-mismatch rejection was already handled by
 					// main.onServerVersionMismatch (popup + socket close) — do NOT also
@@ -374,8 +377,12 @@ export class SocketIoConnector implements IConnection {
 		return this.socket.connected;
 	}
 
-	public identify(username: string, mirrorMode?: boolean): Promise<IIdentifyResult> {
+	public identify(username: string, mirrorMode?: boolean, password?: string): Promise<IIdentifyResult> {
 		return new Promise<IIdentifyResult>((resolve, reject) => {
+			// 1.78.x: remember the password for the session so the socket.io
+			// RECONNECT path (which re-runs identify below) re-authenticates
+			// without asking again. In-memory only — never persisted, never logged.
+			if (password !== undefined) this._mpPassword = password || undefined;
 			this.socket.once('handshakeResponse', (data: {
                 success: boolean,
                 username: string,
@@ -417,13 +424,20 @@ export class SocketIoConnector implements IConnection {
                 tradeLockMs?: number,
                 // ...and the CONFIGURED duration in hours (message text; default 48).
                 tradeLockHours?: number,
+                // ROUND 162 (progress wall): server-blocked map IDs (lowercase dotted).
+                blockedMaps?: string[],
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
+                // 1.78.x: wrong-password rejections carry authFailed so the
+                // client can reopen the login panel instead of erroring out;
+                // passwordRequired marks legacy accounts with no password yet.
+                authFailed?: string,
+                passwordRequired?: boolean,
             }) => {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, tradeEnabled: data.tradeEnabled !== false, tradeRatio: (typeof data.tradeRatio === 'number' && isFinite(data.tradeRatio) && data.tradeRatio >= 1) ? data.tradeRatio : 2, tradeLockMs: (typeof data.tradeLockMs === 'number' && isFinite(data.tradeLockMs) && data.tradeLockMs > 0) ? data.tradeLockMs : 0, tradeLockHours: (typeof data.tradeLockHours === 'number' && isFinite(data.tradeLockHours) && data.tradeLockHours >= 0) ? data.tradeLockHours : 48, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, tradeEnabled: data.tradeEnabled !== false, tradeRatio: (typeof data.tradeRatio === 'number' && isFinite(data.tradeRatio) && data.tradeRatio >= 1) ? data.tradeRatio : 2, tradeLockMs: (typeof data.tradeLockMs === 'number' && isFinite(data.tradeLockMs) && data.tradeLockMs > 0) ? data.tradeLockMs : 0, tradeLockHours: (typeof data.tradeLockHours === 'number' && isFinite(data.tradeLockHours) && data.tradeLockHours >= 0) ? data.tradeLockHours : 48, blockedMaps: Array.isArray(data.blockedMaps) ? data.blockedMaps : undefined, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined, passwordRequired: data.passwordRequired === true});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -447,8 +461,20 @@ export class SocketIoConnector implements IConnection {
 						reject(verr);
 						return;
 					}
+					// 1.78.x: auth rejection (wrong password / brute-force lockout)
+					// — reject with a marker connect() recognizes (it reopens the
+					// login panel with a hint instead of reporting a generic
+					// connection failure). _mpAuthMsg carries the server's own
+					// bilingual message (attempts left / lock duration).
+					if (typeof data.authFailed === 'string' && data.authFailed) {
+						const aerr: any = new Error('[multiplayer] Login rejected: ' + (data.failed || data.authFailed));
+						aerr._mpAuthFailed = true;
+						aerr._mpAuthMsg = typeof data.failed === 'string' ? data.failed : '';
+						reject(aerr);
+						return;
+					}
 					// The server rejects with {failed: "..."} (older style) or
-					// {message: "..."} (round-17 version mismatches) — no `success`.
+					// {message: "..."} (round-17 version mismatches) — no success.
 					reject(new Error('[multiplayer] Login rejected: ' + (data.failed || data.message || 'unknown reason')));
 				}
 			});
@@ -463,6 +489,10 @@ export class SocketIoConnector implements IConnection {
 				// 1.71.0: mirror rollback mode — the server authenticates but holds
 				// the normal save stream until saveMirrorRestore picks a snapshot.
 				mirrorMode: !!mirrorMode,
+				// 1.78.x: account password (undefined = field dropped from the
+				// payload; the server only checks it for password-protected
+				// accounts). Reused from _mpPassword on reconnect re-identify.
+				password: this._mpPassword,
 			});
 		});
 	}
@@ -772,6 +802,9 @@ export class SocketIoConnector implements IConnection {
 	}
 
 	public throwBall(ballInfo: IBallInfo): void {
+		// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag = true traces the
+		// send decision, including whether syncEmit's solo-instance skip would drop it.
+		try { if ((window as any)._mpIceDiag) console.log('[mpice] emit throwBall', ballInfo && ballInfo.ballInfo, 'solo=', this.main.isSoloInstance()); } catch (_) { /* ignore */ }
 		this.syncEmit('throwBall', ballInfo);
 	}
 
@@ -1585,6 +1618,8 @@ export class SocketIoConnector implements IConnection {
 	}
 	public onThrowBall(callback: (ballInfo: IBallInfo) => void): void {
 		this.socket.on('throwBall', (data: IBallInfo) => {
+			// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag wire trace.
+			try { if ((window as any)._mpIceDiag) console.log('[mpice] wire throwBall', data && data.ballInfo, 'from=', data && data.combatant); } catch (_) { /* ignore */ }
 			callback(data);
 		});
 	}
@@ -1918,6 +1953,32 @@ export class SocketIoConnector implements IConnection {
 	public saveMirrorRestore(index: number): void {
 		this.socket.emit('saveMirrorRestore', { index });
 	}
+
+	/** 1.78.x: set/change the account password (authed socket). Resolves with the
+	 *  server's result; on success the session password is updated so a later
+	 *  reconnect re-identifies with the NEW password. */
+	public setPassword(password: string): Promise<{ ok: boolean, msg?: string }> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const done = (r: { ok: boolean, msg?: string }): void => {
+				if (settled) return;
+				settled = true;
+				if (r.ok) this._mpPassword = password;
+				resolve(r);
+			};
+			const timer = setTimeout(() => done({ ok: false, msg: 'timeout' }), 8000);
+			try {
+				this.socket.once('setPasswordResult', (data: any) => {
+					clearTimeout(timer);
+					done({ ok: !!(data && data.ok), msg: data && typeof data.msg === 'string' ? data.msg : undefined });
+				});
+				this.socket.emit('setPassword', { password });
+			} catch (_) {
+				clearTimeout(timer);
+				done({ ok: false, msg: 'send failed' });
+			}
+		});
+	}
 	public onSaveMirrorRestoreResult(callback: (result: { ok: boolean, reason?: string, index?: number, tradeLockMs?: number }) => void): void {
 		this.socket.on('saveMirrorRestoreResult', (data: any) => {
 			if (!data || typeof data.ok !== 'boolean') return;
@@ -2034,9 +2095,12 @@ export class SocketIoConnector implements IConnection {
 
 	/** Round 27 (item 5): the server dropped/rejected a save upload — resolve the
 	 * exit-to-title upload dialog as FAILED so the player exits without the full wait. */
-	public onSaveFailed(callback: (slot: string, reason: string) => void): void {
+	public onSaveFailed(callback: (slot: string, reason: string, prevLevel?: number) => void): void {
 		this.socket.on('saveFailed', (data: any) => {
-			if (data && typeof data.slot === 'string') callback(data.slot, String(data.reason || ''));
+			if (data && typeof data.slot === 'string') {
+				callback(data.slot, String(data.reason || ''),
+					typeof data.prevLevel === 'number' && isFinite(data.prevLevel) ? data.prevLevel : undefined);
+			}
 		});
 	}
 

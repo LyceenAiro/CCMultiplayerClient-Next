@@ -608,9 +608,16 @@ function makeTag(name: string, opts: { font: any, alpha: number, gold: boolean, 
         const origOvc: any = box.onVisibilityChange;
         box.onVisibilityChange = function (this: any, vis: any) {
             try {
-                if (vis) {
+                // ROUND 160 (console spam): the engine re-fires onVisibilityChange
+                // from _updateRecursive every frame while a tag is up — an
+                // unconditional log here printed HUNDREDS of '[tagvis] shown' lines
+                // per cutscene (plus a fresh Error().stack per call). Silent by
+                // default now: window.__mpTagVis = true re-enables the spy, logged
+                // once per show/hide TRANSITION per tag instead of per frame.
+                if ((window as any).__mpTagVis && this._mpTagVisLast !== !!vis) {
+                    this._mpTagVisLast = !!vis;
                     const st: any = new Error('tagvis').stack;
-                    console.log('[tagvis] shown: ' + this._mpLabel, String(st).split(String.fromCharCode(10)).slice(2, 6).join(' | '));
+                    console.log('[tagvis] ' + (vis ? 'shown' : 'hidden') + ': ' + this._mpLabel, String(st).split(String.fromCharCode(10)).slice(2, 6).join(' | '));
                 }
             } catch (_) { /* spy only */ }
             if (origOvc) origOvc.call(this, vis);

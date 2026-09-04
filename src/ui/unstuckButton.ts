@@ -1,4 +1,5 @@
 import { t } from '../i18n';
+import { showMpToast } from './toasts';
 
 /**
  * ROUND 149 (feature): pause-menu "脱离卡死" (unstuck) button. In multiplayer a
@@ -63,6 +64,14 @@ function aimRespawnAtMonster(player: any): void {
 	} catch (e) { console.warn('[multiplayer] unstuck: monster pick failed', e); }
 }
 
+/** ROUND 161 (unstuck mercy window): the first unstuck is FREE — no water-fall
+ * damage. Any re-use within 60s of the LAST use pays the vanilla ~10% max-HP
+ * fall damage; a 60s quiet period resets it, so the next use is free again.
+ * Tracked per pressing client (the whole sequence is local — HP streams out
+ * via the normal playerState blocks, unchanged). */
+const UNSTUCK_FREE_WINDOW_MS = 60000;
+let lastUnstuckUseAt = 0; // 0 = never used -> first use is free
+
 function doUnstuck(getMp: () => any): void {
 	const m = getMp && getMp();
 	const conn = m && m.connection;
@@ -77,7 +86,50 @@ function doUnstuck(getMp: () => any): void {
 	// close the pause menu first (vanilla resume does exactly this), then run the
 	// vanilla water fall: splash -> respawn line -> reappear -> ~10% max-HP damage.
 	try { (sc as any).model.enterRunning(); } catch (_) { /* fall through */ }
-	try { player.quickFall((ig as any).TERRAIN.WATER); } catch (e) { console.warn('[multiplayer] unstuck: quickFall failed', e); }
+	// ROUND 161: free iff the last use was >60s ago (or never). The fall damage
+	// is frozen SYNCHRONOUSLY inside quickFall from player.fallDmgFactor
+	// (b = floor(maxHp * fallDmgFactor) -> doQuickRespawn), so zeroing the factor
+	// around the call makes this use free; restoring right after keeps every
+	// later fall (real water/hole falls included) at vanilla damage. Only touch
+	// it when the current value is a finite number — restoring an undefined
+	// factor would turn later real falls into NaN damage.
+	const now = Date.now();
+	const free = now - lastUnstuckUseAt > UNSTUCK_FREE_WINDOW_MS;
+	let savedFallFactor: number | null = null;
+	if (free) {
+		try {
+			const cur = player.fallDmgFactor;
+			if (typeof cur === 'number' && isFinite(cur)) { savedFallFactor = cur; player.fallDmgFactor = 0; }
+		} catch (_) { savedFallFactor = null; }
+	}
+	let fell = false;
+	try { player.quickFall((ig as any).TERRAIN.WATER); fell = true; lastUnstuckUseAt = now; } catch (e) { console.warn('[multiplayer] unstuck: quickFall failed', e); }
+	if (savedFallFactor !== null) { try { player.fallDmgFactor = savedFallFactor; } catch (_) { /* ignore */ } }
+	if (fell) { try { showMpToast({ title: t(free ? 'mpUnstuckFree' : 'mpUnstuckPaid') }); } catch (_) { /* ignore */ } }
+}
+
+/** 1.77.x: same button DURING a cutscene — the player is scene-controlled, so
+ * the water-fall teleport would be wrong; instead run one stall-gated cutscene
+ * heal (cutsceneActorGuard.healFromPause: nudge a stuck action, or force-end a
+ * wedged event call through the engine's own _endEventCall). The pause menu is
+ * closed first, exactly like the vanilla RESUME button (enterRunning). */
+function doCutsceneUnstuck(getMp: () => any): void {
+	const m = getMp && getMp();
+	const conn = m && m.connection;
+	if (!conn || typeof conn.isOpen !== 'function' || !conn.isOpen()) return;
+	try { (sc as any).model.enterRunning(); } catch (_) { /* fall through */ }
+	const guard: any = m && m.cutsceneActorGuard;
+	if (guard && typeof guard.healFromPause === 'function') {
+		try { guard.healFromPause(); } catch (e) { console.warn('[multiplayer] cutscene unstuck failed', e); }
+	}
+}
+
+function inCutscene(): boolean {
+	try {
+		const mdl: any = (sc as any).model;
+		return !!(mdl && (mdl.currentState === (sc as any).GAME_MODEL_STATE.CUTSCENE
+			|| (typeof mdl.isCutscene === 'function' && mdl.isCutscene())));
+	} catch (_) { return false; }
 }
 
 /** updateButtons post-hook: (re)place the button above RESUME, or detach it. */
@@ -86,7 +138,13 @@ function refreshUnstuckButton(gui: any, getMp: () => any): void {
 	if (!btn) {
 		btn = new (sc as any).ButtonGui(t('unstuck'), (sc as any).BUTTON_DEFAULT_WIDTH);
 		btn.setAlign((ig as any).GUI_ALIGN.X_RIGHT, (ig as any).GUI_ALIGN.Y_BOTTOM);
-		btn.onButtonPress = () => { try { doUnstuck(getMp); } catch (e) { console.warn('[multiplayer] unstuck failed', e); } };
+		// 1.77.x: dispatch at CLICK time — outside a cutscene this is the combat
+		// water-fall escape, during one it's the stall-gated scene heal.
+		btn.onButtonPress = () => {
+			try {
+				if (inCutscene()) doCutsceneUnstuck(getMp); else doUnstuck(getMp);
+			} catch (e) { console.warn('[multiplayer] unstuck failed', e); }
+		};
 		gui._mpUnstuckBtn = btn;
 	}
 	// the parent's updateButtons rebuilds its own list; we re-evaluate every call
@@ -95,10 +153,17 @@ function refreshUnstuckButton(gui: any, getMp: () => any): void {
 	const conn = m && m.connection;
 	const connected = !!(conn && typeof conn.isOpen === 'function' && conn.isOpen());
 	if (!connected) return;
-	// plain pause branch only: resume+save+toTitle visible, no cutscene skip /
-	// cancel-reload, no arena restart/lobby variants
-	if (!isAttached(gui.resumeButton) || !isAttached(gui.saveGameButton) || !isAttached(gui.toTitleButton)) return;
-	if (isAttached(gui.skipButton) || isAttached(gui.cancelButton) || isAttached(gui.arenaRestart) || isAttached(gui.arenaLobby)) return;
+	const cs = inCutscene();
+	if (isAttached(gui.arenaRestart) || isAttached(gui.arenaLobby) || isAttached(gui.cancelButton)) return;
+	if (!cs) {
+		// plain pause branch only: resume+save+toTitle visible, no cutscene skip
+		if (!isAttached(gui.resumeButton) || !isAttached(gui.saveGameButton) || !isAttached(gui.toTitleButton)) return;
+		if (isAttached(gui.skipButton)) return;
+	} else {
+		// 1.77.x: cutscene branch (with or without the skip button — skipBlock
+		// scenes fall back to the plain layout). RESUME is always attached here.
+		if (!isAttached(gui.resumeButton)) return;
+	}
 	const grp: any = gui.buttonGroup;
 	if (!grp || typeof grp.clear !== 'function' || !gui.resumeButton.hook) return;
 	// one slot above RESUME (same +4 gap the vanilla stack uses)
@@ -110,9 +175,11 @@ function refreshUnstuckButton(gui: any, getMp: () => any): void {
 	grp.addFocusGui(gui.resumeButton, 0, 1, true);    // resume keeps the ESC/back binding
 	grp.addFocusGui(gui.optionsButton, 0, 2);
 	grp.addFocusGui(gui.saveGameButton, 0, 3);
-	grp.addFocusGui(gui.toTitleButton, 0, 4);
+	let idx = 4;
+	if (cs && isAttached(gui.skipButton)) grp.addFocusGui(gui.skipButton, 0, idx++);
+	if (isAttached(gui.toTitleButton)) grp.addFocusGui(gui.toTitleButton, 0, idx);
 	// default focus stays on RESUME so mashing confirm to unpause can't
-	// accidentally trigger the teleport
+	// accidentally trigger the heal/teleport
 	if ((ig as any).input.mouseGuiActive) {
 		grp.setCurrentFocus(0, 1);
 		grp.unfocusCurrentButton();

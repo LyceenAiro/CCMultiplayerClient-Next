@@ -9,6 +9,12 @@ export class OnTeleportListener {
 	 * watchdog exists to clean up). */
 	private _teleportGen = 0;
 
+	/** ROUND 162 (progress wall): generation vetoed by the SERVER's changeMap
+	 * gate (failed === 'blocked'). fireTeleport skips the real load for it, so a
+	 * stale/edited client still never loads a blocked map. Monotonic gens make
+	 * the single-slot latch sufficient. */
+	public _mpVetoedGen = 0;
+
 	/** ROUND 100 (teleport recovery rework): the 5s watchdog no longer trusts a
 	 * fixed timer alone — it only fires when the loader/map-request made NO
 	 * progress for the whole window (same pending signature). The first recovery
@@ -36,6 +42,18 @@ export class OnTeleportListener {
 		const game = ig.game as sc.CrossCode;
 		const original = game.teleport;
 		game.teleport = function(this: sc.CrossCode, map: string, teleportPosition: any, hint?: any) {
+			// ROUND 162 (progress wall): server-blocked maps are refused at INTENT —
+			// cancelled before the death-abort, the changeMap deferral and ANY map
+			// load, so the blocked map is never loaded (its story never runs) and
+			// the player simply stays put with a toast. Offline / older servers the
+			// list is empty and isMapBlocked returns false — zero behavior change.
+			try {
+				const mw: any = (window as any).__mpMain;
+				if (mw && typeof mw.isMapBlocked === 'function' && mw.isMapBlocked(map)) {
+					try { if (typeof mw.onProgressWallBlock === 'function') mw.onProgressWallBlock(map); } catch (_) { /* ignore */ }
+					return undefined as any;
+				}
+			} catch (_) { /* fall through to the normal flow */ }
 			// A teleport while dead ends the death immediately (silent respawn —
 			// the teleport places the player; the death pin must not keep writing
 			// stale death-map coordinates afterwards).
@@ -76,7 +94,9 @@ export class OnTeleportListener {
 				// player mid-load. The per-frame coll decision-maker
 				// (netSync.updateRemoteMirrorFade) forces them to IGNORE until this deadline.
 				try { if (instance.main.netSync) instance.main.netSync._mpMirrorGraceUntil = Date.now() + 1000; } catch (_) { /* ignore */ }
-				if (gen === instance._teleportGen) original.call(this, map, teleportPosition, hint);
+				// ROUND 162: the server vetoed this changeMap (progress wall) —
+				// stay put; never fire the load.
+				if (gen === instance._teleportGen && instance._mpVetoedGen !== gen) original.call(this, map, teleportPosition, hint);
 			};
 			instance.onTeleport(map, teleportPosition, gen)
 				.then(() => { fireTeleport(); })
@@ -298,6 +318,18 @@ export class OnTeleportListener {
 			// A newer teleport superseded this one: its response must NOT overwrite
 			// the host flag (stale verdict for the wrong map).
 			if (gen !== undefined && gen !== this._teleportGen) return;
+			// ROUND 162: a FAILED changeMap carries no verdict — never clobber the
+			// host flag with it. 'blocked' (progress wall) additionally vetoes the
+			// pending load entirely and drops the stale pendingChangeMap so
+			// onMapEnter can never consume a failure payload as a roster.
+			if (result && (result as any).failed) {
+				if ((result as any).failed === 'blocked') {
+					this._mpVetoedGen = (gen === undefined) ? 0 : gen;
+					try { if (this.main.pendingChangeMap === req) this.main.pendingChangeMap = undefined; } catch (_) { /* ignore */ }
+					try { this.main.onProgressWallBlock(map); } catch (_) { /* ignore */ }
+				}
+				return;
+			}
 			// ROUND 116 (team-wipe revive): stash the response ON the request
 			// promise. onMapEnter needs the instance roster (newInstanceMembers)
 			// BEFORE loadLevel can synchronously finish a cached same-map reload —

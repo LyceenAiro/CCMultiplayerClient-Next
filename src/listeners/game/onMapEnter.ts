@@ -78,6 +78,9 @@ export class OnMapEnterListener {
 		// response is still outstanding (legacy path), re-apply it afterwards.
 		if (pending) {
 			const applyResult = (result: any) => {
+				// ROUND 162: a vetoed/failed changeMap carries no verdict — keep
+				// the current host flag and roster instead of stamping undefined.
+				if (!result || result.failed) return;
 				this.main.host = result.isHost;
 				// Round 20: remember the NEW instance's host username for the " (Host)"
 				// name-tag label (optional field — guarded against older servers).
@@ -120,6 +123,24 @@ export class OnMapEnterListener {
 				}).catch(() => { /* keep current flag */ });
 			}
 		}
+
+		// ROUND 162 (progress wall): keep a two-map non-blocked history for the
+		// kick-back target. The teleport gate cancels blocked maps at INTENT, so
+		// a blocked map REACHING loadLevel means a bypass (direct loadLevel,
+		// save-spawn) — self-heal by kicking back out (deferred + re-checked
+		// inside). data.name is the raw JSON id (SLASH form) — normalize to the
+		// dotted form every other surface (ig.game.mapName, teleport args) uses.
+		try {
+			const nm: string = (data && (data as any).name) || '';
+			const norm = nm.trim().toLowerCase().split('/').join('.');
+			if (connected && norm) {
+				if (this.main.isMapBlocked(norm)) this.main.kickFromBlockedMap(norm);
+				else if (norm !== this.main.lastSafeMap) {
+					this.main.prevSafeMap = this.main.lastSafeMap;
+					this.main.lastSafeMap = norm;
+				}
+			}
+		} catch (_) { /* never block a map load */ }
 	}
 
 	/**

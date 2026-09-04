@@ -338,10 +338,23 @@ export class NetSync {
 	private _mpProjDiagLog: { [k: string]: boolean } = Object.create(null);
 	private _mpProjDiagMap(): boolean {
 		try {
+			// ROUND 156: console override — `window.__mpProjDiag = true` enables the
+			// [mpproj] stream diagnostics on ANY map (the antlion/黄沙巨口 fight).
+			if ((window as any).__mpProjDiag) return true;
 			const m = ((ig.game as any) && (ig.game as any).mapName) || '';
 			return m === 'heat-dng/f1/midboss' || m === 'heat-dng.f1.midboss';
 		} catch (_) { return false; }
 	}
+	/** ROUND 156: once-per-key diag print helper (dedupes via _mpProjDiagLog). */
+	private _mpProjDiagOnce(key: string, msg: string): void {
+		try {
+			if (this._mpProjDiagLog[key]) return;
+			this._mpProjDiagLog[key] = true;
+			console.log(msg);
+		} catch (_) { /* ignore */ }
+	}
+	private _mpProjDiagLastSend = 0;
+	private _mpProjDiagLastApply = 0;
 	/** Round 62: stale-reap accumulator for visual projectile copies (member side). */
 	private _mpProjReapTimer = 0;
 	/** ROUND 132: accumulator for the LOCAL player's thrown-ball position stream
@@ -590,6 +603,10 @@ export class NetSync {
 	 * is true). Time-based: expires on its own, never reset explicitly. Set on local
 	 * soft revival (respawn) and on teleport (fireTeleport in onTeleport.ts). */
 	public _mpMirrorGraceUntil = 0;
+	/** Diag: rate-limit keys (10s per player+map) for the applyPlayerState
+	 *  roster-gate drop logs — the usual cause of "can't see X after following
+	 *  them into a map". */
+	private _mpGateDropLog: { [k: string]: number } = {};
 	// ---- round 22: network bandwidth optimization ----
 	/** Last time we actually EMITTED a playerState packet (Date.now()). Enforces the
 	 * option-driven send-rate floor (default 10Hz, hot-applied via getPlayerStateMs)
@@ -1542,7 +1559,7 @@ export class NetSync {
 						// TEMP DIAG (loop fx): marked=false means the host sheet was NOT loaded at spawn
 						// (cache sweep) — the member replays a looping copy the host never had, so no stop
 						// can ever be relayed; the member-side duration cap below is the backstop for it.
-						if (markUid > 0 && mpLoopSpawn) console.log('[mpfx] HOST loopspawn uid=' + markUid + ' ' + this.path + '/' + a + ' marked=' + !!h);
+						if (markUid > 0 && mpLoopSpawn && (window as any)._mpFxDiag) console.log('[mpfx] HOST loopspawn uid=' + markUid + ' ' + this.path + '/' + a + ' marked=' + !!h); // ROUND 160: flag-gated (was unconditional spam)
 						return h;
 					};
 					const origSpawnFixed = ES.prototype.spawnFixed;
@@ -1576,7 +1593,7 @@ export class NetSync {
 						if (markUid > 0 && h) {
 							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; } catch (_) { /* ignore */ }
 						}
-						if (markUid > 0 && mpLoopSpawn) console.log('[mpfx] HOST loopspawn uid=' + markUid + ' ' + this.path + '/' + a + ' marked=' + !!h);
+						if (markUid > 0 && mpLoopSpawn && (window as any)._mpFxDiag) console.log('[mpfx] HOST loopspawn uid=' + markUid + ' ' + this.path + '/' + a + ' marked=' + !!h); // ROUND 160: flag-gated (was unconditional spam)
 						return h;
 					};
 				}
@@ -1638,7 +1655,7 @@ export class NetSync {
 					EFF.prototype.stop = function (this: any) {
 						try {
 							const u = this._mpTelegraphUid;
-							if (u && this._mpTelegraphLoop && !this._mpTelegraphStopRelayed) console.log('[mpfx] HOST fxstop uid=' + u + ' ' + this._mpTelegraphSheet + '/' + this._mpTelegraphKey);
+							if (u && this._mpTelegraphLoop && !this._mpTelegraphStopRelayed && (window as any)._mpFxDiag) console.log('[mpfx] HOST fxstop uid=' + u + ' ' + this._mpTelegraphSheet + '/' + this._mpTelegraphKey); // ROUND 160: flag-gated
 							if (u && !this._mpTelegraphStopRelayed) {
 								this._mpTelegraphStopRelayed = true;
 								const m = (window as any).__mpMain;
@@ -1753,6 +1770,7 @@ export class NetSync {
 					};
 				}
 			} catch (e) { console.warn('[netsync] EnemyCounter wrap failed', e); }
+			this.installArenaBattleHeal();
 			try {
 				// 1.73.x (counter marble sync): when a host enemy dies next to an
 				// EnemyCounter, sc.combat spawns a CombatantMarble that flies into the
@@ -6202,7 +6220,6 @@ export class NetSync {
 	private stageBossDefeatCinematic(e: any): boolean {
 		try {
 			if (!e || e._killed || e._mpDying) return false;
-			if (e._mpBossCinematic) return true; // already staged — not a "no cinematic" case
 			const mk = (e as any).manualKill;
 			if (typeof mk !== 'string' || !mk) {
 				// ROUND 139 (diag): the scripted-defeat staging was skipped — the puppet
@@ -6211,25 +6228,48 @@ export class NetSync {
 				try { console.log('[mpBoss] no manualKill for puppet uid=' + (e._mpUid || 0) + ' type=' + (e.enemyName || '?') + ' name=' + (e.name || '') + ' mi=' + (e.mapId || 0)); } catch (_) { /* ignore */ }
 				return false;
 			}
-			e._mpBossCinematic = true;
-			e._mpBossCineAt = Date.now();
-			try { e.dying = (sc as any).DYING_STATE ? (sc as any).DYING_STATE.DYING : 2; } catch (_) { /* ignore */ }
-			try { e.defeatNotified = true; } catch (_) { /* ignore */ }
-			try {
-				if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
-				else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
-			} catch (_) { /* ignore */ }
-			// 1.75.x (boss HP bar during the defeat cinematic): on the host the big
-			// boss bar hides the moment the BossDies event starts (force-combat
-			// drops / aggression flips), but the member puppet keeps its streamed
-			// target lock, so both bars (BigHpBar + under-feet StatusBar) stayed
-			// visible until the closing MANUAL_COMBATANT_KILL removed the corpse.
-			// Pin hpBar visibility to HIDDEN — both bar gates check it FIRST, and no
-			// stream-apply path rewrites it (netSync never writes visibility.hpBar).
-			try {
-				const HB: any = (sc as any).ENEMY_HP_BAR;
-				if (e.visibility) e.visibility.hpBar = (HB && typeof HB.HIDDEN === 'number') ? HB.HIDDEN : 2;
-			} catch (_) { /* ignore */ }
+			if (e._mpBossCinematic) {
+				// 1.77.x: already pinned. A corpse pinned while the local player was
+				// soft-dead carries _mpBossDefeatDeferred and resumes HERE on revive
+				// (respawn re-calls us) — fall through to the var+trigger half and
+				// re-arm the watchdog window from NOW (the dead time must not count
+				// against the 20s watchdog once the cinematic is actually running).
+				if (e._mpBossDefeatDeferred !== mk) return true; // fully staged already
+				e._mpBossDefeatDeferred = null;
+				e._mpBossCineAt = Date.now();
+			} else {
+				e._mpBossCinematic = true;
+				e._mpBossCineAt = Date.now();
+				try { e.dying = (sc as any).DYING_STATE ? (sc as any).DYING_STATE.DYING : 2; } catch (_) { /* ignore */ }
+				try { e.defeatNotified = true; } catch (_) { /* ignore */ }
+				try {
+					if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
+					else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
+				} catch (_) { /* ignore */ }
+				// 1.75.x (boss HP bar during the defeat cinematic): on the host the big
+				// boss bar hides the moment the BossDies event starts (force-combat
+				// drops / aggression flips), but the member puppet keeps its streamed
+				// target lock, so both bars (BigHpBar + under-feet StatusBar) stayed
+				// visible until the closing MANUAL_COMBATANT_KILL removed the corpse.
+				// Pin hpBar visibility to HIDDEN — both bar gates check it FIRST, and no
+				// stream-apply path rewrites it (netSync never writes visibility.hpBar).
+				try {
+					const HB: any = (sc as any).ENEMY_HP_BAR;
+					if (e.visibility) e.visibility.hpBar = (HB && typeof HB.HIDDEN === 'number') ? HB.HIDDEN : 2;
+				} catch (_) { /* ignore */ }
+				// 1.77.x (dead-member deferral): NEVER start a blocking cutscene while
+				// the local player is soft-dead — it would fight the spectator camera,
+				// the death GUI and the revive countdown, and a revive landing mid-event
+				// corrupts both. Pin the 0-HP corpse instead (reap/beacon exempt via
+				// _mpBossCinematic; the streamed anim keeps flowing, so a spectating
+				// member still watches the boss's death live) and let respawn()
+				// complete the var+trigger half.
+				if (this._mpDead) {
+					e._mpBossDefeatDeferred = mk;
+					console.log('[netsync] boss defeat pinned; cinematic deferred until revive via ' + mk);
+					return true;
+				}
+			}
 			try { ig.vars.set(mk, true); } catch (_) { /* ignore */ }
 			// The member's own BossDies-style EventTrigger can never carry the event
 			// through on its own: with story sync active, Cutscene.startEvent suppresses
@@ -6237,13 +6277,27 @@ export class NetSync {
 			// swallows the trigger's native update. Start the defeat cutscene DIRECTLY,
 			// under the same allow-token the blocker path uses, so the cinematic
 			// (diePre / dieExplosion / white overlay / slow-mo) really plays here.
-			const cineStarted = this.startBossDefeatTriggerLocally(mk);
+			const cine = this.startBossDefeatTriggerLocally(mk);
+			// 1.77.x: NO local trigger started (missing trigger / a gate refused) —
+			// the scripted cinematic will never play on this client. Undo the
+			// cinematic pinning and report FAILURE so the caller falls back to the
+			// generic stream death: a timely flinch+boom beats a 0-HP boss frozen
+			// until the host's loot beacon (the "member death anim starts when the
+			// drops appear" desync) or the 20s watchdog.
+			if (cine.state === 'none') {
+				console.warn('[netsync] boss defeat cinematic found no startable trigger for ' + mk + ' — generic death fallback');
+				try { e._mpBossCinematic = false; } catch (_) { /* ignore */ }
+				try { delete e._mpBossCineAt; } catch (_) { /* ignore */ }
+				return false;
+			}
 			// 1.76.x (boss cinematic timing): _mpBossCineStarted gates the block-apply
 			// anim-replay suppression (see applyEntityState) — only when the cutscene is
 			// REALLY driving the puppet. Without a started trigger the suppression would
 			// freeze the puppet outright (no anim at all) until the 20s watchdog.
-			e._mpBossCineStarted = cineStarted ? true : undefined;
-			if (cineStarted) {
+			// 1.77.x: a QUEUED call (blocked behind a running blocking event) is NOT
+			// driving the puppet yet — keep streamed anims flowing until it starts.
+			e._mpBossCineStarted = (cine.state === 'started') ? true : undefined;
+			if (cine.state === 'started') {
 				// 1.76.x: UNLOCK the puppet's anim/face/state so the cutscene drives it
 				// NATIVELY — its SET_ANIM / DO_ACTION steps write currentAnim/plain values,
 				// which the puppet's property lock silently discards. The host boss is
@@ -6251,8 +6305,37 @@ export class NetSync {
 				try {
 					if (this.main && typeof (this.main as any).unlockEntity === 'function') (this.main as any).unlockEntity(e);
 				} catch (_) { /* the cinematic plays on regardless */ }
+				// 1.77.x (instant-end guard): a locally-started defeat cutscene that
+				// DIES within ~2s never reached its visual steps (a throwing step hit
+				// the crash shield, or an external enterGame raced the start) — the
+				// member then sees nothing until the host's loot beacon. Unpin the
+				// boss and hand it to the generic stream death instead, so the member
+				// still gets a timely death ~2s after the kill. A legit completion
+				// (MANUAL_COMBATANT_KILL kills the puppet) fails the _killed guard.
+				try {
+					const call: any = cine.call;
+					if (call && typeof call.onEnd === 'function') {
+						const startAt = Date.now();
+						const prevEnd = call.onEnd;
+						const self = this;
+						call.onEnd = function (this: any, ec: any) {
+							const ms = Date.now() - startAt;
+							try {
+								if (ms < 2000 && !e._killed && !e._mpDying) {
+									console.warn('[mpBoss] defeat cutscene ended after only ' + ms + 'ms (before its visual steps) — generic death fallback');
+									e._mpBossCinematic = false;
+									e._mpBossCineStarted = undefined;
+									self.stageBossStreamDeath(e);
+								} else {
+									console.log('[mpBoss] defeat cutscene ended after ' + ms + 'ms (killed=' + !!e._killed + ')');
+								}
+							} catch (_) { /* ignore */ }
+							return prevEnd.call(this, ec);
+						};
+					}
+				} catch (_) { /* diagnostics must never break staging */ }
 			}
-			console.log('[netsync] boss defeat cinematic staged via ' + mk + (cineStarted ? ' (cutscene started)' : ' (no local trigger)'));
+			console.log('[netsync] boss defeat cinematic staged via ' + mk + (cine.state === 'started' ? ' (cutscene started)' : ' (cutscene queued behind a blocking event)'));
 			return true;
 		} catch (_) { return false; }
 	}
@@ -6265,11 +6348,11 @@ export class NetSync {
 	 * native update can't double-start it later. No-op when no matching trigger
 	 * exists on this client (the 20s watchdog in processDeathQueue still cleans
 	 * the puppet up). */
-	private startBossDefeatTriggerLocally(mk: string): boolean {
+	private startBossDefeatTriggerLocally(mk: string): { state: 'started' | 'queued' | 'none', call?: any } {
 		try {
 			const ET: any = (ig.ENTITY as any).EventTrigger;
 			const g: any = ig.game;
-			if (!ET || !g || !g.entities) return;
+			if (!ET || !g || !g.entities) return { state: 'none' };
 			const EVT: any = (ig as any).EVENT_TYPE || {};
 			for (let i = 0; i < g.entities.length; i++) {
 				const trig: any = g.entities[i];
@@ -6282,16 +6365,29 @@ export class NetSync {
 				const raw = trig._mpStorySettings || trig._mpCsSettings || null;
 				const cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
 				if (!cond || cond.indexOf(mk) === -1) continue;
-				if (trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning()) continue;
-				if (trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) continue;
+				// 1.77.x diagnostics: the candidate trigger matched the var — log the
+				// exact gate that refuses it (previously silent continues, which made
+				// the "member sees no defeat cinematic" report undebuggable).
+				const tname = trig.name || ('mapId:' + trig.mapId);
+				if (trig.eventCall && typeof trig.eventCall.isRunning === 'function' && trig.eventCall.isRunning()) {
+					console.log('[mpBoss] defeat trigger ' + tname + ' already running — reuse');
+					return { state: 'started', call: trig.eventCall };
+				}
+				if (trig.triggerVar && (ig.vars as any).get(trig.triggerVar)) {
+					console.log('[mpBoss] defeat trigger ' + tname + ' refused: triggerVar already set'); continue;
+				}
 				if (trig.startCondition && typeof trig.startCondition.evaluate === 'function'
-					&& !trig.startCondition.evaluate()) continue;
-				if (trig.endCondition && typeof trig.endCondition.evaluate === 'function' && trig.endCondition.evaluate()) continue;
+					&& !trig.startCondition.evaluate()) {
+					console.log('[mpBoss] defeat trigger ' + tname + ' refused: startCondition false (' + cond + ')'); continue;
+				}
+				if (trig.endCondition && typeof trig.endCondition.evaluate === 'function' && trig.endCondition.evaluate()) {
+					console.log('[mpBoss] defeat trigger ' + tname + ' refused: endCondition true'); continue;
+				}
 				let ev: any = trig.event || null;
 				if (!ev && raw && raw.event) {
 					try { ev = new (ig as any).Event({ name: trig.name || undefined, steps: raw.event }); } catch (_) { ev = null; }
 				}
-				if (!ev) continue;
+				if (!ev) { console.log('[mpBoss] defeat trigger ' + tname + ' refused: no event steps'); continue; }
 				try { ev._mpBlockerEvent = true; } catch (_) { /* ignore */ }
 				const prev = (window as any).__mpStoryRun;
 				(window as any).__mpStoryRun = { allow: true };
@@ -6302,17 +6398,24 @@ export class NetSync {
 					if (prev === undefined) delete (window as any).__mpStoryRun;
 					else (window as any).__mpStoryRun = prev;
 				}
-				if (!call) continue;
+				if (!call) { console.log('[mpBoss] defeat trigger ' + tname + ' refused: startEvent returned null'); continue; }
 				trig.eventCall = call;
 				if (trig.triggerVar) {
 					try { (ig.vars as any).set(trig.triggerVar, true); } catch (_) { /* ignore */ }
 				}
+				// callEvent QUEUES a BLOCKING cutscene behind a running blocking event
+				// (call.blocked) instead of starting it — the puppet is not being
+				// driven yet, so the caller must keep streamed anims flowing.
+				if (call.blocked) {
+					console.log('[netsync] boss defeat cutscene QUEUED behind a blocking event via trigger ' + (trig.name || mk));
+					return { state: 'queued', call };
+				}
 				console.log('[netsync] boss defeat cutscene started locally via trigger ' + (trig.name || mk));
-				return true;
+				return { state: 'started', call };
 			}
 			console.log('[netsync] no EventTrigger found for manualKill var ' + mk + ' — cinematic relies on native trigger');
 		} catch (_) { /* ignore */ }
-		return false;
+		return { state: 'none' };
 	}
 
 	/** 1.74.x: a boss-flagged puppet whose HOST-streamed HP reached 0, with NO
@@ -6326,7 +6429,13 @@ export class NetSync {
 		try {
 			if (!e || e._killed || e._mpDying || e._mpBossCinematic) return;
 			const et: any = e.enemyType;
-			if (!et || !et.boss) return; // regular enemies keep the reap-path timing
+			// 1.77.x: also accept a manualKill enemy whose cinematic staging just
+			// reported "no startable trigger" (stageBossDefeatCinematic returned
+			// false) — some scripted-defeat bosses (e.g. minibosses.* entries) lack
+			// the enemyType.boss flag, and without this they froze at 0 HP until
+			// the host's loot beacon finally popped the corpse.
+			const hasMk = typeof (e as any).manualKill === 'string' && (e as any).manualKill;
+			if ((!et || !et.boss) && !hasMk) return; // regular enemies keep the reap-path timing
 			const uid = e._mpUid || 0;
 			if (uid) {
 				this.noteMemberKill(uid);
@@ -9173,8 +9282,9 @@ export class NetSync {
 		console.log('[netsync] SHOW_EXTERN_ANIM relay hook installed');
 	}
 
-	/** 1.75.x (per-player quest encounters, e.g. 深度呵护): wraps Enemy.show so the
-	 * member notices the exact frame a tmp.quest_* map enemy becomes visible. Such
+	/** 1.75.x (per-player quest encounters, e.g. 深度呵护; 1.77.x generalized to
+	 * any pure tmp.* spawnCondition, e.g. 新矿井#1's tmp.bugsSpawn-*): wraps
+	 * Enemy.show so the member notices the exact frame a tmp.* map enemy becomes visible. Such
 	 * enemies are per-player quest waves — the host's own copy is hidden unless the
 	 * HOST also runs that encounter, so any prior host adoption must be released and
 	 * the enemy must become owner-local (AI restored, streamed via cutsceneEntity). */
@@ -11434,7 +11544,7 @@ export class NetSync {
 							// forever. 8s is far beyond every real windup/charge telegraph in the game
 							// (~1-4s), so a legit loop is never cut; an orphaned one self-heals.
 							try { if (typeof handle.duration === 'number' && handle.duration < 0) handle.duration = 8; } catch (_) { /* ignore */ }
-							console.log('[mpfx] MEMBER loopspawn uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' list=' + list.length);
+							if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER loopspawn uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' list=' + list.length); // ROUND 160: flag-gated
 						}
 						list.push({ sheet: fx.sheet, key: fx.key, handle, loop: isLoop });
 						if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER tracked uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' list=' + list.length);
@@ -11469,7 +11579,7 @@ export class NetSync {
 				}
 				if (!list.length) delete this._enemyTelegraphFx[uid];
 			}
-			if (matchedLoop || (!matched && (window as any)._mpFxStopDiag)) console.log('[mpfx] MEMBER fxstop uid=' + uid + ' ' + sheet + '/' + key + ' matched=' + matched);
+			if ((matchedLoop && (window as any)._mpFxDiag) || (!matched && (window as any)._mpFxStopDiag)) console.log('[mpfx] MEMBER fxstop uid=' + uid + ' ' + sheet + '/' + key + ' matched=' + matched); // ROUND 160: matched case flag-gated
 			if (!matched && sheet && key) {
 				const now = Date.now();
 				const stops = this._enemyFxPendingStop;
@@ -12675,10 +12785,13 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * would call the nonexistent Enemy.quickFall. The vanilla callback is
 	 * hook-disabled for _mpMirror entities (installPuzzleFxHooks) and this pass
 	 * replicates the visuals from the streamed position:
-	 *   - standing check: QUICKSAND map terrain at the coll center on the level
-	 *     derived from the streamed z, with |z - levelHeight| <= 1 (lerp-safe
-	 *     stand-in for the vanilla z == baseZPos), plus the vanilla side-conditions
-	 *     (LOOSE groundConnect, terrain friction not ignored, not mid-death FX);
+	 *   - standing check: vanilla getPointTerrain equivalent at the coll center —
+	 *     the terrain-bearing ENTITY with the highest top at/below the streamed z
+	 *     (every quicksand floor in the game is an ObjectLayerView; no map ships
+	 *     tile quicksand), falling back to tile-map terrain, then |z - groundTop|
+	 *     <= 1.5 (lerp-safe stand-in for the vanilla z == baseZPos), plus the
+	 *     vanilla side-conditions (LOOSE groundConnect, terrain friction not
+	 *     ignored, not mid-death FX);
 	 *   - while standing: an ig.InfluenceEntry on the mirror whose groundSinkZ
 	 *     grows size.z * min(1, timer/2) — the engine's own sink rendering
 	 *     (updateSprites -> influencer.onPostSpriteUpdate) applies it — plus the
@@ -12715,12 +12828,38 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						// stale on mirrors (network writes bypass setZ).
 						const level: number = (ig.game as any).getLevelIdx(z);
 						if (level >= 0) {
-							const groundZ: number = (ig.game as any).getLevelHeight(level);
-							if (Math.abs(z - groundZ) <= 1) {
-								const cx: number = cpm.x + coll.size.x / 2;
-								const cy: number = cpm.y + coll.size.y / 2;
-								onSand = terrainApi.getMapTerrain(cx, cy, level, 0, 0) === TERR.QUICKSAND;
+							const levelZ: number = (ig.game as any).getLevelHeight(level);
+							const cx: number = cpm.x + coll.size.x / 2;
+							const cy: number = cpm.y + coll.size.y / 2;
+							// Every quicksand floor in the game (midboss arena, Faj'ro temple boss,
+							// arena challenges) is an ObjectLayerView whose terrain lives on the
+							// ENTITY — vanilla reads _collData.groundEntry.entity.terrain, which a
+							// locked mirror never has — and NO map ships tile quicksand, so a pure
+							// getMapTerrain lookup can never see it (the mirror sink never fired).
+							// Do vanilla's getPointTerrain instead: the highest terrain-entity top
+							// still at/below our z is the ground we stand on.
+							let groundZ: number = levelZ;
+							let terrain: number = 0;
+							try {
+								const found: any[] = (ig.game as any).getEntitiesInRectangle(cx - 2, cy - 2, z - 2, 4, 4, 4) || [];
+								for (let fi = 0; fi < found.length; fi++) {
+									const fe: any = found[fi];
+									if (!fe || fe._killed || !fe.coll || !fe.terrain) continue;
+									const top: number = fe.coll.pos.z + fe.coll.size.z;
+									if (top <= z + 1.5 && top >= z - 3 && top > groundZ - 0.01) {
+										terrain = fe.terrain;
+										groundZ = top;
+									}
+								}
+							} catch (_) { /* fall through to the tile lookup */ }
+							if (!terrain) {
+								terrain = terrainApi.getMapTerrain(cx, cy, level, 0, 0);
+								groundZ = levelZ;
 							}
+							// Stand-in for vanilla's z == baseZPos (never exactly true for a lerped
+							// mirror): the streamed z must sit on the ground just found. Object-layer
+							// tops differ from the level height, so gate on groundZ, not levelZ.
+							onSand = terrain === TERR.QUICKSAND && Math.abs(z - groundZ) <= 1.5;
 						}
 					}
 				} catch (_) { onSand = false; }
@@ -15457,6 +15596,17 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				}
 			}
 			if (!list.length) return;
+			// ROUND 156 diag (antlion rocks/claws): confirm the block actually leaves the
+			// host (1/s throttle — the stream runs at blockInterval).
+			if (this._mpProjDiagMap()) {
+				const nowS = Date.now();
+				if (nowS - this._mpProjDiagLastSend > 1000) {
+					this._mpProjDiagLastSend = nowS;
+					let g = 0;
+					for (const it of list) { if (it.k === 'G') g++; }
+					console.log('[mpproj] host SEND n=' + list.length + ' G=' + g + ' map=' + this.mapName);
+				}
+			}
 			conn.updateProjectileState(this.mapName, list);
 		} catch (_) { /* never break the frame */ }
 	}
@@ -15469,6 +15619,20 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 */
 	private applyProjectileState(map: string, list: any[]): void {
 		try {
+			// ROUND 156 diag (antlion rocks/claws): confirm the stream REACHES this
+			// client and which gate would drop it (1/s throttle). Runs before the
+			// host/map guards on purpose — a silent early-return is the suspect.
+			if (this._mpProjDiagMap()) {
+				const nowA = Date.now();
+				if (nowA - this._mpProjDiagLastApply > 1000) {
+					this._mpProjDiagLastApply = nowA;
+					let g = 0;
+					if (Array.isArray(list)) { for (const s of list) { if (s && s.k === 'G') g++; } }
+					console.log('[mpproj] member APPLY map=' + map + ' mine=' + this.mapName
+						+ ' n=' + (Array.isArray(list) ? list.length : -1) + ' G=' + g
+						+ ' host=' + this.main.host + ' mapMatch=' + (map === this.mapName));
+				}
+			}
 			if (this.main.host) return;                        // host renders its own real projectiles
 			if (!map || map !== this.mapName) return;          // stream for a map we left
 			if (!Array.isArray(list)) return;
@@ -15645,11 +15809,23 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	private spawnGenericProxyPuppet(s: any): any {
 		try {
 			const puppet = this.puppets[s.src];
-			if (!puppet || puppet._killed || !puppet.proxies) return null;
+			// ROUND 156 diag: each silent early-return names its reason (once per uid).
+			if (!puppet || puppet._killed || !puppet.proxies) {
+				if (this._mpProjDiagMap()) this._mpProjDiagOnce('gf' + s.i, '[mpproj] member G-spawn FAIL uid=' + s.i + ' pn=' + s.pn + ' src=' + s.src
+					+ ' puppet=' + !!puppet + (puppet ? ' killed=' + !!puppet._killed + ' proxies=' + !!puppet.proxies : ''));
+				return null;
+			}
 			const proxy = (sc as any).ProxyTools.getProxy(s.pn, puppet);
-			if (!proxy || !proxy.data || typeof proxy.spawn !== 'function') return null;
+			if (!proxy || !proxy.data || typeof proxy.spawn !== 'function') {
+				if (this._mpProjDiagMap()) this._mpProjDiagOnce('gp' + s.i, '[mpproj] member G-spawn FAIL uid=' + s.i + ' pn=' + s.pn
+					+ ' proxyMissing — puppet proxies: ' + Object.keys(puppet.proxies || {}).join(','));
+				return null;
+			}
 			const e = proxy.spawn(s.x, s.y, s.z, puppet, { x: s.vx || 0, y: s.vy || 0 });
-			if (!e) return null;
+			if (!e) {
+				if (this._mpProjDiagMap()) this._mpProjDiagOnce('gn' + s.i, '[mpproj] member G-spawn FAIL uid=' + s.i + ' pn=' + s.pn + ' spawn returned null');
+				return null;
+			}
 			// Neutralize (same contract as spawnProjectilePuppet): party OTHER + coll IGNORE +
 			// no attack/hit proxy, so even a retained native step can never hit the local player.
 			e.party = (sc as any).COMBATANT_PARTY.OTHER;
@@ -15662,6 +15838,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			try { e.onProjectileHit = function () { return false; }; } catch (_) { /* ignore */ }
 			e.combatant = puppet;
 			e.target = null;
+			// ROUND 158 (antlion homing fire-rock): TACKLE steps stay in the visual
+			// clone now so homing proxies replay their motion natively — neutralize
+			// the HIT half here. setTackle is where the step installs the live
+			// AttackInfo and runs the one-time rectangle scan (ROUND 133's icicle
+			// concern); a noop keeps tackle.attackInfo null and hitCount 0 (so
+			// cancelOnHit / hit-branches take the miss path) while the step's
+			// accelDir drive still moves the copy exactly like on the host. coll
+			// IGNORE + null attackInfo + the member damage gate make hits impossible
+			// regardless.
+			try { e.setTackle = function () { /* visual copy: tackle is motion-only */ }; } catch (_) { /* ignore */ }
 			// 1.76.x (lobbed-rock homing fix — Ti'im / drillertoise thrown rocks):
 			// proxies whose action homes via JUMP_TARGET_MOVEMENT used to keep that
 			// step in the visual action but got e.target=null — the step's
@@ -15675,11 +15861,19 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// stripped) still cannot hurt anyone. Unresolvable -> stays inert.
 			try {
 				const JTM: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.JUMP_TARGET_MOVEMENT;
+				// ROUND 157 (antlion claw): FACE_TO_TARGET steps need a real target too —
+				// the Arm's action one-shot-faces its target before the rise, the lunge and
+				// the swing; with target=null those steps were no-ops and the claw swept a
+				// fixed default direction instead of the hunted player.
+				const FACE: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.FACE_TO_TARGET;
+				// ROUND 158: TACKLE steps need the target too — rotateSpeed homing reads
+				// it, and the step instant-ends when a non-player combatant has none.
+				const TCK: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.TACKLE;
 				const action0: any = proxy.data && proxy.data.action;
-				if (JTM && action0 && action0.rootStep) {
+				if ((JTM || FACE || TCK) && action0 && action0.rootStep) {
 					let homes = false;
 					for (let st = action0.rootStep; st; st = st._nextStep) {
-						if (st instanceof JTM) { homes = true; break; }
+						if ((JTM && st instanceof JTM) || (FACE && st instanceof FACE) || (TCK && st instanceof TCK)) { homes = true; break; }
 					}
 					if (homes) {
 						const tn: string = (puppet as any)._mpTargetName || '';
@@ -15687,7 +15881,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						if (tn) {
 							if (tn === (this.main as any).name) tgt = (ig.game as any).playerEntity;
 							else {
-								const pl: any = (this.main as any).players && (this.main as any).players[tn];
+								// ROUND 159 (antlion rocks lobbed straight up onto the boss): the
+								// host's OWN player is streamed as the '__host__' sentinel
+								// (encodeEnemy), and players['__host__'] never exists — every
+								// proxy aimed at the host resolved to null, so
+								// JUMP_TARGET_MOVEMENT skipped ALL horizontal motion and the copy
+								// lobbed straight up and fell back onto the boss whenever the
+								// member wasn't the target. Resolve the sentinel through the
+								// tracked host name (instanceHost) to the host's local mirror.
+								const key: string = (tn === '__host__') ? (((this.main as any).instanceHost as string) || '') : tn;
+								const pl: any = key && (this.main as any).players && (this.main as any).players[key];
 								tgt = pl && pl.entity;
 							}
 						}
@@ -15709,7 +15912,11 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// rock's crosshair + gravity fall + landing debris intact (no RUMBLE/CIRCLE_ATTACK)
 			// and replays the Digmo's icicles with their real icicle visual (no TACKLE/SHOOT_PROXY).
 			const HOST_ONLY_NAMES = [
-				'TACKLE', 'CIRCLE_ATTACK', 'DIRECT_HIT', 'CIRCLE_HIT',
+				// ROUND 158 (antlion homing fire-rock): TACKLE is no longer dropped —
+				// the copy replays its MOTION natively (the phase-2 fire rock's ground
+				// roll at the player, mines, bold charges). The hit half is neutralized
+				// by the e.setTackle noop below, not by dropping the step.
+				'CIRCLE_ATTACK', 'DIRECT_HIT', 'CIRCLE_HIT',
 				'RUMBLE_SCREEN', 'SHOOT_PROXY', 'SHOOT_PROXY_RANGE',
 				'MOVE_TO_DISTANCE', 'MOVE_TO', 'MOVE_TO_POINT', 'MOVE_TO_ENTITY', 'MOVE_FORWARD',
 				'NAVIGATE_ESCAPE_TARGET', 'NAVIGATE_TO_TARGET',
@@ -15728,6 +15935,14 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				}
 				return false;
 			};
+			// ROUND 157 (antlion ArmSpawner): conditional step classes whose branches
+			// need sanitizing when cloned below (engine IF, COMBAT_IF and — ROUND 158 —
+			// TACKLE's hit/missed branches share the branches/getBranchNames shape).
+			const COND_CLASSES: any[] = [];
+			for (const n of ['IF', 'COMBAT_IF', 'TACKLE']) {
+				const cc = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP[n];
+				if (cc) COND_CLASSES.push(cc);
+			}
 			try {
 				const action = proxy.data && proxy.data.action;
 				if (action && action.rootStep) {
@@ -15737,6 +15952,41 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						if (!isHostOnly(cur)) {
 							const clone = Object.assign(Object.create(Object.getPrototypeOf(cur)), cur);
 							clone._nextStep = null;
+							// ROUND 157 (antlion ArmSpawner): an IF/COMBAT_IF clone shares the
+							// ORIGINAL branches object, and branch steps are ORIGINAL instances
+							// — the clone filter only walks the MAIN chain, so a host-only step
+							// inside a branch (the ArmSpawner's nested SHOOT_PROXY_RANGE that
+							// spawns the Arms) would run LOCALLY and spawn desynced live proxies
+							// at member-random spots, on top of the streamed host copies. Give
+							// the clone a FRESH branches object (never mutate the shared one —
+							// that would corrupt the member's proxy data for every later clone)
+							// and null any branch whose body holds a host-only step, so the IF
+							// falls through to the cloned continuation. Visual-only branches
+							// keep their exact old shallow-clone behavior. Branch bodies end
+							// at the join step (the original step after the IF).
+							for (let ci = 0; ci < COND_CLASSES.length; ci++) {
+								if (!(cur instanceof COND_CLASSES[ci]) || !clone.branches) continue;
+								const join = cur._nextStep;
+								const bnames = (typeof cur.getBranchNames === 'function' ? cur.getBranchNames() : null) || Object.keys(clone.branches || {});
+								const nb: any = {};
+								for (const bn of bnames) {
+									const head = clone.branches[bn];
+									let bad = false;
+									let guard = 0;
+									for (let bs = head; bs && bs !== join; bs = bs._nextStep) {
+										if (isHostOnly(bs)) { bad = true; break; }
+										if (++guard > 200) break; // pathological linkage — keep branch as-is
+									}
+									nb[bn] = bad ? null : head;
+									if (bad) {
+										try {
+											if (this._mpProjDiagMap()) this._mpProjDiagOnce('ifb' + s.i + bn,
+												'[mpproj] member G-clone IF-branch dropped uid=' + s.i + ' pn=' + s.pn + ' branch=' + bn);
+										} catch (_) { /* ignore */ }
+									}
+								}
+								clone.branches = nb;
+							}
 							kept.push(clone);
 						}
 						cur = cur._nextStep;
@@ -15764,15 +16014,54 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// movement steps are stripped, so let the stream drive them like a
 			// projectile (lockEntity + dead-reckon in applyProjectileState).
 			// Animated generic proxies (falling rock, icicle) keep native motion.
+			// ROUND 157: the antlion's Arm also lands here — it carries faceAnims
+			// instead of an `animation` field, and its only native motion step
+			// (MOVE_TO_DISTANCE) is stripped, so stream-driven position is right.
 			if (proxy.data && !proxy.data.animation) {
 				e._mpProxyLerp = true;
 				e._mpSnapNext = true;
 				this.main.lockEntity(e, { x: s.x, y: s.y, z: s.z });
+				// ROUND 157 (antlion claw never swings on members): lockEntity's purpose
+				// here is the POS lock only — but it ALSO property-locks currentAnim and
+				// face, so the cloned action's SHOW_ANIMATION writes (setCurrentAnim ->
+				// currentAnim = name) were silently dropped and updateAnim() kept
+				// re-reading the stale value every frame: the copy froze at the
+				// initAnimations auto-pick ("show"'s last frame) while its SHOW_EFFECT
+				// dust (separate, unlocked entities) kept playing — the member saw a
+				// static claw + dust. Unlock anim/face (KEEP the pos lock — the stream
+				// still drives position) so the cloned action's SHOW_ANIMATION and
+				// FACE_TO_TARGET steps write natively. No protected-wrapper write ever
+				// targets a this.projectiles entry, so plain writability is safe here.
+				try {
+					if (e._mpAnimLock) {
+						const ca = e.currentAnim;
+						Object.defineProperty(e, 'currentAnim', { value: ca, writable: true, configurable: true });
+						e._mpAnimLock = false;
+					}
+				} catch (_) { /* ignore */ }
+				try {
+					if (e._mpFaceLock) {
+						const cf: any = e.face;
+						Object.defineProperty(e, 'face', {
+							value: { x: (cf && typeof cf.x === 'number') ? cf.x : 0, y: (cf && typeof cf.y === 'number') ? cf.y : 0 },
+							writable: true, configurable: true,
+						});
+						e._mpFaceLock = false;
+					}
+				} catch (_) { /* ignore */ }
 			}
 			e._mpProj = true;
 			e._mpRockNative = true;
 			return e;
-		} catch (_) { return null; }
+		} catch (err) {
+			// ROUND 156 diag: a swallowed exception here was the prime suspect for the
+			// antlion's invisible rocks/claws — print it (once per uid) when diag is on.
+			try {
+				if (this._mpProjDiagMap()) this._mpProjDiagOnce('gx' + (s && s.i), '[mpproj] member G-spawn EXC uid=' + (s && s.i) + ' pn=' + (s && s.pn)
+					+ ' err=' + ((err && (err as any).message) || err));
+			} catch (_) { /* ignore */ }
+			return null;
+		}
 	}
 
 	/**
@@ -17698,6 +17987,11 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	/** entity id -> first off-screen sighting (ms) for frozen NPC runners. */
 	private _runnerOffSince: Map<number, number> = new Map();
 
+	/** ROUND 155: arena battle-completion self-heal — once-guard + the first
+	 * tick the cleared-room state was observed (0 = not observing). */
+	private _arenaHealInstalled = false;
+	private arenaClearSince = 0;
+
 	/** 1.73.x (long-session fps decay): ambient NPC runners spawn from off-map
 	 * edge doors (rookie-harbor.center west teleport puts them at x~-190..-320).
 	 * The engine only updates entities inside the physics activation range, so
@@ -17734,6 +18028,74 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				}
 			}
 		} catch (_) { /* ambience cleanup must never break the frame */ }
+	}
+
+	/** ROUND 155 (arena battle completion self-heal, member side). The sealed-
+	 * arena chain is driven by PER-CLIENT map vars: TouchTrigger sets
+	 * map.battleStart, the round1 cutscene seals the room (map.barrierUp),
+	 * the local EnemyCounter turns kills into map.killCount/preDone and its
+	 * marble into map.postDone, and battleEnd's inline sheet then blocks on
+	 * WAIT_UNTIL_TRUE map.postDone before it can set map.battleDone and drop
+	 * the barrier. On a MEMBER the puppets raise no native DEFEATED events,
+	 * so everything rides on the host's 1.73.x counter-done broadcast — one
+	 * lost packet (member mid door-transition, reconnect, host migration)
+	 * seals the member in the arena forever, and when battleEnd had already
+	 * started it wedges ON the sheet wait with the letterbox on
+	 * ("锁在怪物场地里卡死在剧情中"). When the battle is provably over
+	 * locally — battleStart set, battleDone unset, an unfinished EnemyCounter
+	 * present, and NO living enemy for 5 straight seconds — set pre/postDone
+	 * directly: a wedged battleEnd completes through its own sheet and a
+	 * never-fired battleEnd starts on its native trigger; the engine's own
+	 * steps then set battleDone + drop the barrier. On the host/solo the heal
+	 * only fires when the native counter is provably stalled (a vanilla
+	 * soft-lock), so it is a net win there too. */
+	private installArenaBattleHeal(): void {
+		if (this._arenaHealInstalled) return;
+		this._arenaHealInstalled = true;
+		setInterval(() => { try { this.checkArenaBattleHeal(); } catch (_) { /* never break the frame */ } }, 1000);
+	}
+
+	private checkArenaBattleHeal(): void {
+		const reset = () => { this.arenaClearSince = 0; };
+		try {
+			const m: any = this.main;
+			if (!m) { reset(); return; }
+			// (runs on the host too: the heal only fires when the native counter is
+			// provably stalled — all enemies dead for 5s with the marble count
+			// unfinished — which is a soft-lock in vanilla as well; a healthy battle
+			// never produces 5 enemy-less seconds, and the last marble's ~2s flight
+			// lands well inside the window)
+			const conn: any = m.connection;
+			if (!conn || !conn.isOpen || !conn.isOpen()) { reset(); return; }
+			const g: any = ig.game as any;
+			const vars: any = (ig as any).vars;
+			if (!g || !g.playerEntity || !vars || typeof vars.get !== 'function') { reset(); return; }
+			if (!vars.get('map.battleStart') || vars.get('map.battleDone')) { reset(); return; }
+			const mdl: any = (sc as any).model;
+			if (mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene()) { reset(); return; }
+			const ents: any[] = g.entities || [];
+			const EC: any = (ig.ENTITY as any) && (ig.ENTITY as any).EnemyCounter;
+			const EN: any = (ig.ENTITY as any) && (ig.ENTITY as any).Enemy;
+			if (!EC || !EN) { reset(); return; }
+			let counter: any = null;
+			let alive = 0;
+			for (const e of ents) {
+				if (!e || e._killed) continue;
+				if (!counter && e instanceof EC && !e.done) counter = e;
+				if (e instanceof EN && !e._hidden && (e.hp === undefined || e.hp > 0)) alive++;
+			}
+			if (!counter || alive > 0) { reset(); return; }
+			if (!this.arenaClearSince) { this.arenaClearSince = Date.now(); return; }
+			if (Date.now() - this.arenaClearSince < 5000) return;
+			this.arenaClearSince = 0;
+			const pre = String(counter.preVariable || '');
+			const post = String(counter.postVariable || '');
+			console.warn('[netsync] arena battle finished but counter stalled (group='
+				+ String(counter.enemyGroup || '') + ' pre=' + pre + ' post=' + post
+				+ ') — completing it locally');
+			try { if (pre && !vars.get(pre)) vars.set(pre, true); } catch (_) { /* ignore */ }
+			try { if (post && !vars.get(post)) vars.set(post, true); } catch (_) { /* ignore */ }
+		} catch (_) { /* ignore */ }
 	}
 
 	private leakAutoSample(): void {
@@ -18107,6 +18469,18 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		// coll already restored above). The per-frame pump rebuilds the own tag at the
 		// new spot next frame. Internally guarded — a wipe failure never breaks revival.
 		try { this.main.wipeTags(); } catch (_) { /* ignore */ }
+		// 1.77.x: complete boss-defeat stagings deferred while we were soft-dead
+		// (stageBossDefeatCinematic pinned the corpse and stashed the manualKill var
+		// in _mpBossDefeatDeferred). The re-entry skips the pin half and runs the
+		// var set + local defeat cutscene now that a blocking cutscene is safe.
+		try {
+			for (const uidStr in this.puppets) {
+				const be: any = this.puppets[uidStr];
+				if (be && be._mpBossDefeatDeferred && !be._killed && !be._mpDying) {
+					this.stageBossDefeatCinematic(be);
+				}
+			}
+		} catch (_) { /* ignore */ }
 		console.log('[multiplayer] respawned (soft revive)' + (mirror ? ' next to teammate' : (keepPos ? ' (teleport)' : ''))
 			+ ' at ' + Math.round(reviveFrac * 100) + '% HP' + (reviveBoss ? ' (boss fight)' : ''));
 	}
@@ -18217,6 +18591,14 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// would otherwise leave floating.
 					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
 					try { const ap = this.main.players[player]; if (ap) (ap as any)._mpAimLine = false; } catch (_) { /* ignore */ }
+					try {
+						const dk = 'pm:' + player + '@' + myMap;
+						const dn = Date.now();
+						if (dn - (this._mpGateDropLog[dk] || 0) >= 10000) {
+							this._mpGateDropLog[dk] = dn;
+							console.log('[netsync] playerState dropped: ' + player + ' pmap=' + pmap[player] + ' myMap=' + myMap + ' (off-map gate)');
+						}
+					} catch (_) { /* ignore */ }
 					return;
 				}
 				knownOnMap = true;
@@ -18234,6 +18616,14 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				if (ready || Object.keys(onMap).length > 0) {
 					try { this.main.dropRemoteTag(player); } catch (_) { /* ignore */ }
 					try { const ap = this.main.players[player]; if (ap) (ap as any)._mpAimLine = false; } catch (_) { /* ignore */ }
+					try {
+						const dk = 'ro:' + player + '@' + (((ig.game as any) || {}).mapName || '');
+						const dn = Date.now();
+						if (dn - (this._mpGateDropLog[dk] || 0) >= 10000) {
+							this._mpGateDropLog[dk] = dn;
+							console.log('[netsync] playerState dropped: ' + player + ' not in playersOnThisMap=[' + Object.keys(onMap).join(',') + '] pmap=' + (((this.main as any).playerMapByName || {})[player] || '?') + ' (roster gate)');
+						}
+					} catch (_) { /* ignore */ }
 					return;
 				}
 			}
@@ -19277,18 +19667,29 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* ignore */ }
 	}
 	/** 1.75.x (per-player quest encounters): true for a MEMBER-side map enemy whose
-	 * spawnCondition is a pure tmp.quest_* wave flag. Conditions that ALSO reference
-	 * quest.* (normal spawner/enemy state gated by quest progress) stay host-owned;
-	 * these positive-only tmp.quest conditions are the per-player wave spawns set by
-	 * the local quest cutscene (tmp.quest_foa2-wave1, tmp.questBall-wave1, ...). */
+	 * spawnCondition is a pure tmp.* wave flag. tmp.* vars are PER-CLIENT session
+	 * state — never synced, never saved — so a spawn gated purely on tmp.* can never
+	 * be host-authoritative: the host's stream reflects the HOST's tmp flags, not
+	 * ours. Such enemies must be owner-local (real AI, killable, streamed out via
+	 * cutsceneEntity): the local quest cutscene/interaction sets the flag (console
+	 * props, wave cutscenes) and the local EnemyCounter chain drives the per-player
+	 * quest forward. Examples: tmp.quest_foa2-wave1, tmp.questBall-wave1, and 1.77.x
+	 * — tmp.bugsSpawn-1/-3 (新矿井#1 miners-bombquest-1: without this the member's
+	 * hidden bug wave was reaped as stale puppets before the bomb console's
+	 * tmp.bugsSpawn-1 could ever show it).
+	 * A condition that ALSO references a persistent scope (map.*, quest.*, ...)
+	 * stays host-owned — that state IS shared via the host. */
 	private isLocalQuestWaveEnemy(e: any): boolean {
 		try {
 			if (this.main.host || !e || e._mpMirror) return false;
 			const sc = (e.settings && typeof e.settings.spawnCondition === 'string')
 				? e.settings.spawnCondition
 				: (typeof e.spawnCondition === 'string' ? e.spawnCondition : '');
-			if (!sc || !/tmp\.quest/i.test(sc)) return false;
-			if (/quest\./.test(sc)) return false; // quest-progress-gated entities stay host-owned
+			if (!sc || sc.indexOf('tmp.') === -1) return false;
+			// Strip every tmp.<name> token; any REMAINING scoped variable
+			// (map./quest./plot./...) means persistent host-owned gating.
+			const stripped = sc.replace(/tmp\.[A-Za-z0-9_-]+/g, '');
+			if (/[A-Za-z_][A-Za-z0-9_-]*\./.test(stripped)) return false;
 			return true;
 		} catch (_) { return false; }
 	}
@@ -19425,6 +19826,15 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	private reapStalePuppets(): void {
 		try {
 			if (this.main.host) return; // the host owns every real enemy; nothing to reap
+			// 1.77.x: while the local player is soft-dead, the death presentation
+			// (fade, death GUI, spectator camera glide) can hitch the frame loop past
+			// the 600ms uid-stale threshold and mass-reap every puppet mid-fight —
+			// observed live: a member who died to the antlion midboss lost the boss +
+			// add puppets (their pre_die fx relays dropped "no-puppet"), so the
+			// boss-defeat staging could only run AFTER the revive, and the member's
+			// death cinematic started exactly when the host's drops appeared. Blocks
+			// keep flowing and refreshing stamps while dead; reaping resumes on revive.
+			if (this._mpDead) return;
 			const now = Date.now();
 			// Round 24 (host-stall guard): no entityState block has arrived for >1200ms —
 			// the host stalled, lagged hard, or dropped the connection. Reaping on a hiccup
@@ -19444,6 +19854,13 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				// reaped on their own client every host block).
 				if (!(e instanceof Enemy) || e._mpMirror || e._killed || e._mpDying
 					|| (e as any)._mpCutsceneSpawned || (e as any)._mpBossCinematic) continue;
+				// 1.77.x: pure tmp.*-gated enemies are owner-local per-player quest
+				// waves (generalized isLocalQuestWaveEnemy) — the host's block can
+				// never carry them, and CRUCIALLY their copies sit HIDDEN (inert)
+				// until the local quest interaction flips the tmp flag; reaping them
+				// here (the unadopted-mapId branch below) killed 新矿井#1's bug wave
+				// while it was still hidden, so the bomb console spawned nothing.
+				if (this.isLocalQuestWaveEnemy(e)) continue;
 				const uid = e._mpUid || 0;
 				if (uid !== 0) {
 					// Adopted puppet: reap when its uid hasn't been seen in any host block

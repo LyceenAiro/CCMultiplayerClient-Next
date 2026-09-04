@@ -66,6 +66,13 @@ interface IIdentifyResult {
     /** Anti-dupe: the server's CONFIGURED lockout duration in hours (default 48,
      * 0 = restriction disabled). Used for message text; older servers omit it. */
     tradeLockHours?: number;
+    /** ROUND 162 (progress wall): server-configured blocked map IDs (lowercase
+     * dotted form). The teleport gate refuses these before any map load;
+     * omitted by older servers -> feature off. */
+    blockedMaps?: string[];
     /** 1.71.0: save-mirror metadata in mirror-rollback mode (newest first). */
     mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>;
+    /** 1.78.x: the account has NO password hash yet (legacy / brand new) — the
+     *  client forces a set-password dialog once the game is entered. */
+    passwordRequired?: boolean;
 }

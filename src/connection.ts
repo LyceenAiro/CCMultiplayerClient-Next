@@ -47,7 +47,12 @@ export interface IConnection {
      * badges guard with `conn.getNetQuality?.()`. */
     getNetQuality?(): INetQuality;
 
-    identify(username: string, mirrorMode?: boolean): Promise<IIdentifyResult>;
+    /** 1.78.x: "password" is sent on the handshake when the account has one
+     *  (the server rejects with an _mpAuthFailed-marked error otherwise). */
+    identify(username: string, mirrorMode?: boolean, password?: string): Promise<IIdentifyResult>;
+    /** 1.78.x: set/change the account password over the authed socket (the
+     *  forced set-password dialog for password-less accounts uses this). */
+    setPassword?(password: string): Promise<{ ok: boolean, msg?: string }>;
     /** Round 19: `isolated` is the PVP-duel isolation tri-state forwarded to the
      * server (true = pin routing to solo:<user>:<map>; false = clear; absent =
      * leave the override unchanged). The connector ALSO makes it sticky: an
@@ -525,8 +530,9 @@ export interface IConnection {
     /** Round 27 (item 5): the server rejected/dropped a save upload (rate-limited,
      * corrupt stream, or area-change storm suppression). The exit-to-title upload
      * dialog resolves FAILURE on this so the player exits instead of waiting for the
-     * full timeout. */
-    onSaveFailed?(callback: (slot: string, reason: string) => void): void;
+     * full timeout. 1.77.x: on a 'levelReset' rejection the payload also carries
+     * prevLevel (the stored save's player level) for the anomaly dialog. */
+    onSaveFailed?(callback: (slot: string, reason: string, prevLevel?: number) => void): void;
     /** Round 23: the server STREAMS the player's save as paced saveDownload parts
      * right after the handshake (it is no longer embedded in handshakeResponse).
      * The connector reassembles the parts and fires this callback ONCE — with the

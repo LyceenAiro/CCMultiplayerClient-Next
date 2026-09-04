@@ -45,6 +45,7 @@ import { installPuzzleSync, IPuzzleSync } from './sync/puzzleSync';
 import { installBubbleSync, IBubbleSync } from './sync/bubbleSync';
 import { installCutsceneRelay, ICutsceneRelay } from './sync/cutsceneRelay';
 import { installTempPartyBotSupport, ITempPartyBotSupport } from './sync/tempPartyBot';
+import { installCutsceneActorGuard, ICutsceneActorGuard } from './sync/cutsceneActorGuard';
 import { saveUploadQueue } from './sync/saveUploadQueue';
 import { showMpToast } from './ui/toasts';
 import { receiveChat, receiveChatError, chatPartyDisbanded, clearChat } from './ui/chatBox';
@@ -59,7 +60,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '2.3.0';
+export const MP_VERSION = '0.2.4';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -86,6 +87,24 @@ export class Multiplayer {
 	 *  DIFFERENT sub-map must not be mirrored; onPlayerChangeMap seeds this from the
 	 *  relayed `map` field and netSync's mirror gate reads it (via playersOnThisMap). */
 	public playerMapByName: { [name: string]: string } = {};
+	/** Players who entered while we were mid-map-change; spawned by
+	 *  OnPlayerChangeMapListener's loadingComplete flush/reconcile. MUST live on
+	 *  main, not on the listener: the loadingComplete inject is installed once per
+	 *  process (bound to the FIRST listener instance) while a NEW listener is
+	 *  created on every reconnect — a per-listener queue split-brains after any
+	 *  reconnect (enters queued on the new listener, the flush reading the old
+	 *  one's empty queue), the roster reconcile then rebuilt an EMPTY
+	 *  playerMapByName and every playerState from the followed host was gated
+	 *  out for the whole map ("follow quickly -> can't see the host entity"). */
+	public pendingSpawn: { [name: string]: { position: Vec3, map?: string } } = {};
+	/** Load-complete waiters (see OnPlayerChangeMapListener) — same persistence rule. */
+	public pendingLoadCbs: Array<() => void> = [];
+	/** Peer-audit admission tags (auditPartyPeerMirrors): names whose
+	 *  playerMapByName/playersOnThisMap entry was filled from the party-scoped
+	 *  memberMap (not the instance roster), so it can be revoked the moment their
+	 *  memberMap flips away. */
+	public _mpAuditPatched: { [name: string]: boolean } = {};
+	private _mpLastPeerAuditAt = 0;
 	/** Round 27 (item 2): the map each remote party MEMBER is currently on
 	 *  (username -> mapName). Seeded/updated by the per-second checkBotMaps publish
 	 *  (this client's OWN map via the cached memberMap, and every relayed packet for
@@ -310,10 +329,24 @@ export class Multiplayer {
 	 * (handshake tradeLockHours; default 48, 0 = restriction off). Message text
 	 * only — the enforcement itself is fully server-side. */
 	public tradeLockHours = 48;
+	/** ROUND 162 (progress wall): server-configured blocked map IDs, all
+	 * normalized to lowercase DOTTED form (config.js sanitizes; older servers
+	 * omit the field -> empty set -> feature off). */
+	public blockedMaps: Set<string> = new Set<string>();
+	/** ROUND 162: two-map non-blocked history (onMapEnter; normalized dotted
+	 * form) — kick-back targets when a player somehow ends up INSIDE a blocked
+	 * map (the engine's own previousMap is preferred; these are the fallback). */
+	public lastSafeMap = '';
+	public prevSafeMap = '';
+	/** ROUND 162: throttle for the denial toast (door triggers re-fire while the
+	 * player keeps standing in them). */
+	private _mpWallToastAt = 0;
 	public puzzleSync?: IPuzzleSync;
 public bubbleSync?: IBubbleSync;
 	public cutsceneRelay?: ICutsceneRelay;
 	public tempPartyBots?: ITempPartyBotSupport;
+	/** 1.77.x: missing/hidden cutscene actor materialization + unstuck button. */
+	public cutsceneActorGuard?: ICutsceneActorGuard;
 	/** netSync hook fired when this client is promoted to instance host (set in
 	 * initializeListeners; respawns puppet enemies as real AI-driven ones). */
 	public onPromotedToHost?: () => void;
@@ -337,6 +370,72 @@ public bubbleSync?: IBubbleSync;
 	public getAreaType(): number {
 		return currentAreaType();
 	}
+	/** ROUND 162 (progress wall): true when the given map ID is on the server's
+	 * blocked list. Normalizes both slash and dotted form, case-insensitive. */
+	public isMapBlocked(name: string): boolean {
+		try { return this.blockedMaps.has(String(name || '').trim().toLowerCase().split('/').join('.')); } catch (_) { return false; }
+	}
+
+	/** ROUND 162: (re)apply the server-sent blocked list at every login. Also
+	 * self-heals the "already inside" case: standing in a freshly blocked map
+	 * kicks back out (deferred inside kickFromBlockedMap). */
+	public applyBlockedMaps(list: any): void {
+		try {
+			this.blockedMaps.clear();
+			if (Array.isArray(list)) {
+				for (const raw of list) {
+					if (typeof raw !== 'string') continue;
+					const id = raw.trim().toLowerCase().split('/').join('.');
+					if (id && id.length <= 128 && id.indexOf('..') === -1) this.blockedMaps.add(id);
+				}
+			}
+			if (this.blockedMaps.size) console.log('[multiplayer] progress wall: ' + this.blockedMaps.size + ' blocked map(s): ' + Array.from(this.blockedMaps).join(', '));
+			if (this.lastSafeMap && this.isMapBlocked(this.lastSafeMap)) this.lastSafeMap = '';
+			if (this.prevSafeMap && this.isMapBlocked(this.prevSafeMap)) this.prevSafeMap = '';
+			const cur = (ig.game && (ig.game as any).mapName) || '';
+			if (cur && this.isMapBlocked(cur)) this.kickFromBlockedMap(cur);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 162: a blocked-map entry attempt — log + throttled denial toast. */
+	public onProgressWallBlock(map: string): void {
+		try {
+			console.log('[multiplayer] progress wall: blocked entry to ' + map);
+			const now = Date.now();
+			if (now - this._mpWallToastAt < 3000) return;
+			this._mpWallToastAt = now;
+			showMpToast({ title: t('mpWallBlocked') });
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 162: we somehow ENDED UP inside a blocked map (save-spawn before
+	 * login, a loadLevel path that bypassed the teleport gate, or the map was
+	 * blocked mid-session) — teleport back out. Target preference: the engine's
+	 * own previousMap, then the non-blocked history, then the mod's established
+	 * safe town. Deferred + re-checked: callers are in login/map-enter contexts
+	 * where an immediate re-teleport would race the in-flight load. */
+	public kickFromBlockedMap(map: string): void {
+		try {
+			console.warn('[multiplayer] progress wall: inside blocked map ' + map + '; kicking back');
+			setTimeout(() => {
+				try {
+					const g: any = ig.game;
+					const normOf = (v: any) => String(v || '').trim().toLowerCase().split('/').join('.');
+					const cur = normOf(g && g.mapName);
+					if (!cur || !this.isMapBlocked(cur)) return; // already left by other means
+					let target = '';
+					const prev = normOf(g && g.previousMap);
+					if (prev && prev !== cur && !this.isMapBlocked(prev)) target = prev;
+					else if (this.lastSafeMap && this.lastSafeMap !== cur && !this.isMapBlocked(this.lastSafeMap)) target = this.lastSafeMap;
+					else if (this.prevSafeMap && this.prevSafeMap !== cur && !this.isMapBlocked(this.prevSafeMap)) target = this.prevSafeMap;
+					else target = 'rhombus-sqr.central';
+					try { showMpToast({ title: t('mpWallKicked') }); } catch (_) { /* ignore */ }
+					g.teleport(target);
+				} catch (_) { /* ignore */ }
+			}, 1500);
+		} catch (_) { /* ignore */ }
+	}
+
 	public getAreaPathOfMap(mapName: string): string {
 		return areaPathOfMap(mapName);
 	}
@@ -386,7 +485,13 @@ public bubbleSync?: IBubbleSync;
 		const server = await showServerList(this.config);
 		this.connection = this.config.getConnectionFor(this, server);
 
-		const username = await this.showLogin();
+		// 1.78.x: the password-reset flow runs over plain HTTP (the login panel
+		// appears before the game socket exists) against the public /auth routes.
+		const authApi = {
+			request: (u: string) => mpAuthPost(server, '/auth/requestReset', { username: u }),
+			confirm: (u: string, c: string, p: string) => mpAuthPost(server, '/auth/confirmReset', { username: u, code: c, password: p }),
+		};
+		let cred = await this.showLogin({ auth: authApi });
 		this._isNewAccount = false;
 		this._startMode = 'server';
 		this._bridgeStart = false;
@@ -400,17 +505,38 @@ public bubbleSync?: IBubbleSync;
 
 		this.initializeListeners();
 
-		console.log('[multiplayer] Logging in as ' + username.name + (username.mirrorMode ? ' (mirror rollback)' : ''));
-		const result = await this.connection.identify(username.name, username.mirrorMode);
+		console.log('[multiplayer] Logging in as ' + cred.name + (cred.mirrorMode ? ' (mirror rollback)' : ''));
+		// 1.78.x: a wrong-password rejection reopens the login panel with a hint
+		// (same server, same socket) instead of failing the whole connect.
+		let result: IIdentifyResult;
+		for (;;) {
+			try {
+				result = await this.connection.identify(cred.name, cred.mirrorMode, cred.password);
+				break;
+				} catch (e: any) {
+				if (e && e._mpAuthFailed) {
+					// The server's bilingual message (attempts left / lock duration)
+					// wins over the generic wrong-password hint.
+					const authMsg = typeof e._mpAuthMsg === 'string' && e._mpAuthMsg ? e._mpAuthMsg : t('loginWrongPassword');
+					cred = await this.showLogin({ name: cred.name, hint: authMsg, auth: authApi });
+					continue;
+				}
+				throw e;
+				}
+		}
 
 		if (!result.success) {
 			throw new Error('[multiplayer] Could not login! Is the user already logged in?');
 		}
 
+		// 1.78.x: legacy account without a password — the forced set-password
+		// dialog runs BEFORE launchGame (startConnect awaits it on the title screen).
+		(this as any)._mpNeedsPasswordSetup = result.passwordRequired === true;
+
 		// Remember the logged-in account name (drives the in-game party name and
 		// per-account social scoping). Reset the logout latch so a second session on
 		// this same client process logs out cleanly again (installExitHooks' guard).
-		this.name = username.name;
+		this.name = cred.name;
 		(this as any)._loggedOut = false;
 		this._isNewAccount = !!result.isNew;
 		(this as any)._disconnectHandled = false;
@@ -422,7 +548,7 @@ public bubbleSync?: IBubbleSync;
 		// 1.71.0: 镜像回溯 — the server identified us but held the save stream.
 		// Let the player pick one of the five mirrors; the chosen snapshot then
 		// streams through the normal saveDownload channel below.
-		if (username.mirrorMode) {
+		if (cred.mirrorMode) {
 			await this.showMirrorPicker(result.mirrors || []);
 		}
 
@@ -520,6 +646,12 @@ public bubbleSync?: IBubbleSync;
 				console.log('[multiplayer] trade locked for another ' + Math.ceil(lm / 3600000) + 'h (save import / mirror rollback)');
 			}
 		} catch (_) { /* ignore */ }
+
+		// ROUND 162 (progress wall): server-blocked map IDs. Older servers omit
+		// the field -> empty list (feature off). applyBlockedMaps also kicks us
+		// out if we are already standing in a freshly blocked map (logged in
+		// inside one, or the list changed while we were there).
+		try { this.applyBlockedMaps((result as any).blockedMaps); } catch (_) { /* ignore */ }
 
 		// 1.74.x (player collision): server config playerCollision (default false =
 		// walk-through everywhere). Older servers omit it — fall back to false (no
@@ -788,6 +920,17 @@ public bubbleSync?: IBubbleSync;
 	 * (netSync reads it back), so a mirror that enters mid-load still appears.
 	 */
 	public refreshTownCollision(): void {
+		// ~1/s party-peer audit: the fast-follow map-enter race (both clients load
+		// the new map within the same second, one still mid-load) can leave the
+		// instance roster silent about a member who IS on our map — netSync's
+		// applyPlayerState gate then drops their playerStates for the whole map
+		// ("can't see the host after following in"). The party-scoped memberMap
+		// relay is independent of that channel; use it as the fail-safe.
+		const auditNow = Date.now();
+		if (auditNow - this._mpLastPeerAuditAt >= 1000) {
+			this._mpLastPeerAuditAt = auditNow;
+			this.auditPartyPeerMirrors();
+		}
 		for (const name in this.players) {
 			const player = this.players[name];
 			if (!player) continue;
@@ -823,6 +966,51 @@ public bubbleSync?: IBubbleSync;
 			if (e._mpBaseCollType === undefined) e._mpBaseCollType = entity.coll.type;
 			// Round 19: the actual coll.type write is owned by netSync (town + fade).
 		}
+	}
+
+	/** ~1/s party-peer mirror audit (fail-safe for the instance channel). The
+	 *  onPlayerChangeMap enter events + the load-complete roster reconcile are the
+	 *  primary source for playerMapByName/playersOnThisMap, but the fast-follow
+	 *  map-enter race (a follower loads while the earlier entrant is still mid-load,
+	 *  or a reconnect split the pendingSpawn queue) can leave that roster silent
+	 *  about a member who IS on our map; their playerStates then fail netSync's
+	 *  roster gate and their mirror never spawns for the rest of the map. The
+	 *  party-scoped memberMap relay (1 Hz, every party member, any instance) is
+	 *  independent of that channel and precise to the sub-map, so: ADMIT a member
+	 *  whose memberMap equals our map when the instance roster has NO entry for
+	 *  them (never overwrite a conflicting instance-channel map — it is fresher),
+	 *  and REVOKE the admission as soon as their memberMap flips away. No mirror
+	 *  is spawned here: admitting just opens the state gate, and their very next
+	 *  playerState self-heal-spawns the mirror at the true position. */
+	private auditPartyPeerMirrors(): void {
+		try {
+			if (!this.connection || !this.connection.isOpen || !this.connection.isOpen()) return;
+			if (!ig.game || ig.game.isTeleporting() || ig.game.entities.length === 0) return;
+			const myMap = this.currentMapName;
+			if (!myMap) return;
+			const roster = this.partyMembers || [];
+			if (roster.length <= 1) return;
+			for (const name of roster) {
+				if (!name || name === this.name) continue;
+				const mm = this.memberMapByName ? this.memberMapByName[name] : undefined;
+				const known = this.playerMapByName ? this.playerMapByName[name] : undefined;
+				if (mm && mm === myMap && known === undefined) {
+					// The instance roster is silent about a member the party relay places on
+					// our map — admit them so their playerStates pass the netSync gate.
+					this.playerMapByName[name] = myMap;
+					if (this.playersOnThisMap) this.playersOnThisMap[name] = true;
+					this._mpAuditPatched[name] = true;
+					console.log('[multiplayer] peer audit: admitted ' + name + ' on ' + myMap
+						+ ' via memberMap (instance roster silent) — their next playerState spawns the mirror');
+				} else if (this._mpAuditPatched[name] && mm !== myMap) {
+					delete this._mpAuditPatched[name];
+					if (mm) this.playerMapByName[name] = mm;
+					else delete this.playerMapByName[name];
+					if (this.playersOnThisMap) delete this.playersOnThisMap[name];
+					console.log('[multiplayer] peer audit: revoked ' + name + ' (memberMap now ' + (mm || '?') + ')');
+				}
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	/** Roster of the instance we most recently joined (from changeMapResponse
@@ -1350,8 +1538,13 @@ public bubbleSync?: IBubbleSync;
 		// that path already shows its own error and must not double-toast.
 		try {
 			if (typeof this.connection.onSaveFailed === 'function') {
-				this.connection.onSaveFailed((slot, reason) => {
+				this.connection.onSaveFailed((slot, reason, prevLevel) => {
 					try {
+						// 1.77.x: LEVEL-REGRESSION anomaly — handled BEFORE every early
+						// return below: this is a forced, modal "return to title and
+						// re-login" flow, never a toast, and it must still fire while an
+						// exit-to-title upload is settling or save toasts are muted.
+						if (reason === 'levelReset') { this.onSaveLevelReset(prevLevel); return; }
 						if (this._mpExitUploadActive) return;
 						if (reason !== 'tooSmall' && reason !== 'invalid') return;
 						if (!getMpOption('showSaveToast')) return;
@@ -1577,6 +1770,21 @@ public bubbleSync?: IBubbleSync;
 			if (data && data.blocked === 'soloZone') {
 				console.log('[multiplayer] regroup refused: target is in a solo-only trial zone (' + (data.leader || '?') + ')');
 				try { showMpToast({ title: t('teleportSoloZone') }); } catch (_) { /* ignore */ }
+				return;
+			}
+			// 1.77.x (方案C): the target is a quest/special instance map (e.g. 新矿井#1
+			// miners-bombquest-1). Visiting it mid-quest persists the map's progress
+			// vars (map.*) into OUR save and can permanently break that quest's
+			// battle gating for us (battle-start props conditioned on !map.* vanish).
+			// Ask once; YES proceeds exactly like before, NO cancels quietly.
+			const targetMap: any = data && data.map;
+			if (typeof targetMap === 'string' && this.isQuestInstanceMap(targetMap)) {
+				console.warn('[multiplayer] regroup target is a quest-instance map (' + targetMap + ') — asking first');
+				try {
+					(sc as any).Dialogs.showYesNoDialog(t('teleportQuestWarn'), (sc as any).DIALOG_INFO_ICON.QUESTION, (a: any) => {
+						if (a && a.data === 0) this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos);
+					});
+				} catch (_) { this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos); }
 				return;
 			}
 			this.regroupToPartyLeader(data && data.leader, data && data.map, data && data.pos);
@@ -2003,6 +2211,13 @@ public bubbleSync?: IBubbleSync;
 	 * their map; otherwise we go to the leader's party-instance map. Falls back to
 	 * the default town if we have no usable target yet.
 	 */
+	/** 1.77.x: quest/special instance maps (".special." quest maps, "excluded-*"
+	 * trial caves, arena maps) — a mid-quest visit persists map.* progress vars
+	 * into our save and can break that quest's battle gating for us permanently. */
+	private isQuestInstanceMap(map: string): boolean {
+		return /\.special\.|\.excluded-|^arena\./.test(map);
+	}
+
 	private regroupToPartyLeader(leader: string | undefined, map: string | undefined, pos: Vec3 | undefined): void {
 		// Round 19: a regroup teleport that arrives while the LOCAL player is in a
 		// cutscene must not fire — teleporting mid-story would fight the story UI
@@ -3985,13 +4200,17 @@ public bubbleSync?: IBubbleSync;
 		this.connect()
 			.then(async () => {
 				console.log('[multiplayer] Connected');
+				// 1.78.x: a password-less account sets its password BEFORE the game
+				// launches — forced modal over the title screen, blocks until set (the
+				// save download keeps streaming in the background meanwhile).
+				await this.maybeShowPasswordSetup();
 				// ROUND 103: a brand-new account picks a start before the game launches.
 				if (this._isNewAccount) {
 					this._startMode = await this.chooseStartMode();
 					this._bridgeStart = this._startMode === 'bridge';
-				} else {
-					this._bridgeStart = false;
-				}
+					} else {
+						this._bridgeStart = false;
+					}
 				this.launchGame();
 			})
 			.catch((err: any) => {
@@ -4224,6 +4443,16 @@ public bubbleSync?: IBubbleSync;
 				this.tempPartyBots = installTempPartyBotSupport(() => this);
 				this.tempPartyBots.install();
 			} catch (e) { console.warn('[multiplayer] temp party bot install failed', e); }
+			// 1.77.x (cutscene actor guard): missing/hidden scene actors (spawnCond-
+			// gated NPCs, already-defeated monsters) wedged the blocking event call
+			// forever on diverged clients. JIT-materialize them at ig.Event.getEntity,
+			// shield EventCall.update against step throws, sweep temp actors after the
+			// scene, and power the pause-menu "脱离卡死" button during cutscenes
+			// while connected (the button itself lives in ui/unstuckButton.ts).
+			try {
+				this.cutsceneActorGuard = installCutsceneActorGuard(() => this);
+				this.cutsceneActorGuard.install();
+			} catch (e) { console.warn('[multiplayer] cutscene actor guard install failed', e); }
 		}
 	}
 
@@ -4293,6 +4522,14 @@ public bubbleSync?: IBubbleSync;
 
 	/** Registered upload-ack callbacks (wired once on connect, keyed by slot). */
 	private _mpExitUploadResolve: ((ok: boolean) => void) | null = null;
+
+	/** 1.77.x save-anomaly (level regression) guard: the blocking dialog element
+	 * while it is up (doubles as the "already shown" dedupe — rejected autosaves
+	 * keep arriving until the player clicks through, and must not stack panels). */
+	private _mpLevelResetDialog: any = null;
+	/** One-shot: the next gotoTitle must exit WITHOUT saving/uploading (the save
+	 * state was judged anomalous — persisting it is exactly what we refuse). */
+	private _mpForceExitNoSave = false;
 
 	/** Wire the saveSaved / saveFailed ack listeners that settle an exit-upload. Call
 	 * once per connect (the connection is recreated per session, so re-wire each time —
@@ -4481,6 +4718,41 @@ public bubbleSync?: IBubbleSync;
 					try { showMpToast({ title: t(this._mpGodMode ? 'adminGodOn' : 'adminGodOff') }); } catch (_) { /* ignore */ }
 					ack(true, this._mpGodMode ? 'on' : 'off'); break;
 				}
+				// 1.77.x (admin UI / server console): reset the CURRENT map's persisted
+				// progress vars (ig.vars.storage.maps[currentLevelName]) and reload the
+				// map — rescues saves polluted by an accidental visit to a teammate's
+				// mid-quest map (the quest's battle-gating props, conditioned on
+				// !map.*, vanish permanently otherwise). Refused during cutscene /
+				// combat / teleport — mid-scene var wipes would break the scene.
+				case 'resetMap': {
+					try { if (game.isTeleporting && game.isTeleporting()) { ack(false, '传送中'); return; } } catch (_) { /* ignore */ }
+					try {
+						const mdl: any = (sc as any).model;
+						if (mdl && typeof mdl.isCutscene === 'function' && mdl.isCutscene()) { ack(false, '剧情播放中'); return; }
+						if (mdl && typeof mdl.isCombat === 'function' && mdl.isCombat()) { ack(false, '战斗中'); return; }
+					} catch (_) { /* ignore */ }
+					const vars: any = (ig as any).vars;
+					const key: string = vars && vars.currentLevelName;
+					if (!vars || !vars.storage || !key || !vars.storage.maps) { ack(false, '变量存储不可用'); return; }
+					const mapName: string = game.mapName;
+					if (!mapName || typeof game.teleport !== 'function') { ack(false, '地图接口不可用'); return; }
+					const old = vars.storage.maps[key] || {};
+					let cleared = 0;
+					for (const _ in old) cleared++;
+					vars.storage.maps[key] = {};
+					vars.storage.map = vars.storage.maps[key];
+					try {
+						if (vars.storage.session && vars.storage.session.maps) {
+							vars.storage.session.maps[key] = {};
+							vars.storage.session.map = vars.storage.session.maps[key];
+						}
+						vars.storage.tmp = {};
+					} catch (_) { /* ignore */ }
+					console.warn('[multiplayer] admin resetMap: cleared ' + cleared + ' persisted var(s) of "' + key + '", reloading map');
+					game.teleport(mapName);
+					try { showMpToast({ title: t('adminResetMap').replace('{n}', String(cleared)) }); } catch (_) { /* ignore */ }
+					ack(true, '已清除 ' + cleared + ' 个进度变量并重载 ' + mapName); break;
+				}
 				default:
 					ack(false, '未知命令: ' + cmd.kind);
 			}
@@ -4515,6 +4787,17 @@ public bubbleSync?: IBubbleSync;
 	 */
 	private uploadThenGotoTitle(originalGotoTitle: (...a: any[]) => any, args: any[]): boolean {
 		const self = this as any;
+		// 1.77.x: the save-anomaly (level regression) dialog's confirm clicked
+		// through — this gotoTitle is the forced "return to title and re-login".
+		// Exit WITHOUT saving: the local save state was judged anomalous (level
+		// regressed to 1) and uploading it is exactly what the server refuses, so
+		// skip the whole save+upload dance and tear down straight to the title.
+		if (this._mpForceExitNoSave) {
+			this._mpForceExitNoSave = false;
+			console.warn('[multiplayer] forced title exit WITHOUT saving (save-anomaly guard)');
+			this.finalizeTitleExit(originalGotoTitle, args);
+			return true;
+		}
 		// Only while actually online: offline / server-down exits keep the classic path.
 		if (self._loggedOut) return false;
 		const conn = this.connection;
@@ -4868,6 +5151,10 @@ public bubbleSync?: IBubbleSync;
 		this.botMapByName = {};
 		this.playerMapByName = {};
 		this.playersOnThisMap = {};
+		// The mid-load enter queue + peer-audit tags are session-scoped too.
+		this.pendingSpawn = {};
+		this.pendingLoadCbs = [];
+		this._mpAuditPatched = {};
 		// ROUND 83: a fresh session starts pre-reconcile; drop door fade-in flags too.
 		this.playersRosterReady = false;
 		this.pendingFadeIn = Object.create(null);
@@ -5181,6 +5468,11 @@ public bubbleSync?: IBubbleSync;
 .mpSaveInfo { font-size: 12px; color: #8fd6ff; margin-top: 10px; min-height: 16px; }
 .mpSaveBlockErr .mpSavePanel { border-color: #ff9d9d; box-shadow: 0 0 18px rgba(255, 157, 157, 0.35), inset 0 0 26px rgba(13, 42, 66, 0.8); }
 .mpSaveBlockErr .mpSaveInfo { color: #ffb3b3; }
+.mpSaveBtn { display: inline-block; margin-top: 14px; padding: 6px 22px; cursor: pointer;
+    background: rgba(20, 52, 82, 0.95); color: #eaf7ff; border: 1px solid #6fc7ff; border-radius: 4px;
+    font-family: inherit; font-size: 13px; letter-spacing: 1px; }
+.mpSaveBtn:hover, .mpSaveBtn:focus { background: rgba(42, 96, 142, 0.95); outline: none;
+    box-shadow: 0 0 8px rgba(111, 199, 255, 0.6); }
 `;
 		document.head.appendChild(style);
 	}
@@ -5242,6 +5534,73 @@ public bubbleSync?: IBubbleSync;
 		}
 		this._saveBlockFill = null;
 		this._saveBlockInfo = null;
+	}
+
+	// ---- 1.77.x: save-anomaly (level regression) forced dialog ----
+
+	/** The server rejected a save because the STORED save has player level > 1 but
+	 * the upload reported level 1 — the client's save state was silently reset
+	 * underneath it (broken restore / fresh-save race). The stored cloud save was
+	 * NOT overwritten. Per the save-anomaly spec this is a FORCED flow: a modal
+	 * dialog tells the player the save is abnormal and the only way out is back to
+	 * the title screen to re-login (the login flow re-downloads the intact cloud
+	 * save). Modal + deduped: rejected autosaves keep arriving while the dialog
+	 * waits, and must never stack a second panel. */
+	private onSaveLevelReset(prevLevel?: number): void {
+		console.warn('[multiplayer] save rejected: level regression (stored level ' +
+			(prevLevel !== undefined ? prevLevel : '?') + ' -> 1) — forcing return to title');
+		if (this._mpLevelResetDialog) return; // already up — never stack panels
+		try {
+			this.ensureSaveBlockStyle();
+			const box = $('<div class="mpSaveBlock mpSaveBlockErr"></div>');
+			const panel = $('<div class="mpSavePanel"></div>');
+			panel.append($('<div class="mpSaveTitle"></div>').text(t('saveLevelResetTitle')));
+			const msg = t('saveLevelResetMsg').replace('{prev}', prevLevel !== undefined ? String(prevLevel) : '?');
+			panel.append($('<div class="mpSaveInfo" style="min-height:0;line-height:1.7;white-space:normal;text-align:left;margin-top:0"></div>').text(msg));
+			const btn = $('<button type="button" class="mpSaveBtn"></button>').text(t('returnTitle'));
+			panel.append(btn);
+			box.append(panel);
+			const self = this;
+			const close = () => { self.closeLevelResetDialog(true); };
+			btn.on('click', close);
+			const onKey = (ev: any) => {
+				const k = ev && (ev.key || ev.keyCode);
+				if (k === 'Enter' || k === 'Escape' || k === 13 || k === 27) close();
+			};
+			(document as any).addEventListener('keydown', onKey);
+			box.data('mpOnKey', onKey); // unbound again in closeLevelResetDialog
+			box.appendTo(document.body);
+			this._mpLevelResetDialog = box;
+			try { (btn as any).trigger('focus'); } catch (_) { /* ignore */ }
+		} catch (e) {
+			// The dialog itself is best-effort — the forced exit is the point.
+			console.error('[multiplayer] level-reset dialog failed; forcing title exit directly', e);
+			this._mpLevelResetDialog = null;
+			this.closeLevelResetDialog(true);
+		}
+	}
+
+	/** Close the anomaly dialog; with `exit` also run the forced title exit. When
+	 * the player was ALREADY exiting to title (the rejected save WAS the exit
+	 * upload) or is already logged out, that exit flow owns the transition — the
+	 * dialog is then informational only and we must not double-exit. */
+	private closeLevelResetDialog(exit: boolean): void {
+		const box = this._mpLevelResetDialog;
+		this._mpLevelResetDialog = null;
+		if (box) {
+			try {
+				const onKey = box.data('mpOnKey');
+				if (onKey) (document as any).removeEventListener('keydown', onKey);
+			} catch (_) { /* ignore */ }
+			try { box.remove(); } catch (_) { /* ignore */ }
+		}
+		if (!exit) return;
+		try {
+			const self = this as any;
+			if (self._loggedOut || this._mpExitUploadActive) return; // already heading out
+			this._mpForceExitNoSave = true; // consumed by uploadThenGotoTitle
+			(ig.game as any).gotoTitle();
+		} catch (e) { console.error('[multiplayer] forced title exit failed', e); }
 	}
 
 	/**
@@ -5361,11 +5720,26 @@ public bubbleSync?: IBubbleSync;
     border: 1px solid #6fc7ff; border-radius: 12px;
     font-size: 12px; font-family: inherit; }
 .mpLoginChip:hover { background: rgba(46, 104, 142, 0.95); box-shadow: 0 0 8px rgba(111,199,255,0.6); }
+/* 1.78.x: password / reset additions */
+.mpLoginLink { background: none; border: none; color: #8fd6ff; cursor: pointer;
+    font-size: 12px; font-family: inherit; margin-top: 8px; padding: 0; text-decoration: underline; }
+.mpLoginLink:hover { color: #dff3ff; }
+.mpLoginDesc { font-size: 12px; color: #8fd6ff; line-height: 1.6; margin-bottom: 8px; white-space: normal; }
 `;
 		document.head.appendChild(style);
 	}
 
-	private showLogin(): Promise<{ name: string, mirrorMode: boolean }> {
+	private showLogin(opts?: {
+		name?: string,
+		hint?: string,
+		// 1.78.x: password-reset HTTP hooks. The login panel appears BEFORE the
+		// game socket exists, so the reset flow runs over plain HTTP against the
+		// server's public /auth routes (closures bound in connect()).
+		auth?: {
+			request: (username: string) => Promise<{ ok: boolean, msg?: string }>,
+			confirm: (username: string, code: string, password: string) => Promise<{ ok: boolean, msg?: string }>,
+		},
+	}): Promise<{ name: string, mirrorMode: boolean, password?: string }> {
 		return new Promise((resolve, reject) => {
 			this.ensureLoginStyle();
 
@@ -5373,15 +5747,8 @@ public bubbleSync?: IBubbleSync;
 			// language) instead of the old full-width black band. Fresh per call —
 			// no cached username, so re-login after gotoTitle keeps working.
 			const box = $('<div class="mpLogin"></div>');
+			mpShieldModalKeys(box); // 1.78.x: keep game bindings from eating password keys
 			const hist = readLoginHistory();
-			const input = $('<input type="text" class="mpLoginInput" />');
-			input.attr('placeholder', t('loginUserPh'));
-			input.val(hist.last || '');
-			const hint = $('<div class="mpLoginHint"></div>');
-			const submit = $('<button type="submit" class="mpLoginSubmit">' + t('loginSubmit') + '</button>');
-			const mirror = $('<button type="button" class="mpLoginMirror">' + t('loginMirror') + '</button>');
-			const close = $('<button type="button" class="mpLoginClose" title="' + t('loginClose') + '">&times;</button>');
-			const form = $('<form></form>');
 
 			let settled = false;
 			const cleanup = (): void => {
@@ -5395,32 +5762,25 @@ public bubbleSync?: IBubbleSync;
 				// button underneath (the openAddFriendBox idiom).
 				try { (ig.interact as any).setBlockDelay(0.2); } catch (_) { /* ignore */ }
 			};
-			const commit = (name: string, mirrorMode: boolean): void => {
+			const commit = (name: string, mirrorMode: boolean, password?: string): void => {
 				persistLoginHistory(name);
 				cleanup();
-				resolve({ name, mirrorMode });
+				resolve({ name, mirrorMode, password });
 			};
 			const cancel = (): void => {
 				cleanup();
 				reject('cancelled'); // distinctive marker — startConnect must not alert
 			};
-			const submitName = (mirrorMode: boolean): void => {
-				const name = String(input.val() || '').trim();
-				if (!name) {
-					hint.text(t('loginRequired'));
-					input.focus();
-					return; // do NOT settle — keep the panel open, focus in the input
-				}
-				commit(name, mirrorMode);
-			};
 
 			// Round 16: the old focus listener REMOVED the box on regained focus and
 			// never settled the promise -> connect() hung forever on the title screen.
 			// Replaced: any regain that isn't a submit CANCELS (rejects) instead of
-			// silently dropping; while the user is typing we keep the panel instead.
+			// silently dropping; while the user is typing in ANY field of the panel
+			// (1.78.x — there is a password input now) we keep the panel instead.
 			const onFocus = (): void => {
 				if (settled) return;
-				if (document.activeElement === input[0]) {
+				const ae = document.activeElement;
+				if (ae && box[0] && box[0].contains(ae)) {
 					try { ig.system.setFocusLost(); } catch (_) { /* ignore */ }
 					return;
 				}
@@ -5439,40 +5799,147 @@ public bubbleSync?: IBubbleSync;
 
 			// Header: title + a visible close (X) affordance wired to the same reject.
 			const head = $('<div class="mpLoginHead"></div>');
-			head.append('<span class="mpLoginTitle">' + t('loginTitle') + '</span>');
+			const titleSpan = $('<span class="mpLoginTitle">' + t('loginTitle') + '</span>');
+			const close = $('<button type="button" class="mpLoginClose" title="' + t('loginClose') + '">&times;</button>');
+			head.append(titleSpan);
 			head.append(close);
 			box.append(head);
-
-			form.append(input).append(hint).append(submit).append(mirror);
-			box.append(form);
-
-			// Recent users: one chip per previously-used name — clicking one submits
-			// that name immediately.
-			const recents = hist.recent.filter((r) => !!r && r !== hist.last);
-			if (recents.length) {
-				const recentBox = $('<div class="mpLoginRecent"></div>');
-				recentBox.append('<div class="mpLoginRecentLabel">' + t('loginRecent') + '</div>');
-				const chips = $('<div class="mpLoginChips"></div>');
-				for (const r of recents) {
-					const chip = $('<button type="button" class="mpLoginChip"></button>');
-					chip.text(r);
-					chip.on('click', () => commit(r, false));
-					chips.append(chip);
-				}
-				recentBox.append(chips);
-				box.append(recentBox);
-			}
-
-			form.submit(() => {
-				submitName(false);
-				return false;
-			});
-			mirror.on('click', () => submitName(true));
 			close.on('click', () => cancel());
+
+			const body = $('<div></div>');
+			box.append(body);
+
+			// ---- login mode ----
+			const renderLogin = (): void => {
+				body.empty();
+				titleSpan.text(t('loginTitle'));
+				const form = $('<form></form>');
+				const input = $('<input type="text" class="mpLoginInput" />');
+				input.attr('placeholder', t('loginUserPh'));
+				input.val((opts && opts.name) || hist.last || '');
+				// 1.78.x: password field. Empty is fine for legacy accounts without
+				// a password — the server only checks accounts that HAVE one.
+				const pwInput = $('<input type="password" class="mpLoginInput" autocomplete="off" />');
+				pwInput.attr('placeholder', t('loginPasswordPh'));
+				const hint = $('<div class="mpLoginHint"></div>');
+				if (opts && opts.hint) hint.text(opts.hint);
+				const submit = $('<button type="submit" class="mpLoginSubmit">' + t('loginSubmit') + '</button>');
+				const mirror = $('<button type="button" class="mpLoginMirror">' + t('loginMirror') + '</button>');
+
+				const submitName = (mirrorMode: boolean): void => {
+					const name = String(input.val() || '').trim();
+					if (!name) {
+						hint.text(t('loginRequired'));
+						input.focus();
+						return; // do NOT settle — keep the panel open, focus in the input
+					}
+					const pw = String(pwInput.val() || '');
+					commit(name, mirrorMode, pw || undefined);
+				};
+				form.submit(() => {
+					submitName(false);
+					return false;
+				});
+				mirror.on('click', () => submitName(true));
+
+				form.append(input).append(pwInput).append(hint).append(submit).append(mirror);
+				// 1.78.x: forgot-password entry — only when the caller wired the HTTP
+				// reset hooks (a server was selected, so /auth is reachable).
+				if (opts && opts.auth) {
+					const forgot = $('<button type="button" class="mpLoginLink">' + t('loginForgot') + '</button>');
+					forgot.on('click', () => renderReset(String(input.val() || '').trim()));
+					form.append(forgot);
+				}
+				body.append(form);
+
+				// Recent users: one chip per previously-used name — clicking one submits
+				// that name immediately (with whatever password is currently typed).
+				const recents = hist.recent.filter((r) => !!r && r !== hist.last);
+				if (recents.length) {
+					const recentBox = $('<div class="mpLoginRecent"></div>');
+					recentBox.append('<div class="mpLoginRecentLabel">' + t('loginRecent') + '</div>');
+					const chips = $('<div class="mpLoginChips"></div>');
+					for (const r of recents) {
+						const chip = $('<button type="button" class="mpLoginChip"></button>');
+						chip.text(r);
+						chip.on('click', () => {
+							const pw = String(pwInput.val() || '');
+							commit(r, false, pw || undefined);
+						});
+						chips.append(chip);
+					}
+					recentBox.append(chips);
+					body.append(recentBox);
+				}
+				try { (input as any).trigger('focus'); } catch (_) { /* ignore */ }
+			};
+
+			// ---- 1.78.x: reset mode (HTTP, pre-socket) ----
+			const renderReset = (presetName: string): void => {
+				if (!opts || !opts.auth) return;
+				const authHooks = opts.auth;
+				body.empty();
+				titleSpan.text(t('resetTitle'));
+				const form = $('<form></form>');
+				form.on('submit', () => false);
+				const rUser = $('<input type="text" class="mpLoginInput" />');
+				rUser.attr('placeholder', t('loginUserPh'));
+				rUser.val(presetName || '');
+				const desc = $('<div class="mpLoginDesc"></div>').text(t('resetDesc'));
+				const requestBtn = $('<button type="button" class="mpLoginSubmit">' + t('resetRequest') + '</button>');
+				const step2 = $('<div></div>');
+				step2.hide();
+				const rCode = $('<input type="text" class="mpLoginInput" autocomplete="off" />');
+				rCode.attr('placeholder', t('resetCodePh'));
+				rCode.attr('maxlength', '6');
+				const rNew = $('<input type="password" class="mpLoginInput" autocomplete="off" />');
+				rNew.attr('placeholder', t('resetNewPwPh'));
+				const confirmBtn = $('<button type="button" class="mpLoginSubmit">' + t('resetConfirm') + '</button>');
+				step2.append(rCode).append(rNew).append(confirmBtn);
+				const hint = $('<div class="mpLoginHint" style="margin-top:6px"></div>');
+				const back = $('<button type="button" class="mpLoginLink">' + t('resetBack') + '</button>');
+
+				requestBtn.on('click', () => {
+					const name = String(rUser.val() || '').trim();
+					if (!name) { hint.text(t('loginRequired')); return; }
+					requestBtn.prop('disabled', true).text(t('resetSending'));
+					hint.text('');
+					authHooks.request(name).then((r) => {
+						requestBtn.prop('disabled', false).text(t('resetRequest'));
+						hint.text(r && r.msg ? r.msg : '?');
+						if (r && r.ok) step2.show();
+					});
+				});
+				confirmBtn.on('click', () => {
+					const name = String(rUser.val() || '').trim();
+					const code = String(rCode.val() || '').trim();
+					const pw = String(rNew.val() || '');
+					if (!name || !code) { hint.text(t('loginRequired')); return; }
+					if (pw.length < 4 || pw.length > 64) { hint.text(t('setPwWeak')); return; }
+					confirmBtn.prop('disabled', true).text(t('resetSending'));
+					authHooks.confirm(name, code, pw).then((r) => {
+						confirmBtn.prop('disabled', false).text(t('resetConfirm'));
+						if (r && r.ok) {
+							// Back to the login form with the NEW password prefilled.
+							if (opts) { opts.name = name; opts.hint = t('resetOk'); }
+							renderLogin();
+							body.find('input[type="password"]').val(pw);
+							return;
+						}
+						hint.text(r && r.msg ? r.msg : '?');
+					});
+				});
+				back.on('click', () => renderLogin());
+
+				form.append(rUser).append(desc).append(requestBtn).append(step2).append(hint).append(back);
+				body.append(form);
+				try { (rUser as any).trigger('focus'); } catch (_) { /* ignore */ }
+			};
+
+			renderLogin();
 
 			$(document.body).append(box);
 			ig.system.setFocusLost();
-			input.focus();
 		});
 	}
 
@@ -5483,6 +5950,7 @@ public bubbleSync?: IBubbleSync;
 		return new Promise((resolve, reject) => {
 			this.ensureLoginStyle();
 			const box = $('<div class="mpLogin mpMirrorBox"></div>');
+			mpShieldModalKeys(box); // 1.78.x: same engine-key shield as the login panel
 			const head = $('<div class="mpLoginHead"></div>');
 			head.append('<span class="mpLoginTitle">' + t('mirrorTitle') + '</span>');
 			const close = $('<button type="button" class="mpLoginClose" title="' + t('loginClose') + '">&times;</button>');
@@ -5566,9 +6034,130 @@ public bubbleSync?: IBubbleSync;
 		});
 	}
 
+	/** 1.78.x: one-shot gate — a password-less account (legacy or brand new) got
+	 *  passwordRequired on the handshake; force the set-password dialog BEFORE the
+	 *  game launches (awaited by startConnect, so launchGame waits for it). */
+	private maybeShowPasswordSetup(): Promise<void> {
+		if (!(this as any)._mpNeedsPasswordSetup) return Promise.resolve();
+		(this as any)._mpNeedsPasswordSetup = false;
+		return this.showPasswordSetup();
+	}
+
+	/** 1.78.x: FORCED set-password modal (no close button, no outside-click
+	 *  dismiss, no focus cancel — the account must set a password before playing).
+	 *  Uses the login-panel visual language. Retries in place on server reject. */
+	private showPasswordSetup(): Promise<void> {
+		return new Promise((resolve) => {
+			try {
+				if (!this.connection || typeof this.connection.setPassword !== 'function') { resolve(); return; }
+				this.ensureLoginStyle();
+				const box = $('<div class="mpLogin"></div>');
+				mpShieldModalKeys(box); // 1.78.x: password inputs are not engine-exempt
+				const head = $('<div class="mpLoginHead"></div>');
+				head.append('<span class="mpLoginTitle">' + t('setPwTitle') + '</span>');
+				box.append(head);
+				const form = $('<form></form>');
+				const desc = $('<div class="mpLoginDesc"></div>').text(t('setPwMsg'));
+				const pw1 = $('<input type="password" class="mpLoginInput" autocomplete="off" />');
+				pw1.attr('placeholder', t('setPwPh1'));
+				const pw2 = $('<input type="password" class="mpLoginInput" autocomplete="off" />');
+				pw2.attr('placeholder', t('setPwPh2'));
+				const hint = $('<div class="mpLoginHint"></div>');
+				const submit = $('<button type="submit" class="mpLoginSubmit">' + t('setPwSubmit') + '</button>');
+				form.append(desc).append(pw1).append(pw2).append(hint).append(submit);
+				box.append(form);
+
+				let busy = false;
+				// The modal never cancels on focus — re-assert focus loss whenever the
+				// game takes it back (loadingComplete regains focus right as we open).
+				const onFocusHold = (): void => {
+					try { ig.system.setFocusLost(); } catch (_) { /* ignore */ }
+					try { (pw1 as any).trigger('focus'); } catch (_) { /* ignore */ }
+					};
+				const finish = (): void => {
+					try { ig.system.removeFocusListener(onFocusHold); } catch (_) { /* ignore */ }
+					try { box.remove(); } catch (_) { /* ignore */ }
+					try { ig.system.regainFocus(); } catch (_) { /* ignore */ }
+					try { (ig.interact as any).setBlockDelay(0.2); } catch (_) { /* ignore */ }
+					resolve();
+					};
+				form.on('submit', () => {
+					if (busy) return false;
+					const a = String(pw1.val() || '');
+					const b = String(pw2.val() || '');
+					if (a.length < 4 || a.length > 64) { hint.text(t('setPwWeak')); return false; }
+					if (a !== b) { hint.text(t('setPwMismatch')); return false; }
+					busy = true;
+					submit.prop('disabled', true);
+					hint.text('');
+					this.connection.setPassword!(a).then((r) => {
+						busy = false;
+						submit.prop('disabled', false);
+						if (r && r.ok) {
+							console.log('[multiplayer] account password set');
+							finish();
+							return;
+						}
+						hint.text(t('setPwFailed') + (r && r.msg ? ': ' + r.msg : ''));
+						});
+					return false;
+				});
+
+				$(document.body).append(box);
+				// Block game input while the modal is up; it never cancels on focus.
+				try { ig.system.setFocusLost(); } catch (_) { /* ignore */ }
+				try { ig.system.addFocusListener(onFocusHold); } catch (_) { /* ignore */ }
+				try { (pw1 as any).trigger('focus'); } catch (_) { /* ignore */ }
+			} catch (e) {
+				console.error('[multiplayer] password setup dialog failed — skipping', e);
+				resolve();
+			}
+		});
+	}
+
 	private disableFocus() {
 		ig.system.hasFocusLost = () => false;
 	}
+}
+
+// ---- 1.78.x: pre-login auth HTTP (password reset) ----
+
+/** POST JSON to one of the server's public /auth endpoints. Used by the login
+ * panel's reset flow, which runs BEFORE the game socket exists (same CORS-open
+ * stance as serverList's /version probe). Never rejects — network failures
+ * resolve {ok:false} so the panel can show the message inline. */
+function mpAuthPost(server: { type?: string, hostname: string, port: number }, path: string, body: any): Promise<{ ok: boolean, msg?: string }> {
+	return new Promise((resolve) => {
+		const url = (server.type || 'http') + '://' + server.hostname + ':' + server.port + path;
+		try {
+			$.ajax({
+				url,
+				method: 'POST',
+				data: JSON.stringify(body),
+				contentType: 'application/json',
+				dataType: 'json',
+				timeout: 8000,
+				cache: false,
+				success: (d: any) => resolve(d && typeof d === 'object' && typeof d.ok === 'boolean' ? d : { ok: false, msg: 'bad response' }),
+				error: () => resolve({ ok: false, msg: 'network error' }),
+			});
+		} catch (_) { resolve({ ok: false, msg: 'network error' }); }
+	});
+}
+
+/** 1.78.x: the engine's ig.Input listens on WINDOW (bubble phase) and eats
+ * any key bound to a game action unless the event target is an input with
+ * type="text" — PASSWORD inputs don't qualify, so bound letters (WASD/C/X…)
+ * typed into them were preventDefault'd away. Stop keydown/keyup propagation at
+ * the modal container: the engine never sees the keys, while the browser's own
+ * text entry / Enter-to-submit (default actions) are unaffected. */
+function mpShieldModalKeys(box: any): void {
+	try {
+		const el = box && box[0];
+		if (!el) return;
+		el.addEventListener('keydown', (e: Event) => { e.stopPropagation(); }, false);
+		el.addEventListener('keyup', (e: Event) => { e.stopPropagation(); }, false);
+	} catch (_) { /* ignore */ }
 }
 
 // ---- login history (localStorage) ----

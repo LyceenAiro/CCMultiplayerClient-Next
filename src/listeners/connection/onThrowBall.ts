@@ -24,6 +24,8 @@ export class OnThrownBallListener {
 		if (!entity) {
 			// Mirror not spawned yet (they entered while we were loading a map). Skip
 			// this one ball quietly — the next update will land once their mirror is up.
+			// ROUND 164 (ice-skill sync diagnostics): make the silent drop visible.
+			try { if ((window as any)._mpIceDiag) console.log('[mpice] RX drop — no entity for combatant=' + ballInfo.combatant + ' bn=' + (ballInfo.bn || '') + ' ball=' + ballInfo.ballInfo); } catch (_) { /* ignore */ }
 			return;
 		}
 
@@ -131,14 +133,21 @@ export class OnThrownBallListener {
 	if (ballInfo.ballInfo.indexOf('proxy:') === 0) {
 		try {
 			const name = ballInfo.ballInfo.slice('proxy:'.length);
+			const iceDiag = !!(window as any)._mpIceDiag; // ROUND 164 (ice-skill sync diagnostics)
 			const me: any = ig.game.playerEntity;
 			const proxies: any = me && me.proxies;
 			const proxy: any = proxies && proxies[name];
-			if (!proxy || typeof proxy.spawn !== 'function') return;
+			if (!proxy || typeof proxy.spawn !== 'function') {
+				if (iceDiag) console.log('[mpice] RX proxy ' + name + ' NO-PROXY in local registry');
+				return;
+			}
 			// Only GENERIC proxies belong on this channel — a BALL-type name here
 			// means a mismatched sender; those belong to the normal ball branches.
 			const GenericCtor: any = (sc as any).PROXY_TYPE && (sc as any).PROXY_TYPE.GENERIC;
-			if (GenericCtor && !(proxy instanceof GenericCtor)) return;
+			if (GenericCtor && !(proxy instanceof GenericCtor)) {
+				if (iceDiag) console.log('[mpice] RX proxy ' + name + ' NOT-GENERIC (ball-type)');
+				return;
+			}
 			const root: any = (entity as any).getCombatantRoot
 				? ((entity as any).getCombatantRoot() || entity) : entity;
 			// GENERIC spawn wants the CENTER point (it subtracts half its size);
@@ -156,8 +165,12 @@ export class OnThrownBallListener {
 				px + (size && typeof size.x === 'number' ? size.x / 2 : 0),
 				py + (size && typeof size.y === 'number' ? size.y / 2 : 0),
 				pz, root, ballInfo.dir, true);
+			if (iceDiag) console.log('[mpice] RX proxy ' + name + ' spawned=' + (e ? 'ok' : 'NULL') + ' at=' + (px | 0) + ',' + (py | 0) + ',' + (pz | 0));
 			if (e) this.neutralizeProxyVisual(e);
-		} catch (_) { /* a failed proxy replay must never break the frame */ }
+		} catch (err) {
+			// ROUND 164: surface replay failures when tracing (window._mpIceDiag).
+			try { if ((window as any)._mpIceDiag) console.warn('[mpice] RX proxy ERROR', err); } catch (_) { /* ignore */ }
+		}
 		return;
 	}
 
@@ -184,13 +197,19 @@ export class OnThrownBallListener {
 	if (ballInfo.pos && typeof ballInfo.pos.x === 'number') {
 		try {
 			const proxy: any = (sc as any).ProxyTools.getProxy(ballInfo.ballInfo, entity as any);
+			// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag trace.
+			if ((window as any)._mpIceDiag) console.log('[mpice] RX ball ' + ballInfo.ballInfo + ' proxy=' + (proxy ? 'ok' : 'MISSING'));
 			if (proxy && typeof proxy.spawn === 'function') {
 				const root: any = (entity as any).getCombatantRoot
 					? ((entity as any).getCombatantRoot() || entity) : entity;
 				const spawnedBall = proxy.spawn(ballInfo.pos.x, ballInfo.pos.y, ballInfo.pos.z, root, ballInfo.dir);
+				if ((window as any)._mpIceDiag) console.log('[mpice] RX ball ' + ballInfo.ballInfo + ' spawned=' + (spawnedBall ? 'ok' : 'NULL'));
 				if (botName) this.neutralizeReplayBall(spawnedBall);
 			}
-		} catch (_) { /* a failed ball replay must never break the frame */ }
+		} catch (err) {
+			// ROUND 164: surface replay failures when tracing.
+			try { if ((window as any)._mpIceDiag) console.warn('[mpice] RX ball ERROR', err); } catch (_) { /* ignore */ }
+		}
 		return;
 	}
 
@@ -221,6 +240,24 @@ export class OnThrownBallListener {
 			e.checkTackle = function (_a: any, _c: any, _d: any): boolean {
 				return false;
 			};
+			// ROUND 164 (icicle instant-shatter on spectators): the TACKLE action step
+			// insta-ends when a NON-PLAYER combatant has no target (engine run():
+			// `if (!root.isPlayer && !target) stepTimer = 0`). The copy's combatant root
+			// is the caster's MIRROR (Enemy-typed, not isPlayer), so whenever the caster
+			// had no synced target every tackle-capped proxy (icicleSmall/icicleBig/
+			// icicleBigDmg/icicleHuge/turret ring, heat mines, ...) ended its action on
+			// its first frame and postActionUpdate destroyed it WITH its kill effect —
+			// the icicle shattered the moment it appeared for everyone but the caster.
+			// Same cure the Digmo enemy-proxy puppets got (spawnGenericProxyPuppet):
+			// (1) noop setTackle — no live AttackInfo, no one-time rectangle scan,
+			//     hitCount stays 0 so cancelOnHit can never fire either;
+			// (2) guarantee a non-null target (neutral fallback: the mirror itself) so
+			//     the tackle survives its full native duration and the copy shatters on
+			//     spectators' screens at the same moment it does on the caster's.
+			//     The fallback only matters when the mirror has no synced target; ice
+			//     tackles carry no rotateSpeed/missReactTime, so it never steers motion.
+			e.setTackle = function () { /* visual copy: tackle is motion-only */ };
+			if (!e.target) e.target = e.combatant || e;
 		} catch (_) { /* visuals must never break sync */ }
 	}
 

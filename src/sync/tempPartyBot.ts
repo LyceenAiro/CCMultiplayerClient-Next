@@ -267,10 +267,17 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 		} catch (_) { return false; }
 	}
 
-	/** Per-frame sweeper: once the scene is over (no cutscene mode, no running
-	 * events, not loading/teleporting) for IDLE_SWEEP_MS, remove every temp
+	/** Per-frame sweeper: once the scene is over (no cutscene mode, no BLOCKING
+	 * event, not loading/teleporting) for IDLE_SWEEP_MS, remove every temp
 	 * companion. Covers cutscene end, plain blocking events, map changes (the
-	 * entities die with the old map) and disconnects — no engine-hook needed. */
+	 * entities die with the old map) and disconnects — no engine-hook needed.
+	 * 1.77.x fix: the busy check used to hold while ANY event call was running,
+	 * but long-lived/permanent PARALLEL event calls (map ambience controllers,
+	 * a wedged call from a diverged scene) never drain — temps then survived
+	 * the scene forever ("临时NPC在剧情结束后没有移除"). Blocking-scene
+	 * semantics are the correct gate: a temp bot only ever serves a cutscene,
+	 * and a parallel event that still references it re-spawns it on demand via
+	 * the getPartyMemberEntity hook (self-healing). */
 	private sweep(): void {
 		let any = false;
 		for (const _ in this.temps) { any = true; break; }
@@ -281,7 +288,7 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 			const scAny: any = sc as any;
 			busy = !!(ig as any).loading
 				|| !!(scAny.model && typeof scAny.model.isCutscene === 'function' && scAny.model.isCutscene())
-				|| !!(g && g.events && g.events.runningEventCalls && g.events.runningEventCalls.length > 0)
+				|| !!(g && g.events && g.events.blockingEventCall)
 				|| !!(g && typeof g.isTeleporting === 'function' && g.isTeleporting());
 		} catch (_) { busy = true; }
 		if (busy) { this.idleSince = 0; return; }
