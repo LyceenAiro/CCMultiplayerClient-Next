@@ -2127,8 +2127,22 @@ export class NetSync {
 								// is personal feedback), only break variants. Out of range:
 								// attacker = the enemy itself (a.isPlayer no longer forces
 								// the focus), alwaysFocus stripped, d=false.
+								// 1.78.x: ALSO strip the focus while the local player has a
+								// MENU open (shop/pause): vanilla pauses the world there, so
+								// no break camera pull can ever interleave with the NPC
+								// interaction's camera push/pop pair — this mod keeps the
+								// world live, which both yanked the camera mid-shop AND (via
+								// the NPC's blind popTarget, fixed in storySync) could strand
+								// the NPC's camera handle. The BREAK caption/speedlines still
+								// play; only the camera pull + hitstop are skipped.
+								let mpMenuOpen = false;
+								try {
+									const mpMdl: any = (sc as any).model;
+									mpMenuOpen = !!(mpMdl && ((typeof mpMdl.isMenu === 'function' && mpMdl.isMenu())
+										|| (typeof mpMdl.isPaused === 'function' && mpMdl.isPaused())));
+								} catch (_) { mpMenuOpen = false; }
 								if (ns && c && (c as any).break === true && b && b !== (ig as any).game.playerEntity
-									&& !ns.enemyBreakFocusAllowed(b)) {
+									&& (mpMenuOpen || !ns.enemyBreakFocusAllowed(b))) {
 									const conn = ns.main && ns.main.connection;
 									if (conn && typeof conn.isOpen === 'function' && conn.isOpen()) {
 										const stripped = Object.assign({}, c, { alwaysFocus: false });
@@ -15838,6 +15852,28 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			try { e.onProjectileHit = function () { return false; }; } catch (_) { /* ignore */ }
 			e.combatant = puppet;
 			e.target = null;
+			// 1.78.x (heat-golem flameRing never disappearing / stacking): proxy.spawn
+			// registered this copy in the puppet's entityAttached (breakType COMBATANT),
+			// which makes it REMOVABLE by the engine's REMOVE_PROXIES steps. The puppet
+			// evaluates hit reactions LOCALLY for cosmetic break feedback (ROUND 138 —
+			// HIT trackers like fireRingBreak advance through Enemy.onTargetHit on
+			// member hits even though TIME trackers never tick on puppets), and the
+			// golem's RING_BREAK / ICE_DISK reactions both end with REMOVE_PROXIES
+			// sticking:true. Whenever the puppet's local tracker fired BEFORE the
+			// host's (different party-size scaling / relayed-hit counting), the local
+			// reaction destroyed this STREAM-OWNED copy while the host's real flame
+			// ring was still alive — the next projectile block simply respawned it, so
+			// the circling flames never visibly stayed gone and kept piling on top of
+			// themselves across fake-break cycles. Unhook the copy from the clearable
+			// lists: its lifetime is governed ONLY by the host stream (d=1 marker,
+			// 200ms stale-reap in reapStaleProjectiles, clearProjectiles on map change).
+			// Note: puppet.isDefeated is patched to false (see the Enemy.update inject),
+			// so the copy's own breakType defeat-check never fires anyway — nothing is
+			// lost by leaving entityAttached. (ImpactJS erase() of a missing entry is a
+			// no-op, so the copy's later destroy()->detach() stays safe.)
+			try {
+				if (puppet && typeof puppet.removeEntityAttached === 'function') puppet.removeEntityAttached(e);
+			} catch (_) { /* ignore */ }
 			// ROUND 158 (antlion homing fire-rock): TACKLE steps stay in the visual
 			// clone now so homing proxies replay their motion natively — neutralize
 			// the HIT half here. setTackle is where the step installs the live
@@ -16005,6 +16041,31 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						for (let i = 0; i < kept.length - 1; i++) kept[i]._nextStep = kept[i + 1];
 						const visual = new (ig as any).Action('mpProxyVisual', [], false, false);
 						visual.rootStep = kept[0];
+						// 1.78.x (heat-golem flameRing member crash — "Label 'loop' not found."):
+						// this hand-built chain never went through StepHelpers.constructSteps,
+						// so visual.labeledSteps stayed EMPTY. The boss's flameRing proxy loops
+						// its shield behind a LABEL "loop" + GOTO_LABEL pair; CIRCLE_ATTACK is
+						// host-only-filtered but BOTH label steps survive the clone, and the
+						// GOTO clone then looked up the empty labeledSteps map and THREW inside
+						// ig.Action.run, hard-crashing the member client mid-bossfight. Repair:
+						// re-register every kept LABEL clone (mirroring constructSteps) so
+						// in-chain jumps resolve, and blank the name of any kept GOTO whose
+						// target was filtered away — an empty getJumpLabelName is falsy, so the
+						// step degrades to a plain fall-through instead of throwing.
+						try {
+							const LABEL: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.LABEL;
+							const GOTO: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.GOTO_LABEL;
+							const labeled: any = {};
+							for (const st of kept) {
+								if (LABEL && st instanceof LABEL && st.name != null && st.name !== '') labeled[st.name] = st;
+							}
+							visual.labeledSteps = labeled;
+							if (GOTO) {
+								for (const st of kept) {
+									if (st instanceof GOTO && st.name && !labeled[st.name]) st.name = '';
+								}
+							}
+						} catch (_) { /* label repair must never break the spawn */ }
 						e.setAction(visual);
 					}
 				}
@@ -16936,13 +16997,25 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						}
 						// Generic-proxy copies (the Digmo's icicles) carry a kill effect (icicleExplodeSmall): play it
 						// on reap so the guest sees the shatter instead of a silent disappear.
+						let handled = false;
 						try {
 							if (e._mpProj && e.effects && e.effects.onKill && typeof e.destroy === 'function') {
-								e.destroy();
+								e.destroy();   // deferred kill after the kill effect — don't force
+								handled = true;
 							} else {
 								e.kill(true);
+								handled = !!e._killed;
 							}
-						} catch (_) { /* ignore */ }
+						} catch (_) { handled = false; }
+						// 1.78.x (zombie-copy guard): the kill path above can return with the
+						// copy still alive (swallowed exception / destroy() that never reached
+						// kill()). Deleting the entry then would orphan a live, UNTRACKED copy
+						// — a flame ring circling the boss forever. Retry a hard silent kill;
+						// if even that fails, KEEP the entry so the next sweep retries.
+						if (!handled && !e._killed) {
+							try { if (typeof e.kill === 'function') e.kill(true); } catch (_) { /* ignore */ }
+							if (!e._killed) continue;
+						}
 					}
 					delete this.projectiles[uid];
 				}
@@ -19563,6 +19636,40 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * duration is pinned to -1 (no timer expiry) — attach/detach is host-driven via the
 	 * stream. Shield visual FX (domes) are NOT reproduced; damage correctness is the
 	 * goal. */
+	/** 1.78.x (heat-golem aura stuck after ring break): true when the synced
+	 * connection's shield still matches EVERY streamed field of the snapshot. The
+	 * comparisons mirror the attach normalization in syncPuppetShields EXACTLY
+	 * (defaults included) — otherwise a shield whose wire form differs from its
+	 * live form would be torn down and rebuilt on every block. A compare failure
+	 * returns true (never churn shields on a bad read). */
+	private shieldSnapMatches(shield: any, s: IShieldSnap): boolean {
+		try {
+			if (!shield || !s) return false;
+			const num = (v: any, d: number) => (typeof v === 'number' && isFinite(v)) ? v : d;
+			const eq = (a: number, b: number) => Math.abs(a - b) < 1e-6;
+			if (!eq(num(shield.baseFactor, 1), num(s.bf, 1))) return false;
+			const efA: any[] = Array.isArray(shield.elementFactors) && shield.elementFactors.length >= 4 ? shield.elementFactors : [1, 1, 1, 1];
+			const efB: any[] = Array.isArray(s.ef) && s.ef.length >= 4 ? s.ef : [1, 1, 1, 1];
+			for (let i = 0; i < 4; i++) if (!eq(num(efA[i], 1), num(efB[i], 1))) return false;
+			if (!eq(num(shield.hitResist, 4), num(s.hr, 4))) return false;
+			if (!eq(num(shield.stableOverride, 3), num(s.so, 3))) return false;
+			if (!eq(num(shield.strength, 3), num(s.st, 3))) return false;
+			if ((shield.neutralize === true) !== (s.nt === 1)) return false;
+			if (s.k === 'DIRECTIONAL') {
+				if (!eq(num(shield.range, 0.5), num(s.rg, 0.5))) return false;
+				if ((shield.back === true) !== (s.bk === 1)) return false;
+			}
+			if (s.k === 'PARTS') {
+				const ptA: any[] | null = Array.isArray(shield.parts) ? shield.parts : null;
+				const ptB: any[] | null = Array.isArray(s.pt) ? s.pt : null;
+				if ((ptA ? ptA.length : -1) !== (ptB ? ptB.length : -1)) return false;
+				if (ptA && ptB) { for (let i = 0; i < ptA.length; i++) if (ptA[i] !== ptB[i]) return false; }
+				if ((shield.inverse === true) !== (s.iv === 1)) return false;
+			}
+			return true;
+		} catch (_) { return true; /* compare failure must not churn shields */ }
+	}
+
 	private syncPuppetShields(e: any, sh: IShieldSnap[] | undefined): void {
 		try {
 			if (!e || !Array.isArray(e.shieldsConnections)) return;
@@ -19573,12 +19680,18 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					if (s && typeof s.n === 'string') want[s.n + '|' + s.k] = s;
 				}
 			}
-			// Detach synced shields the host no longer reports.
+			// Detach synced shields the host no longer reports — OR still reports but
+			// with the same name+kind and DIFFERENT params (1.78.x, heat-golem aura:
+			// BreakFireRing does REMOVE_SHIELD aura 0.1 -> ADD_SHIELD aura 0.5, so the
+			// name|kind key survives and the STALE 0.1 instance used to stay attached
+			// forever — member hits on the ring-broken boss kept judging the pre-break
+			// 90% guard, i.e. "damage still blocked after break"). A param mismatch
+			// detaches the old connection; the attach pass below re-creates it fresh.
 			for (let i = e.shieldsConnections.length; i--;) {
 				const c: any = e.shieldsConnections[i];
 				if (!c || !c._mpShieldSync) continue;
 				const key = ((c.shield && c.shield.name) || '') + '|' + c._mpShieldKind;
-				if (want[key]) continue;
+				if (want[key] && this.shieldSnapMatches(c.shield, want[key])) continue;
 				try {
 					if (typeof e.removeShield === 'function') e.removeShield(c);
 					else e.shieldsConnections.splice(i, 1);

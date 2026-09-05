@@ -131,6 +131,10 @@ let shared: PuzzleSync | null = null;
  * resetGroup wrap must not rebroadcast it back (echo loop). */
 let bounceFxReplayDepth = 0;
 let bounceFxHooksInstalled = false;
+/** ROUND 165: >0 while a receiver replays a relayed steam-oven activation — the
+ * startSteam wrap must not rebroadcast it back (echo loop). */
+let steamOvenReplayDepth = 0;
+let steamOvenHookInstalled = false;
 /** 1.77.x: Lorry motion/touch suppression hooks (heat-dng.f1.room-02). */
 let lorryHooksInstalled = false;
 
@@ -163,6 +167,9 @@ class PuzzleSync implements IPuzzleSync {
 	private _varLogSeen = new Set<string>();
 	/** 1.76.x: per-group timestamp of the last relayed fail-flash replay (spam guard). */
 	private bounceResetFxAt = new Map<string, number>();
+	/** ROUND 165: per-oven timestamp of the last relayed steam activation replay
+	 * (mapId -> ms; guards duplicate packets, legit re-steams are seconds apart). */
+	private steamOvenFxAt = new Map<number, number>();
 	/** 1.77.x: member-side rider heartbeat throttle for host-managed lorries
 	 * (mapId -> last send time). */
 	private riderSentAt = new Map<number, number>();
@@ -181,6 +188,7 @@ class PuzzleSync implements IPuzzleSync {
 		if (!m || !m.connection) return;
 		try { m.connection.onPuzzleState((data) => this.apply(data)); } catch (_) { /* ignore */ }
 		try { if (typeof (m.connection as any).onBounceFx === 'function') (m.connection as any).onBounceFx((data: any) => this.applyBounceFx(data)); } catch (_) { /* ignore */ }
+		try { if (typeof (m.connection as any).onSteamOven === 'function') (m.connection as any).onSteamOven((data: any) => this.applySteamOvenFx(data)); } catch (_) { /* ignore */ }
 		try { if (typeof (m.connection as any).onSlidingPush === 'function') (m.connection as any).onSlidingPush((data: any) => this.applySlidingPush(data)); } catch (_) { /* ignore */ }
 		if (!updateRegistered) {
 			updateRegistered = true;
@@ -193,6 +201,7 @@ class PuzzleSync implements IPuzzleSync {
 		}
 		this.installPushPullHooks();
 		this.installBounceFxHooks();
+		this.installSteamOvenHook();
 		this.installLorryHooks();
 	}
 
@@ -555,6 +564,72 @@ class PuzzleSync implements IPuzzleSync {
 			}
 		} catch (e) { console.warn('[puzzlesync] bounce-FX hooks failed', e); }
 	}
+
+	/** ROUND 165 (steam-oven FX relay): a local SteamOven just started steaming (an
+	 * ice disk melted into it on THIS client). The ovenActivate burst, the glow that
+	 * travels the steam pipes and the outlet steam clouds are local-only vanilla
+	 * side effects — broadcast one compact event so same-instance peers replay them
+	 * natively (applySteamOvenFx). */
+	private broadcastSteamOvenFx(mi: number): void {
+		try {
+			const m = this.getMain();
+			if (!m || !m.connection || !m.connection.isOpen()) return;
+			if (typeof (m.connection as any).steamOven !== 'function') return;
+			if (typeof mi !== 'number' || !mi) return;
+			const g: any = ig.game;
+			const map = (g && g.mapName) || '';
+			if (!map) return;
+			(m.connection as any).steamOven(map, mi);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** ROUND 165: peer's steam-oven activation — find OUR local copy of the oven by
+	 * mapId and run its native startSteam() (ovenActivate burst + propagateSteam:
+	 * the moving pipe glow and outlet steam clouds). 1.5s per-oven dedup guards
+	 * duplicate packets; legit re-steams (a fresh disk) are seconds apart. */
+	private applySteamOvenFx(data: { map: string, mi: number }): void {
+		try {
+			if (!data || typeof data.mi !== 'number') return;
+			const g: any = ig.game;
+			if (!g || (g.mapName || '') !== data.map) return;
+			const now = Date.now();
+			if (now - (this.steamOvenFxAt.get(data.mi) || 0) < 1500) return;
+			const entities = (g.entities as any[]) || [];
+			let ent: any = null;
+			for (const e of entities) {
+				if (e && !e._killed && e.mapId === data.mi) { ent = e; break; }
+			}
+			if (!ent || typeof ent.startSteam !== 'function') return;
+			const OVEN: any = (ig.ENTITY as any).SteamOven;
+			if (OVEN && !(ent instanceof OVEN)) return;
+			this.steamOvenFxAt.set(data.mi, now);
+			steamOvenReplayDepth++;
+			try { ent.startSteam(); } finally { steamOvenReplayDepth--; }
+		} catch (_) { /* cosmetic replay must never break the frame */ }
+	}
+
+	/** ROUND 165: wrap the vanilla SteamOven.startSteam so the ACTIVATING client
+	 * broadcasts the event (see broadcastSteamOvenFx). startSteam only ever runs on
+	 * the client whose local ice disk physically collided with the oven (streamed
+	 * disks are collision-less), so there is no echo; the replay-depth guard skips
+	 * rebroadcast while replaying a relayed activation. */
+	private installSteamOvenHook(): void {
+		if (steamOvenHookInstalled) return;
+		steamOvenHookInstalled = true;
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const self = this;
+		try {
+			const OVEN: any = (ig.ENTITY as any).SteamOven;
+			if (!OVEN || !OVEN.prototype || typeof OVEN.prototype.startSteam !== 'function') return;
+			const origStartSteam = OVEN.prototype.startSteam;
+			OVEN.prototype.startSteam = function (this: any) {
+				const r = origStartSteam.apply(this, arguments as any);
+				try { if (!steamOvenReplayDepth) self.broadcastSteamOvenFx(this.mapId); } catch (_) { /* ignore */ }
+				return r;
+			};
+		} catch (e) { console.warn('[puzzlesync] steam-oven hook failed', e); }
+	}
+
 	/** 1.74.0: host receives a member's push — recompute the push direction from the
 	 * ball's flight velocity (charged balls) or the hit point (bomb blasts), then
 	 * trace + slide the local pillar natively (or flash "blocked" if a wall/fence is

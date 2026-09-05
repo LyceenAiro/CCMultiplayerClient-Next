@@ -1290,6 +1290,18 @@ export class SocketIoConnector implements IConnection {
 		});
 	}
 
+	/** ROUND 165 (steam-oven FX relay): see connection.ts. */
+	public steamOven(map: string, mi: number): void {
+		this.syncEmit('steamOven', { map, mi });
+	}
+	public onSteamOven(callback: (data: { map: string, mi: number }) => void): void {
+		this.socket.on('steamOven', (data: any) => {
+			if (data && typeof data.map === 'string' && typeof data.mi === 'number') {
+				callback({ map: data.map, mi: data.mi });
+			}
+		});
+	}
+
 	/** 1.73.x: the host's enemy counter reached 0 (battle done). Members set the
 	 * counter vars locally + zero the visible counter so the relayed battle-done
 	 * cutscene completes (its WAIT_UNTIL_TRUE waits on the post variable). */

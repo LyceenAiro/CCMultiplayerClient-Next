@@ -308,6 +308,13 @@ export interface IConnection {
     bounceFx(map: string, mi: number, k: number): void;
     /** 1.76.x: a same-instance peer's bounce-puzzle FX event. */
     onBounceFx(callback: (data: { map: string, mi: number, k: number }) => void): void;
+    /** ROUND 165 (steam-oven FX relay): a client's ice disk melted into a SteamOven —
+     * the ovenActivate burst + pipe steam propagation (the glow that travels the
+     * pipes, the outlet steam clouds) are local-only vanilla side effects, so relay
+     * one compact event for same-instance peers to replay natively. mi = oven mapId. */
+    steamOven(map: string, mi: number): void;
+    /** ROUND 165: a same-instance peer's steam-oven activation. */
+    onSteamOven(callback: (data: { map: string, mi: number }) => void): void;
     /** ROUND 132: stream the LOCAL player's thrown-ball positions (bounce-puzzle
      * visibility — throwBall only relays the throw moment, not the steered bounce). */
     playerBall(map: string, entries: Array<{ i: number, el?: number, chg?: number, x: number, y: number, z: number, vx?: number, vy?: number }>): void;

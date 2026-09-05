@@ -2455,6 +2455,66 @@ export class StorySyncController {
 					} catch (_) { /* never break the interaction */ }
 					return r;
 				},
+				// 1.78.x (camera stuck on the shop/dialog NPC): vanilla onEventStart
+				// pushes an ANONYMOUS PosTarget handle and onEventEnd removes it with a
+				// BLIND ig.camera.popTarget("FAST") — it pops whatever happens to be on
+				// top. Solo that's safe (menus/cutscenes pause the world, so nothing can
+				// push between the pair); this mod keeps the world LIVE behind open
+				// menus (ROUND 94/123), so a relayed break-focus / level-up zoom / boss
+				// camera relay CAN interleave — the blind pop then eats the interleaver
+				// and the NPC's PosTarget stays on the stack FOREVER: the camera locks
+				// onto the shop until the next map load (onPlayerPlaced pops everything).
+				// Capture the pushed handle here and make onEventEnd remove THAT handle
+				// by identity instead of trusting the stack top.
+				onEventStart(this: any) {
+					const cam: any = (ig as any).camera;
+					const depthBefore: number = cam && Array.isArray(cam.targets) ? cam.targets.length : -1;
+					const r = this.parent();
+					try {
+						if (cam && depthBefore >= 0 && cam.targets.length > depthBefore) {
+							const top: any = cam.targets[cam.targets.length - 1];
+							const CamCls: any = (ig as any).Camera;
+							if (top && (!CamCls || !CamCls.TargetHandle || top instanceof CamCls.TargetHandle)) {
+								this._mpNpcCamHandle = top;
+							}
+						}
+					} catch (_) { /* ignore */ }
+					return r;
+				},
+				onEventEnd(this: any) {
+					// Runs BEFORE the native body (its popTarget is the blind one).
+					try {
+						const cam: any = (ig as any).camera;
+						const h: any = this._mpNpcCamHandle;
+						this._mpNpcCamHandle = null;
+						if (cam && Array.isArray(cam.targets) && cam.targets.length) {
+							const idx: number = h ? cam.targets.indexOf(h) : -1;
+							if (idx !== -1 && idx !== cam.targets.length - 1) {
+								// An interleaved target sits on top of ours. Splice ours
+								// out silently (mid-stack removeTarget skips the camera
+								// transition), so the native popTarget below eats the
+								// interleaver instead of stranding ours. The interleaver's
+								// owner later removes its own handle by identity (no-op).
+								try { cam.removeTarget(h, 0); } catch (_) { /* ignore */ }
+							} else if (idx === -1 && cam.targets.length <= 1) {
+								// Our handle is already gone (a foreign blind pop ate it)
+								// and only the player's own camera handle remains — the
+								// native popTarget would pop THAT and leave the camera
+								// targetless. Feed it a dummy at the CURRENT camera
+								// position (zero visual change) for the pop to consume.
+								const CamCls: any = (ig as any).Camera;
+								if (CamCls && CamCls.TargetHandle && CamCls.PosTarget && typeof cam.pushTarget === 'function') {
+									try {
+										const pos: any = { x: cam._currentPos ? cam._currentPos.x : 0, y: cam._currentPos ? cam._currentPos.y : 0 };
+										cam.pushTarget(new CamCls.TargetHandle(new CamCls.PosTarget(pos), 0, 0), 'IMMEDIATELY');
+									} catch (_) { /* ignore */ }
+								}
+							}
+							// idx === top: the native popTarget pops our handle — normal.
+						}
+					} catch (_) { /* never break the NPC event end */ }
+					return this.parent();
+				},
 			});
 			console.log('[storysync] NPC interaction gate installed');
 		} catch (_) { /* ignore */ }
