@@ -32,7 +32,7 @@ import { PlayerListener } from './listeners/game/playerListener';
 import { IMultiplayerEntity } from './mpEntity';
 import { IPlayer } from './player';
 import { IChangeMapResult } from './connection';
-import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey } from './util/areaUtil';
+import { currentAreaPath, currentAreaType, areaPathOfMap, areaTypeOfMap, SHARED_TOWNS, hasUnlockedArea, hasUnlockedMapStrict, storageMapKey, isTown } from './util/areaUtil';
 import { SocialOverlay } from './ui/socialOverlay';
 import { dropNameTag, wipeAllNameTags, getMpOption } from './ui/mpOptions';
 import { closeMpWindows, showMpWindow, showStartModeWindow } from './ui/socialMenuInject';
@@ -60,7 +60,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '0.2.5';
+export const MP_VERSION = '0.2.6';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -300,6 +300,20 @@ export class Multiplayer {
 	private _saveSuppressUntil = 0;
 	/** ITEM 1: log the 5s upload suppression once per suppression window. */
 	private _saveSuppressLogged = false;
+	/** 0.2.5 (user directive: 传送至其他玩家切换地图时不自动保存，避免卡死): a
+	 * map change caused by "传送到队友身边" performs NO auto-save at all — the
+	 * engine's mid-load checkpoint save plus the post-load area-poll /
+	 * landing-persist saves are the freeze (卡死) vector on these teleports.
+	 * Armed at regroup-teleport start (whole load), tightened to load-complete
+	 * + 3s by onceGameReady. Manual stamped saves (saveHere) stay live. */
+	private _mpRegroupSaveSuppressUntil = 0;
+	/** 0.2.5 (user directive, part 2): the regroup DESTINATION map whose visit
+	 * has never been persisted. While the player is still on this map (no map
+	 * change of their own since the regroup teleport), the return-to-title
+	 * button must NOT auto-save either — relogin then restores the pre-teleport
+	 * checkpoint. Cleared by the first genuine save (any kind) and self-heals
+	 * on map mismatch. */
+	private _mpRegroupUnsavedMap: string | null = null;
 	/** ITEM 3: SHARED 60s anti-spam timer for area-change + teleport-point (landmark)
 	 * unlock saves — at most one such upload per 60s. Starts at 0 so the FIRST save of
 	 * the kind always uploads. Deliberately NOT reset on reconnect (anti-spam, not
@@ -500,6 +514,9 @@ public bubbleSync?: IBubbleSync;
 
 		if (!this.connection.isOpen()) {
 			console.log('[multiplayer] Connecting..');
+			// 1.79.x (bandwidth): latch the wire-schema preference BEFORE the
+			// handshake so the (re)connect payload reports it.
+			try { this.connection.setSchemaPref(getMpOption('netSchema') === 'd' ? 'd' : 'c'); } catch (_) { /* default c */ }
 			await this.connection.open(server.hostname, server.port, server.type);
 		}
 
@@ -626,6 +643,35 @@ public bubbleSync?: IBubbleSync;
 				this.netSync.setPerfectGuardComp(num(result.perfectGuardBaseMs, 10), num(result.perfectGuardPingFactor, 0.6));
 			}
 		} catch (_) { /* ignore */ }
+
+		// 1.79.x (bandwidth): server relay caps (by area type) + the self-heal
+		// heartbeat rate. Clients align their send floors, edges and heartbeats to
+		// these so no upstream packet is silently dropped by the relay cap. Older
+		// servers omit the fields — fall back to 30 / 10 / 1.
+		try {
+			const num = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
+			this.relayFieldHz = Math.max(1, Math.min(60, num(result.relayMaxTickField, 30)));
+			this.relayTownHz = Math.max(1, Math.min(60, num(result.relayMaxTickTown, 10)));
+			this.healHz = Math.max(0.5, Math.min(60, num(result.healHz, 1)));
+		} catch (_) { /* ignore */ }
+		// 1.79.x (bandwidth): the party-effective wire schema. An older server
+		// omits it -> stay on 'legacy' (the current long-key JSON, feature off).
+		this.mpNetSchema = (result.netSchema === 'c' || result.netSchema === 'd') ? result.netSchema : 'legacy';
+		// 1.80.x (idle kick): AFK limits per area type (0 = off; older servers
+		// omit both -> feature off). Arm the raw-input hooks + the 5s watchdog,
+		// and let the SERVER's backstop kick route through the same exit path.
+		try {
+			const num2 = (v: any, def: number) => (typeof v === 'number' && isFinite(v)) ? v : def;
+			this.afkFieldMin = Math.max(0, Math.min(43200, num2(result.afkField, 0)));
+			this.afkTownMin = Math.max(0, Math.min(43200, num2(result.afkTown, 0)));
+		} catch (_) { /* ignore */ }
+		this.installInputHooks();
+		this.startAfkWatchdog();
+		try {
+			this.connection.onAfkKick((info) => {
+				this.afkKickExit(info && info.minutes ? info.minutes : this.afkLimitMinutes(), true);
+			});
+		} catch (_) { /* older connector: no server backstop event */ }
 
 		// 1.77.x (player trading): server config master switch + the exchange loss
 		// ratio (receiver gets floor(given / ratio)). Older servers omit both ->
@@ -1592,11 +1638,31 @@ public bubbleSync?: IBubbleSync;
 			try { reg(fn); } catch (e) { console.error('[multiplayer] lobby wiring error:', e); }
 		};
 
+		// 1.79.x (bandwidth): the server pushes the party-effective wire schema
+		// whenever it changes (preference flip / roster change / logout).
+		safeWire(conn.onNetSchema.bind(conn), (mode: string) => {
+			if ((mode === 'c' || mode === 'd' || mode === 'legacy') && this.mpNetSchema !== mode) {
+				this.mpNetSchema = mode;
+				console.log('[multiplayer] wire schema -> ' + mode + (mode === 'legacy' ? ' (server/compat)' : mode === 'c' ? ' (标准)' : ' (调试)'));
+			}
+		});
+
 		safeWire(conn.onPartyUpdate.bind(conn), (party) => {
 			// Round 23 wave 3: roster-change toasts (member joined / left-with-manner).
 			// Diffed BEFORE the roster is overwritten so we know what changed. The
 			// departure manner (lastLeft) rides the same payload from the server.
 			this.notifyPartyRosterChange(this.partyMembers.slice(), party ? party.members.slice() : [], party && party.lastLeft);
+
+			// 1.79.x (bandwidth): the roster changed -> the party's effective wire
+			// schema may flip (a 'd' or old-build member joined/left). Re-assert OUR
+			// preference; the server recomputes and pushes netSchema to everyone.
+			try {
+				const pref = getMpOption('netSchema');
+				if (pref === 'c' || pref === 'd') {
+					const c: any = this.connection;
+					if (c && typeof c.netSchemaPref === 'function' && c.isOpen()) c.netSchemaPref(pref);
+				}
+			} catch (_) { /* non-fatal */ }
 
 			// Capture the pre-update party state so we can detect the solo->partied
 			// transition (the no-pause swallow only guards NEW pauses, not an already
@@ -2058,6 +2124,32 @@ public bubbleSync?: IBubbleSync;
 	 * false (default) = online players NEVER collide (walk-through everywhere).
 	 * Consumed by netSync (setPlayerCollision) to drive the mirror collision pass. */
 	public mpPlayerCollision = false;
+	/** 1.79.x (bandwidth): server-side MAX RELAY rate (Hz) for the three hot
+	 * streams, by area type (handshakeResponse.relayMaxTickField/Town). Send
+	 * floors, edges and heartbeats align to the CURRENT area's cap so no
+	 * upstream packet is silently dropped by the relay throttle. */
+	public relayFieldHz = 30;
+	public relayTownHz = 10;
+	/** 1.79.x (bandwidth): self-heal heartbeat rate (Hz, float allowed). The
+	 * three hot streams send one unconditional full packet at min(healHz, area
+	 * cap). */
+	public healHz = 1;
+	/** 1.79.x (bandwidth): the PARTY-EFFECTIVE wire schema ('c' 标准 binary,
+	 * 'd' 调试 short-key JSON, 'legacy' old long-key JSON). Arbitrated by the
+	 * server from the members' preferences; updated via the netSchema push. */
+	public mpNetSchema: 'c' | 'd' | 'legacy' = 'legacy';
+	/** 1.80.x (idle kick): AFK auto-disconnect limit in MINUTES for the CURRENT
+	 * area type (0 = never auto-disconnect; handshakeResponse.afkField/Town).
+	 * The timer only resets on REAL keyboard/mouse input — being hit, dying,
+	 * reviving or cutscenes never touch it. */
+	public afkFieldMin = 0;
+	public afkTownMin = 0;
+	/** 1.80.x (idle kick): Date.now() of the last raw input event (window-level
+	 * capture hooks). The connector's netPing rides an `ia` flag whenever this
+	 * advanced since the previous probe, so the SERVER's watchdog stays honest. */
+	public mpLastInputAt = 0;
+	private _mpAfkTimer: any = null;
+	private _mpInputHooked = false;
 	/** Round 17: RTT in ms each remote player in our instance reports to the
 	 * server (relayed as `playerPing`, ~1/s cadence). Shown on their name tag when
 	 * 显示ping值 is on. Stale entries are harmless (tags only render for present
@@ -2268,6 +2360,18 @@ public bubbleSync?: IBubbleSync;
 			return;
 		}
 
+		// 0.2.5 (user directive): a regroup-caused map change must NOT auto-save
+		// at all (避免卡死). Arm the suppression window for the whole load now;
+		// onceGameReady tightens it to a short post-load settle tail that covers
+		// the area-poll (500ms) and the landing-fix pass (~400ms).
+		this._mpRegroupSaveSuppressUntil = Date.now() + 20000;
+		// 0.2.5 part 2: latch the destination as "never saved" — until the player
+		// leaves this map again, return-to-title exits without saving either.
+		this._mpRegroupUnsavedMap = target;
+		this.onceGameReady(() => {
+			this._mpRegroupSaveSuppressUntil = Date.now() + 3000;
+		});
+
 		// Close the pause/main menu BEFORE teleporting: this button lives in the
 		// Social menu, and ig.Game.update only consumes teleporting.levelData while
 		// !paused — with the menu still open the teleport froze at a black fade
@@ -2424,7 +2528,28 @@ public bubbleSync?: IBubbleSync;
 	 *     the 'other' reason bypasses the area throttle the engine's own map-change
 	 *     save just consumed. The server save is what relogin downloads.
 	 */
+	/** 0.2.5: true while the player sits on a regroup-teleported map whose visit
+	 * was never saved. A map mismatch (walked away / respawned / teleported
+	 * elsewhere) self-heals the latch so normal saving resumes. */
+	private regroupUnsavedActive(): boolean {
+		const m = this._mpRegroupUnsavedMap;
+		if (!m) return false;
+		const cur = ((ig.game as any) && (ig.game as any).mapName) || '';
+		if (cur !== m) { this._mpRegroupUnsavedMap = null; return false; }
+		return true;
+	}
+
 	private persistRegroupLanding(): void {
+		// 0.2.5 (user directive): regroup map changes no longer auto-save at all.
+		// The ROUND 121 repair save is obsolete inside the window — the bad
+		// mid-load checkpoint it repaired is now suppressed outright — and running
+		// it was itself one of the freeze (卡死) vectors. The live-coll landing
+		// fix (applyRegroupLandingFix) still runs; only the save is skipped. The
+		// body stays as a fallback for a call that outlives the window.
+		if (Date.now() < this._mpRegroupSaveSuppressUntil) {
+			console.log('[multiplayer] regroup landing save skipped (no-auto-save window)');
+			return;
+		}
 		try {
 			const fix = this._mpRegroupLandingFix;
 			const storage: any = (ig as any).storage;
@@ -2525,6 +2650,23 @@ public bubbleSync?: IBubbleSync;
 	public getPlayerStateMs(): number {
 		const r = Number(getMpOption('playerStateRate')) || 30;
 		return 1000 / r;
+	}
+
+	/** 1.79.x (bandwidth): the CURRENT area's server relay cap in Hz (town ->
+	 * relayTownHz, everything else -> relayFieldHz). Send floors, edges and
+	 * heartbeats clamp to this so no upstream packet is silently dropped by the
+	 * server's relay throttle. */
+	public getAreaCapHz(): number {
+		try {
+			if (typeof isTown === 'function' && isTown()) return this.relayTownHz;
+		} catch (_) { /* fall through to field */ }
+		return this.relayFieldHz;
+	}
+	/** 1.79.x (bandwidth): the self-heal heartbeat interval in ms, already
+	 * clamped to the current area's relay cap (effective = min(healHz, cap)). */
+	public getHealMs(): number {
+		const hz = Math.min(this.healHz, this.getAreaCapHz());
+		return 1000 / Math.max(0.5, hz);
 	}
 
 	/**
@@ -3105,9 +3247,13 @@ public bubbleSync?: IBubbleSync;
 		} catch (_) { /* ignore */ }
 	}
 
-	/** LEADER side (~15 Hz): stream every live bot entity's state to the instance so
-	 * members can render the same bots as host-driven puppets. Emits an EMPTY bots
-	 * array when there are none — members use that as the cull signal. */
+	/** LEADER side (~15 Hz tick): stream every live bot entity's state to the
+	 * instance so members can render the same bots as host-driven puppets.
+	 * 1.79.x (bandwidth): EDGE-GATED + HEARTBEAT — a packet goes out when any bot
+	 * moved / changed anim or (2-decimal) facing / integer hp-exp, when the roster
+	 * appeared/disappeared, or at the self-heal heartbeat (healHz) otherwise. A
+	 * steady idle party costs ~1 pkt/s instead of 15. Emits an EMPTY bots array
+	 * as the cull signal (itself heartbeat-paced once steady). */
 	private streamBotState(): void {
 		try {
 			if (!this.connection || !this.connection.isOpen()) return;
@@ -3116,40 +3262,59 @@ public bubbleSync?: IBubbleSync;
 			// sharing a town instance no longer see each other's bots.
 			if (!this.isPartyLeader) return;
 			if (!ig.game || !ig.game.playerEntity || ig.game.isTeleporting()) return;
-			// 1.71.0: dungeons have no follower bots — keep streaming the EMPTY cull
-			// signal so a member who enters late still drops its stale copies.
-			if (this.inDungeonNow()) {
-				this.connection.botState({ map: ig.game.mapName || '', bots: [] });
-				return;
-			}
-			const party: any = (sc as any).party;
-			if (!party || !party.currentParty) return;
-			const roster = this.partyMembers || [];
+			const now = Date.now();
+			const healMs = this.getHealMs();
 			const bots: any[] = [];
-			for (const n of party.currentParty) {
-				if (!n) continue;
-				const mdl = party.models && party.models[n];
-				if (mdl && mdl._mpName && roster.indexOf(n) !== -1) continue; // real member -> mirror
-				const e = this.partyBotEntity(party, n);
-				if (!e || e._killed || !e.coll) continue;
-				const face = e.face || { x: 0, y: 1 };
-				bots.push({
-					n,
-					x: Math.round(e.coll.pos.x),
-					y: Math.round(e.coll.pos.y),
-					z: Math.round(e.coll.pos.z),
-					fx: face.x,
-					fy: face.y,
-					a: typeof e.currentAnim === 'string' ? e.currentAnim : '',
-					hp: e.params ? e.params.currentHp : 0,
-					mh: e.params && e.params.getStat ? e.params.getStat('hp') : 0,
-					lv: mdl ? mdl.level : 0,
-					ex: mdl ? mdl.exp : 0,
-				});
+			let changed = false;
+			const prev = this._botLastBots;
+			// 1.71.0: dungeons have no follower bots — the EMPTY cull signal still
+			// flows (heartbeat-paced) so a member who enters late drops stale copies.
+			if (!this.inDungeonNow()) {
+				const party: any = (sc as any).party;
+				if (party && party.currentParty) {
+					const roster = this.partyMembers || [];
+					for (const n of party.currentParty) {
+						if (!n) continue;
+						const mdl = party.models && party.models[n];
+						if (mdl && mdl._mpName && roster.indexOf(n) !== -1) continue; // real member -> mirror
+						const e = this.partyBotEntity(party, n);
+						if (!e || e._killed || !e.coll) continue;
+						const face = e.face || { x: 0, y: 1 };
+						// 1.79.x: quantize before the diff — the server relays rounded
+						// values anyway and the HUD shows integer hp/exp; raw floats
+						// were ~45B/bot of upstream waste AND made every exp tick an
+						// "edge". 2-decimal facing keeps the puppet visually smooth.
+						const fx = Math.round(face.x * 100) / 100;
+						const fy = Math.round(face.y * 100) / 100;
+						const a = typeof e.currentAnim === 'string' ? e.currentAnim : '';
+						const x = Math.round(e.coll.pos.x), y = Math.round(e.coll.pos.y), z = Math.round(e.coll.pos.z);
+						const hp = Math.round(e.params ? e.params.currentHp : 0);
+						const mh = e.params && e.params.getStat ? e.params.getStat('hp') : 0;
+						const lv = mdl ? mdl.level : 0;
+						const ex = Math.round(mdl ? mdl.exp : 0);
+						const p = prev[n];
+						if (!p || p.x !== x || p.y !== y || p.z !== z || p.fx !== fx || p.fy !== fy
+							|| p.a !== a || p.hp !== hp || p.mh !== mh || p.lv !== lv || p.ex !== ex) changed = true;
+						bots.push({ n, x, y, z, fx, fy, a, hp, mh, lv, ex });
+					}
+				}
 			}
+			const empty = bots.length === 0;
+			// Roster appear/disappear always ships immediately; everything else
+			// waits for a real edge or the heartbeat.
+			const became = empty !== !!this._botSentEmpty;
+			if (!became && !changed && now - this._botLastSentAt < healMs) return;
+			this._botLastBots = {};
+			for (const b of bots) this._botLastBots[b.n] = b;
+			this._botLastSentAt = now;
+			this._botSentEmpty = empty;
 			this.connection.botState({ map: ig.game.mapName || '', bots });
 		} catch (_) { /* ignore */ }
 	}
+	/** 1.79.x: last-sent bot snapshot (per-bot edge diff) + send pacing state. */
+	private _botLastBots: { [n: string]: any } = {};
+	private _botLastSentAt = 0;
+	private _botSentEmpty = false;
 
 	/** MEMBER side: apply the leader's botState block to our local puppet copies. */
 	private applyBotState(data: any): void {
@@ -3417,7 +3582,11 @@ public bubbleSync?: IBubbleSync;
 			// its own bots, so this cull must never run on the leader or it would strip
 			// them (the leader never receives botState, but a stale member-side
 			// timestamp can survive a leadership transfer).
-			if (!this.isPartyLeader && this._mpLastBotStateAt && Date.now() - this._mpLastBotStateAt > 3000) {
+			// 1.79.x: the leader's stream is now edge-gated + heartbeat-paced, so
+			// the stall threshold scales with the heartbeat (>= 2.5 intervals,
+			// never below the old 3s) — a slow-heal server must not misread a
+			// quiet stream as "leader left my instance".
+			if (!this.isPartyLeader && this._mpLastBotStateAt && Date.now() - this._mpLastBotStateAt > Math.max(3000, this.getHealMs() * 2.5)) {
 				this._mpLastBotStateAt = 0;      // fire once per stall
 				this._mpLeaderMap = '';
 				this.cullLocalBotEntities((sc as any).party);
@@ -3817,6 +3986,9 @@ public bubbleSync?: IBubbleSync;
 			const state: any = {};
 			storage._saveState(state); // builds the save + fires onStorageSave (upload hook)
 			if (typeof storage.saveAutoSlot === 'function') storage.saveAutoSlot(state);
+			// 0.2.5 part 2: a real save just persisted the current position — clear
+			// the regroup-unsaved latch so a later return-to-title saves normally.
+			this._mpRegroupUnsavedMap = null;
 			return true;
 		} catch (e) { return false; }
 	}
@@ -4016,6 +4188,39 @@ public bubbleSync?: IBubbleSync;
 			console.warn('[multiplayer] could not register storage save hook', e);
 		}
 
+		// 0.2.5 (user directive: 传送至其他玩家切换地图时不自动保存，避免卡死):
+		// wrap the engine's checkpoint-save entry so the mid-load map-change save
+		// (the UNSTAMPED one — loadSlot/post-load -> saveCheckpoint) no-ops for the
+		// whole regroup load + settle window. Skipping it skips the onStorageSave
+		// hook too, so nothing uploads either. Manual saveHere stamps 'manual'
+		// right before calling saveCheckpoint, so a deliberate manual save during
+		// the window still runs. Once-guarded: registerSaveSync runs once per
+		// process, but belt-and-braces for re-entry.
+		if (!(this as any)._checkpointWrapInstalled) {
+			(this as any)._checkpointWrapInstalled = true;
+			try {
+				const storage: any = (ig as any).storage;
+				// eslint-disable-next-line @typescript-eslint/no-this-alias
+				const self = this;
+				if (storage && typeof storage.saveCheckpoint === 'function') {
+					const origCp = storage.saveCheckpoint;
+					storage.saveCheckpoint = function (this: any) {
+						try {
+							if (Date.now() < self._mpRegroupSaveSuppressUntil && !self._mpStampedThisHook) {
+								console.log('[multiplayer] checkpoint save suppressed (regroup teleport window)');
+								return;
+							}
+						} catch (_) { /* fall through to the native save */ }
+						// 0.2.5 part 2: a genuine checkpoint save just persisted the
+						// position (e.g. the player walked through a door after the
+						// regroup) — the unsaved-regroup latch is moot from here on.
+						self._mpRegroupUnsavedMap = null;
+						return origCp.apply(this, arguments as any);
+					};
+				}
+			} catch (err) { console.warn('[multiplayer] checkpoint-save wrap failed', err); }
+		}
+
 		// Event-driven saves (round 6, user request): switching AREA (block) and
 		// unlocking a teleport point/landmark both trigger a fresh checkpoint save +
 		// upload, so the server copy is never far behind the live game. Once-guarded:
@@ -4065,6 +4270,17 @@ public bubbleSync?: IBubbleSync;
 					if (now < this._saveSuppressUntil + 25000) {
 						if ((lastArea && area !== lastArea) || (lastLandmarks && landmarks !== lastLandmarks)) {
 							console.debug('[multiplayer] post-login auto-save skipped (join/restore window)');
+						}
+						lastArea = area;
+						lastLandmarks = landmarks;
+						return;
+					}
+					// 0.2.5 (user directive): during the regroup-teleport window,
+					// consume area/landmark changes silently — arriving on the
+					// leader's map/area must never fire an auto-save (卡死 vector).
+					if (now < this._mpRegroupSaveSuppressUntil) {
+						if ((lastArea && area !== lastArea) || (lastLandmarks && landmarks !== lastLandmarks)) {
+							console.debug('[multiplayer] regroup auto-save skipped (no-auto-save window)');
 						}
 						lastArea = area;
 						lastLandmarks = landmarks;
@@ -4471,6 +4687,10 @@ public bubbleSync?: IBubbleSync;
 			// guards the beforeunload / fallback paths uploadThenGotoTitle does not cover.
 			if (this.inCutsceneNow() || this.inCombat()) {
 				console.log('[multiplayer] logout during cutscene/combat — skipping save');
+			} else if (this.regroupUnsavedActive()) {
+				// 0.2.5 (user directive, part 2): beforeunload / offline-fallback
+				// logout on an unsaved regroup map — skip the final save too.
+				console.log('[multiplayer] logout on an unsaved regroup map — skipping save (0.2.5)');
 			} else {
 				// Best-effort final save (checkpoint-safe — see saveWithoutMovingCheckpoint;
 				// the onStorageSave hook uploads while the socket is still open). Round 23:
@@ -4814,6 +5034,16 @@ public bubbleSync?: IBubbleSync;
 			return true;
 		}
 
+		// 0.2.5 (user directive, part 2): regroup-teleported to THIS map and never
+		// saved since — the return-to-title button must not auto-save either (不把
+		// 未真正"抵达"过的位置写进存档). Exit directly, exactly like the
+		// cutscene/combat path above (no save, no upload dialog).
+		if (this.regroupUnsavedActive()) {
+			console.log('[multiplayer] exit to title on an unsaved regroup map — exiting WITHOUT saving (0.2.5)');
+			this.finalizeTitleExit(originalGotoTitle, args);
+			return true;
+		}
+
 		// ROUND 102 (inherit synced quest progress): end any active story sync BEFORE
 		// building the save. Its quest save-guard would otherwise still be armed here
 		// (the session teardown that disarms it runs only later, in clearSession) and
@@ -5095,6 +5325,98 @@ public bubbleSync?: IBubbleSync;
 			console.error('[multiplayer] gotoTitle failed', e);
 		}
 		console.log('[multiplayer] returned to title (server unreachable/updated)');
+	}
+
+	// ---- 1.80.x (idle kick): client-side AFK enforcement ----
+
+	/** Install once-per-process input stamps for the AFK clock.
+	 *
+	 * DOM listeners: keydown/mousedown/mousemove only (capture + passive — they
+	 * must not disturb the game's own input, and game EVENTS (being hit, dying,
+	 * reviving, cutscenes) can never touch this clock — only input does).
+	 *
+	 * WHEEL — deliberately NO DOM listener: registering a standard 'wheel'
+	 * listener on window is the 1.80.x regression that killed ALL in-game wheel
+	 * input (the reported "滚轮无法操作" bug). CrossCode's input listens ONLY to
+	 * the legacy 'mousewheel'/'DOMMouseScroll' events, and Chromium's wheel
+	 * delivery path is fragile around wheel listeners (latching/passive
+	 * interventions — the documented "trapping the wheel event breaks the scroll
+	 * wheel" Chrome bug class). Instead the ENGINE's own one-frame
+	 * scrollUp/scrollDown actions (bound to MWHEEL_UP/DOWN at boot) are polled
+	 * from a registerUpdate pump — zero DOM wheel listeners, and wheel input
+	 * still resets the AFK clock. */
+	private installInputHooks(): void {
+		if (this._mpInputHooked) return;
+		this._mpInputHooked = true;
+		this.mpLastInputAt = Date.now();
+		try {
+			const mark = () => { this.mpLastInputAt = Date.now(); };
+			const opts: any = { capture: true, passive: true };
+			window.addEventListener('keydown', mark, opts);
+			window.addEventListener('mousedown', mark, opts);
+			window.addEventListener('mousemove', mark, opts);
+		} catch (e) { /* best-effort: a missing listener just disables the feature */ }
+		try {
+			const s: any = (typeof simplify !== 'undefined') ? (simplify as any) : null;
+			if (s && typeof s.registerUpdate === 'function') {
+				s.registerUpdate(() => {
+					try {
+						const inp: any = ig.input;
+						if (inp && typeof inp.pressed === 'function'
+							&& (inp.pressed('scrollUp') || inp.pressed('scrollDown'))) {
+							this.mpLastInputAt = Date.now();
+						}
+					} catch (e) { /* never break the frame */ }
+				});
+			}
+		} catch (e) { /* ignore */ }
+	}
+
+	/** 5s watchdog (armed on connect). Graceful path: toast + sync save/upload
+	 * + logout + back to the title screen. The SERVER's own watchdog (netPing
+	 * `ia` flags) is the backstop against patched clients. */
+	private startAfkWatchdog(): void {
+		if (this._mpAfkTimer) return;
+		this._mpAfkTimer = setInterval(() => {
+			try {
+				if (!this.afkFieldMin && !this.afkTownMin) return;
+				if ((this as any)._loggedOut) return;
+				if (!this.connection || typeof this.connection.isOpen !== 'function' || !this.connection.isOpen()) return;
+				const limit = this.afkLimitMinutes();
+				if (limit <= 0) return;
+				const idleMs = Date.now() - (this.mpLastInputAt || Date.now());
+				if (idleMs > limit * 60000) this.afkKickExit(limit, false);
+			} catch (e) { /* the watchdog must never crash the interval */ }
+		}, 5000);
+	}
+
+	/** The CURRENT area's AFK limit (town = afkTownMin, field/dungeon =
+	 * afkFieldMin). 0 = disabled. */
+	private afkLimitMinutes(): number {
+		let town = false;
+		try { town = typeof isTown === 'function' && isTown(); } catch (e) { /* fall through to field */ }
+		return town ? this.afkTownMin : this.afkFieldMin;
+	}
+
+	/** The shared AFK exit: explain, save + upload (synchronous flush so the
+	 * save lands before the socket closes — see saveAndLogout), log out and
+	 * return to the title screen. */
+	private afkKickExit(minutes: number, fromServer: boolean): void {
+		if ((this as any)._loggedOut) return;
+		const msg = t(fromServer ? 'afkKickServerToast' : 'afkKickToast').replace('%1', String(minutes || 0));
+		try {
+			// A DOM toast survives the scene switch to the title screen.
+			const div = document.createElement('div');
+			div.textContent = msg;
+			div.setAttribute('style', 'position:fixed;left:50%;top:12%;transform:translateX(-50%);'
+				+ 'z-index:99999;background:rgba(20,24,34,.92);color:#d8e6ff;padding:10px 22px;'
+				+ 'border:1px solid #4a90d9;border-radius:4px;font:14px/1.5 sans-serif;pointer-events:none;');
+			document.body.appendChild(div);
+			setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 7000);
+		} catch (e) { /* non-fatal */ }
+		console.log('[multiplayer] afk auto-disconnect (' + minutes + 'min limit' + (fromServer ? ', server watchdog' : '') + ')');
+		this.saveAndLogout();
+		try { (ig.game as any).gotoTitle(); } catch (e) { /* already at title */ }
 	}
 
 	/** Despawn all remote mirrors and drop party/social state (on logout / server

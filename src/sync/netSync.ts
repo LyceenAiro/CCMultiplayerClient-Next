@@ -374,9 +374,19 @@ export class NetSync {
 	 * block → dead marker next block) + per-map reset guard. */
 	private _mpBallStreamAlive: { [uid: string]: number } = {};
 	private _mpBallStreamMapName: string = '';
+	/** 1.80.x (combat bandwidth): uids whose static block (el/chg/pn) already
+	 * streamed — follow-up entries carry only i/x/y/z/vx/vy; receivers (and the
+	 * server, for legacy receivers) merge their own cache. Reset with the
+	 * alive-map on map change. */
+	private _mpBallStaticSent: { [uid: string]: number } = {};
 	/** 1.74.x: hit-killed puppets — tombstone so an in-flight stale position
 	 * entry can't resurrect the puppet right after we killed it at the enemy. */
 	private _mpBallHitKilled: { [key: string]: number } = {};
+	/** 1.80.x (combat bandwidth): receiver-side static cache for the split
+	 * playerBall stream — key 'pb_<from>_<uid>' -> {el, chg, pn}, absorbed from
+	 * each ball's first entry, merged into follow-up entries, freed by dead
+	 * markers. Whole-table reset past 256 entries (balls live 1-2s). */
+	private _mpBallStaticRx: { [key: string]: any } = Object.create(null);
 	/** ROUND 133: quest-world spawn-var relay (Broken-Fist miniboss chest, and any
 	 * quest like it). storySync's mapVar relay only fires during an ACTIVE side-quest
 	 * sync, so a co-op partner not formally syncing the quest never receives the
@@ -734,6 +744,12 @@ export class NetSync {
 	 * side). reapStalePuppets refuses to run while no block has arrived for >1200ms
 	 * (host stall / dropped connection) so a hiccup can't mass-reap every puppet. */
 	private _mpLastBlockAt = 0;
+	/** 1.80.x (static/dynamic split): member-side per-uid cache of the STATIC
+	 * entityState fields (mi/t/m/msp/tos/ats/nm/mk), absorbed whenever an entry
+	 * ships them (first appearance, the ~1s force-full heartbeat, late-joiner
+	 * blocks) and merged into dynamic-only entries before anything reads them.
+	 * FIFO-capped; cleared on map change / host promotion. */
+	private _mpEnemyStatic: Map<number, any> | null = null;
 
 	/** ROUND 39 (item 1): the live SOUND HANDLES this instance started for a remote
 	 * player's SUSTAINED (loop:true) sound, keyed by the remote player's name (one
@@ -1550,11 +1566,27 @@ export class NetSync {
 						// 1.75.x (guard-art loop FX): mark LOOPING player-skill effects so the
 						// Effect.stop wrap can relay their end — without it the heat guard art's
 						// flameGuard (blinkCount:-1 red glow) replayed on mirrors FOREVER.
+						// 1.78.x (golem PreShoot linger, ROOT CAUSE): ig.ENTITY.Effect is
+						// ENTITY-POOLED — `new Effect()` returns a RECYCLED instance whose
+						// engine fields get reset() but our expandos survive. A recycled
+						// handle arrived with _mpTelegraphStopRelayed=true from its previous
+						// relayed life, so the Effect.stop wrap never relayed the stop again:
+						// once the pool primed, EVERY ShootAttack left the member's PreShoot /
+						// FlameThrower copy looping until the duration cap (the old blanket
+						// stop-all had been masking this). Reset the once-flag on every
+						// (re)stamp, and strip stale stamps when THIS spawn is not relayed —
+						// otherwise the handle's later stop() would relay a bogus per-key stop
+						// for its previous life, and the member's pending-stop buffer would
+						// suppress a legit spawn for 5s. Same treatment for _mpSkillFxLoop.
 						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && (b === ig.game.playerEntity || botFxName)) {
-							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName || '' }; } catch (_) { /* ignore */ }
+							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName || '' }; h._mpSkillFxStopRelayed = false; } catch (_) { /* ignore */ }
+						} else if (h && h._mpSkillFxLoop) {
+							try { h._mpSkillFxLoop = null; h._mpSkillFxStopRelayed = false; } catch (_) { /* ignore */ }
 						}
 						if (markUid > 0 && h) {
-							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; } catch (_) { /* ignore */ }
+							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; h._mpTelegraphStopRelayed = false; } catch (_) { /* ignore */ }
+						} else if (h && h._mpTelegraphUid) {
+							try { h._mpTelegraphUid = 0; h._mpTelegraphSheet = ''; h._mpTelegraphKey = ''; h._mpTelegraphLoop = false; h._mpTelegraphStopRelayed = false; } catch (_) { /* ignore */ }
 						}
 						// TEMP DIAG (loop fx): marked=false means the host sheet was NOT loaded at spawn
 						// (cache sweep) — the member replays a looping copy the host never had, so no stop
@@ -1587,11 +1619,16 @@ export class NetSync {
 						const h = origSpawnFixed.call(this, a, x, y, z, i, j);
 						const mpLoopSpawn = !!(j && typeof j.duration === 'number' && j.duration < 0);
 						// 1.75.x (guard-art loop FX): same mark on the fixed-spawn path.
+						// 1.78.x: same entity-pool recycle fix as spawnOnTarget above.
 						if (mpLoopSpawn && h && SKILL_SHEETS[this.path] && (i === ig.game.playerEntity || botFxName2)) {
-							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName2 || '' }; } catch (_) { /* ignore */ }
+							try { h._mpSkillFxLoop = { sheet: this.path, key: a, bot: botFxName2 || '' }; h._mpSkillFxStopRelayed = false; } catch (_) { /* ignore */ }
+						} else if (h && h._mpSkillFxLoop) {
+							try { h._mpSkillFxLoop = null; h._mpSkillFxStopRelayed = false; } catch (_) { /* ignore */ }
 						}
 						if (markUid > 0 && h) {
-							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; } catch (_) { /* ignore */ }
+							try { h._mpTelegraphUid = markUid; h._mpTelegraphSheet = this.path; h._mpTelegraphKey = a; h._mpTelegraphLoop = mpLoopSpawn; h._mpTelegraphStopRelayed = false; } catch (_) { /* ignore */ }
+						} else if (h && h._mpTelegraphUid) {
+							try { h._mpTelegraphUid = 0; h._mpTelegraphSheet = ''; h._mpTelegraphKey = ''; h._mpTelegraphLoop = false; h._mpTelegraphStopRelayed = false; } catch (_) { /* ignore */ }
 						}
 						if (markUid > 0 && mpLoopSpawn && (window as any)._mpFxDiag) console.log('[mpfx] HOST loopspawn uid=' + markUid + ' ' + this.path + '/' + a + ' marked=' + !!h); // ROUND 160: flag-gated (was unconditional spam)
 						return h;
@@ -1655,7 +1692,7 @@ export class NetSync {
 					EFF.prototype.stop = function (this: any) {
 						try {
 							const u = this._mpTelegraphUid;
-							if (u && this._mpTelegraphLoop && !this._mpTelegraphStopRelayed && (window as any)._mpFxDiag) console.log('[mpfx] HOST fxstop uid=' + u + ' ' + this._mpTelegraphSheet + '/' + this._mpTelegraphKey); // ROUND 160: flag-gated
+							if (u && this._mpTelegraphLoop && !this._mpTelegraphStopRelayed) console.log('[mpfx] HOST loopstop uid=' + u + ' ' + this._mpTelegraphSheet + '/' + this._mpTelegraphKey); // 1.78.x: always-on (once per handle) — proves the per-key stop link fires
 							if (u && !this._mpTelegraphStopRelayed) {
 								this._mpTelegraphStopRelayed = true;
 								const m = (window as any).__mpMain;
@@ -1687,12 +1724,14 @@ export class NetSync {
 				// action-attached / entity-attached effects (no-group CLEAR_EFFECTS, action end,
 				// cancelAction, state switches) funnels through the ENTITY's own
 				// clearActionAttached / clearEntityAttached. The per-handle Effect.stop relay
-				// covers the normal case, but when the HOST's own spawn returned null (its
-				// sheet cache-swept mid-fight) there is NO handle to mark, so no per-key stop
-				// ever fires and the member's replayed looping telegraph would linger until
-				// its duration cap. Relay a stop-all on these two choke points instead — the
-				// engine semantics are exactly "all attached effects of this enemy end now", which
-				// is precisely the member's tracked set for that uid.
+				// covers the normal case (reliable again after the 1.78.x entity-pool once-flag
+				// fix), but when the HOST's own spawn returned null (its sheet cache-swept
+				// mid-fight) there is NO handle to mark, so no per-key stop ever fires and the
+				// member's replayed looping telegraph would linger until its duration cap.
+				// 1.78.x: these two choke points relay per-key stops for stamped matches and
+				// reserve the legacy stop-all for unstamped ghost-heals only — a blanket
+				// stop-all on every clear killed the member's OTHER freshly replayed loops
+				// (WeakStartPre spawns heatGolemSteamed, then CLEAR_EFFECTS 'aura' wiped both).
 				const AE: any = (ig as any).ActorEntity || (ig.ENTITY as any).ActorEntity;
 				if (AE && AE.prototype && typeof AE.prototype.clearActionAttached === 'function' && !AE.prototype._mpClearAllWrapped) {
 					AE.prototype._mpClearAllWrapped = true;
@@ -1711,13 +1750,31 @@ export class NetSync {
 								// replayed angry2 break glow.
 								const cond = args[0];
 								const list: any[] = this.actionAttached || [];
-								let willStopFx = false;
+								// 1.78.x: precise per-key stops for matched STAMPED entries — sent
+								// here AND through the Effect.stop wrap (reliable again after the
+								// entity-pool once-flag fix); the member dedupes via _enemyFxLastStop.
+								// A matched UNSTAMPED effect means the member may hold a replay the
+								// host can no longer reference per-key (spawn returned null / pre-wrap
+								// spawn) — only then keep the legacy stop-all ghost-heal. A blanket
+								// stop-all on every clear also killed the member's OTHER freshly
+								// replayed loops (WeakStartPre spawns heatGolemSteamed then clears
+								// 'aura' — the stop-all wiped the steam along with the aura).
+								let needsStopAll = false;
+								const stopKeys: { [k: string]: boolean } = {};
 								for (let i = 0; i < list.length; i++) {
 									const entry = list[i];
 									if (!entry || !(entry instanceof EffCtor)) continue;
-									if (!cond || (typeof cond === 'function' && cond(entry, args[1]))) { willStopFx = true; break; }
+									if (!cond || (typeof cond === 'function' && cond(entry, args[1]))) {
+										if (entry._mpTelegraphUid) {
+											const k2 = (entry._mpTelegraphSheet || '') + '/' + (entry._mpTelegraphKey || '');
+											if (!stopKeys[k2]) {
+												stopKeys[k2] = true;
+												m.netSync.broadcastEnemyFxStop(this.uid, entry._mpTelegraphSheet || '', entry._mpTelegraphKey || '');
+											}
+										} else needsStopAll = true;
+									}
 								}
-								if (willStopFx) m.netSync.broadcastEnemyFxStopAll(this.uid);
+								if (needsStopAll) m.netSync.broadcastEnemyFxStopAll(this.uid);
 							}
 						} catch (_) { /* never break the engine clear */ }
 						return origClearAct.apply(this, args as any);
@@ -1730,13 +1787,26 @@ export class NetSync {
 								&& !this._mpPuppet && !this._mpMirror && this.uid > 0) {
 								const cond = args[0];
 								const list: any[] = this.entityAttached || [];
-								let willStopFx = false;
+								// 1.78.x: same stamped/unstamped split as clearActionAttached above —
+								// per-key stops for stamped matches (group-scoped CLEAR_EFFECTS like
+								// WeakStartPre clearing 'aura' thus stop ONLY the aura on members, never
+								// the same-action 'steam'); stop-all only for unstamped ghost-heals.
+								let needsStopAll = false;
+								const stopKeys: { [k: string]: boolean } = {};
 								for (let i = 0; i < list.length; i++) {
 									const entry = list[i];
 									if (!entry || !(entry instanceof EffCtor)) continue;
-									if (!cond || (typeof cond === 'function' && cond(entry, args[1]))) { willStopFx = true; break; }
+									if (!cond || (typeof cond === 'function' && cond(entry, args[1]))) {
+										if (entry._mpTelegraphUid) {
+											const k2 = (entry._mpTelegraphSheet || '') + '/' + (entry._mpTelegraphKey || '');
+											if (!stopKeys[k2]) {
+												stopKeys[k2] = true;
+												m.netSync.broadcastEnemyFxStop(this.uid, entry._mpTelegraphSheet || '', entry._mpTelegraphKey || '');
+											}
+										} else needsStopAll = true;
+									}
 								}
-								if (willStopFx) m.netSync.broadcastEnemyFxStopAll(this.uid);
+								if (needsStopAll) m.netSync.broadcastEnemyFxStopAll(this.uid);
 							}
 						} catch (_) { /* never break the engine clear */ }
 						return origClearEnt.apply(this, args as any);
@@ -3165,22 +3235,41 @@ export class NetSync {
 								const root: any = atk && atk.getCombatantRoot ? (atk.getCombatantRoot() || atk) : atk;
 								if (root && root._mpMirror && root._mpForcedDamage != null) {
 									const du = rest[3];
-									if (du) {
-										du.damage = root._mpForcedDamage;
+									// 1.81.x (moth break-hit rollback fix): when the hit FIRES a
+									// reaction carrying preSwitchState/stunChange/damageFactor (the
+									// Faj'ro moth's ICE_WEAK charged-ice knockdown break), the native
+									// hitApply RECOMPUTES the damage with this fabricated husk
+									// AttackInfo and parks the NEW result object on the feedback object
+									// (a.damageResult); the native onDamage tail then REPLACES the
+									// HP-write result with it (`if(f.damageResult&&u)u=f.damageResult`).
+									// Forcing only rest[3] (the original u) wrote a discarded object —
+									// the host applied the husk-recomputed ~0-1 chip instead, and the
+									// member watched their real number roll back ("破防那一下没有伤害").
+									// Force BOTH result objects: rest[3] (no-reaction path) and
+									// a.damageResult (reaction path — the one the engine actually applies).
+									const duR: any = a && a.damageResult;
+									const duList: any[] = [];
+									if (du) duList.push(du);
+									if (duR && typeof duR.damage === 'number' && duR !== du) duList.push(duR);
+									for (let fi = 0; fi < duList.length; fi++) {
+										const duF = duList[fi];
+										duF.damage = root._mpForcedDamage;
 										// ROUND 72 (crit style sync): the host's chain rolled crit
 										// off the mirror HUSK's params (near-zero focus), so a
 										// member's golden crit showed as a plain white number on
 										// the host. Force the attacker's rolled crit flag the
 										// same way the damage value is forced.
-										if (root._mpForcedCrit) du.critical = true;
+										if (root._mpForcedCrit) duF.critical = true;
 										// ROUND 80 (number style sync): the host chain also
 										// recomputes baseOffensiveFactor/defensiveFactor from the
 										// fabricated MEDIUM attack + the mirror-husk params, so an
 										// uncharged member ball (LIGHT, small thin number) rendered
 										// as a normal-size melee number on the host. Force the
 										// attacker's own rolled factors, exactly like damage/crit.
-										if (typeof root._mpForcedOff === 'number') du.baseOffensiveFactor = root._mpForcedOff;
-										if (typeof root._mpForcedDef === 'number') du.defensiveFactor = root._mpForcedDef;
+										if (typeof root._mpForcedOff === 'number') duF.baseOffensiveFactor = root._mpForcedOff;
+										if (typeof root._mpForcedDef === 'number') duF.defensiveFactor = root._mpForcedDef;
+									}
+									if (duList.length) {
 										// ROUND 80: weakness rides the same style block (drives the
 										// STRONG/WEAK appendix on the number). `a.weakness` is ALSO the
 										// break-bar progress (a NUMBER 0..1 set by the native
@@ -3775,15 +3864,16 @@ export class NetSync {
 						const r = origSpawn.call(this, type, x, y, z, settings, ...rest);
 						try {
 							const Enemy = (ig.ENTITY as any).Enemy;
-							// 1.76.x (heat-dng midboss co-op intro): a member's own event-spawned
-							// jellyfish adds are killed silently inside — the HOST's real copies
-							// (streamed via the normal block) are the killable ones. skipHook mod
-							// spawns (typed puppets incl. those very host jellyfish) never enter.
+							// 1.76.x (heat-dng midboss co-op intro) + 1.81.x (f3.room-07 golem
+							// arena): a member's own event-spawned jellyfish adds are killed
+							// silently inside — the HOST's real copies (streamed via the normal
+							// block) are the killable ones. skipHook mod spawns (typed puppets
+							// incl. those very host jellyfish) never enter.
 							const mSpawn: any = (window as any).__mpMain;
 							if (r && r instanceof Enemy && !r._mpMirror
 								&& !(settings && settings.skipHook)
-								&& mSpawn && mSpawn.netSync && typeof mSpawn.netSync.suppressMidbossAddSpawn === 'function'
-								&& mSpawn.netSync.suppressMidbossAddSpawn(r, settings)) {
+								&& mSpawn && mSpawn.netSync && typeof mSpawn.netSync.suppressMemberEventAddSpawn === 'function'
+								&& mSpawn.netSync.suppressMemberEventAddSpawn(r, settings)) {
 								return r;
 							}
 							if (r && r instanceof Enemy && !r._mpMirror
@@ -3874,6 +3964,11 @@ export class NetSync {
 						// ROUND 103: never acquire a dying/fading/roster-detached mirror.
 						if (!ent || ent._killed || ent._hidden || !ent.coll) continue;
 						if (ent._mpFadeOutUntil && Date.now() < ent._mpFadeOutUntil) continue;
+						// 1.81.x (corpse lock): never acquire a mirror whose owner just soft-died —
+						// the staged death keeps it "alive" for a ~500ms FX window and every
+						// acquire path below would otherwise re-pin the corpse until the delayed
+						// kill lands.
+						if ((ent as any)._mpDying || (pl as any)._mpSoftDead) continue;
 						if (m.players[name] && m.players[name].entity !== ent) continue;
 						out.push(ent);
 					}
@@ -3922,7 +4017,9 @@ export class NetSync {
 							if (t0 && t0._mpMirror) {
 								const m0 = (window as any).__mpMain;
 								const rec = m0 && m0.players && m0.players[t0.name];
-								const invalid = !rec || rec.entity !== t0 || t0._killed || !t0.coll
+								// 1.81.x: a staged-death (_mpDying) mirror is invalid NOW — don't wait
+								// the ~500ms FX window for the kill to free the enemy's lock.
+								const invalid = !rec || rec.entity !== t0 || t0._killed || !t0.coll || !!t0._mpDying
 									|| t0._hidden || (t0._mpFadeOutUntil && Date.now() < t0._mpFadeOutUntil);
 								if (invalid) {
 									if (enemy._mpEngaged && enemy._mpEngaged.name === t0.name) enemy._mpEngaged = null;
@@ -3939,7 +4036,41 @@ export class NetSync {
 						// mirror branch of onPreDamageModification), so a member who is merely
 						// IN RANGE of an enemy — not just one who attacked first — stays
 						// hittable instead of taking no damage until they close on the host.
-						this.parent(enemy);
+						// 1.81.x (corpse lock — the "monster keeps beating the death spot" fix):
+						// a soft-dead LOCAL player stays in the world as a walk-through corpse
+						// (manualKill blocks the engine kill, so it is NOT _killed), and vanilla
+						// target handling has NO defeat check on the local player: EnemyAnno.update's
+						// reselect, the parent updateTarget's proximity acquire and getEnemyTarget's
+						// candidate list all keep offering the corpse, while the distance lose-check
+						// never fires on a static one — enemies kept attacking the death position
+						// until respawn + loseTime (~3s) tore them off. While the local player is
+						// dead: drop the corpse target and run ONLY the vanilla distance lose-check
+						// (a mirror target must still de-aggro by range), skipping the parent's
+						// re-acquire entirely.
+						const nsDead: any = (window as any).__mpMain && (window as any).__mpMain.netSync;
+						const localDead = !!(nsDead && typeof nsDead.isLocalDead === 'function' && nsDead.isLocalDead());
+						try {
+							if (localDead && enemy.target && enemy.target === (ig.game as any).playerEntity) {
+								try { enemy.setTarget(null); } catch (_) { /* ignore */ }
+							}
+						} catch (_) { /* ignore */ }
+						if (localDead) {
+							// Vanilla lose-check replica (game.compiled.js EnemyType.updateTarget):
+							// tick targetLoseTimer while beyond loseDistance, drop at loseTime.
+							try {
+								if (enemy.target && !(sc as any).model.isForceCombat()) {
+									const tdL = this.targetDetect;
+									const dL = enemy.distanceTo(enemy.target);
+									enemy.targetLoseTimer = (tdL && tdL.loseDistance > 0 && dL > tdL.loseDistance)
+										? enemy.targetLoseTimer + ig.system.tick : 0;
+									if (tdL && tdL.loseTime > 0 && enemy.targetLoseTimer >= tdL.loseTime) {
+										try { enemy.setTarget(null); } catch (_) { /* ignore */ }
+									}
+								}
+							} catch (_) { /* never break target update */ }
+						} else {
+							this.parent(enemy);
+						}
 						// ROUND 118 (slope nav freeze): the enemy currently holds a MIRROR
 						// target but its NavPath has been failing. CrossCode caches a failed
 						// A* pair (`ig.navigation.cachedFailure`) and — while the searcher and
@@ -4099,7 +4230,8 @@ export class NetSync {
 								} catch (_) { holdBlock = false; }
 								if (holdBlock) {
 									enemy._mpEngaged = null;
-								} else if (mir && !mir._killed && !(pl && (pl as any)._mpCutscene) && enemy.setTarget) {
+																	// 1.81.x: don't re-pin a dying/soft-dead mirror (staged death FX window).
+									} else if (mir && !mir._killed && !(mir as any)._mpDying && !(pl && (pl as any)._mpCutscene) && !(pl && (pl as any)._mpSoftDead) && enemy.setTarget) {
 									let sameBlock = true;
 									try {
 										sameBlock = (ig.game as any).getLevelIdx(enemy.coll.pos.z)
@@ -4245,7 +4377,8 @@ export class NetSync {
 									// not keep re-piling locks onto the same player.
 									try {
 										const pl0: any = (ig.game as any).playerEntity;
-										if (pl0 && !pl0._killed && pl0.coll && enemy.setTarget) {
+										// 1.81.x: never hand the lock back to the soft-dead local corpse.
+										if (pl0 && !pl0._killed && !localDead && pl0.coll && enemy.setTarget) {
 											const dPl = enemy.distanceTo(pl0);
 											const dMir = enemy.distanceTo(mir);
 											const fairToHost = !nsF || typeof nsF.aggroCountFor !== 'function'
@@ -4371,7 +4504,16 @@ export class NetSync {
 					CombatProto.getEnemyTarget = function (this: any, enemy: any) {
 						const player = ig.game && (ig.game as any).playerEntity;
 						const pool: any[] = [];
-						if (player && !player._killed) pool.push(player);
+						// 1.81.x (corpse lock): a soft-dead local player is NOT _killed (the death-hold
+						// keeps the corpse entity in the world), so the old `!player._killed` test kept
+						// offering the death spot as a valid target and every reselect re-pinned it.
+						let localDeadPool = false;
+						try {
+							const m0d: any = (window as any).__mpMain;
+							const ns0d: any = m0d && m0d.netSync;
+							localDeadPool = !!(ns0d && typeof ns0d.isLocalDead === 'function' && ns0d.isLocalDead());
+						} catch (_) { localDeadPool = false; }
+						if (player && !player._killed && !localDeadPool) pool.push(player);
 						const partyAny: any = (sc as any).party;
 						const aiTargeting = partyAny && partyAny.ai && typeof partyAny.ai.targeting === 'number'
 							? partyAny.ai.targeting : 0;
@@ -4420,6 +4562,10 @@ export class NetSync {
 						if (aiTargeting > 0 && pool.length > 1 && Math.random() < aiTargeting) pool.splice(0, 1);
 						else if (aiTargeting < 0 && pool.length > 1 && Math.random() < -aiTargeting) pool.length = 1;
 						if (!pool.length) {
+							// 1.81.x: with the local player soft-dead the vanilla fallback would hand the
+							// corpse right back — return null so reselectTarget (`e && assignTarget`)
+							// simply gives up instead of re-pinning the death spot.
+							if (localDeadPool) return null;
 							try { return origGetEnemyTarget.call(this); } catch (_) { return player || null; }
 						}
 						return pool[Math.floor(Math.random() * pool.length)];
@@ -10444,6 +10590,9 @@ export class NetSync {
 				this._mpHostileLastPlayerCount = -1;
 				this._mpUidSeen = Object.create(null);
 				this._mpMapSeen = Object.create(null);
+				// 1.80.x (static/dynamic split): the new map's uids know nothing of
+				// the old map's static fields.
+				this._mpEnemyStatic = null;
 				// Round 24: the roster is unknown on the new map until both streams report a
 				// full block (stamps below reset), and reaping must wait for the first block.
 				this._mpFullBlockSeen = 0;
@@ -10768,7 +10917,10 @@ export class NetSync {
 		// every rendered frame, so integer granularity is invisible).
 		const snap: any = {
 			pos: { x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z) },
-			face: { x: face.x, y: face.y },
+			// 1.79.x (bandwidth): quantize face to 2 decimals — a diagonal walk's
+			// unit vector serializes as ~19-char floats otherwise (2x ~38B wasted
+			// per packet, and every micro-change re-triggered the edge gate).
+			face: { x: Math.round(face.x * 100) / 100, y: Math.round(face.y * 100) / 100 },
 			anim,
 			// 1.71.0 extern anim metadata (omitted from the wire while empty below).
 			xa,
@@ -10777,7 +10929,9 @@ export class NetSync {
 			// standing frozen in place reads as a bug — the player should visibly
 			// be GONE until respawn).
 			dead: this._mpDead ? 1 : 0,
-			hp: params.currentHp, maxHp: params.getStat ? params.getStat('hp') : 0,
+			// 1.79.x (bandwidth): round HP — after fractional damage the raw float
+			// carries ~17 decimals on EVERY packet (the HUD/mirrors only show ints).
+			hp: Math.round(params.currentHp), maxHp: params.getStat ? params.getStat('hp') : 0,
 			// Round 22 (opt 3): quantize sp/maxSp to integers. SP regen ticks move
 			// currentSp smoothly every frame — integer quantization keeps the
 			// change-gate from firing on every regen tick (a whole SP point = one
@@ -10923,22 +11077,29 @@ export class NetSync {
 			if (tok !== this._mpGuardLastSent) { this._mpGuardLastSent = tok; this._mpGuardGateToken++; }
 			snap.ggt = this._mpGuardGateToken;
 		} catch (_) { /* never break the state packet */ }
-		// Round 22 (opt 1) / Round 23 (hot-apply): cap + change-gate. A full packet every
-		// `getPlayerStateMs()` (the option-driven 10/20/30/60Hz floor, hot-applied live),
-		// plus IMMEDIATE packets between floors whenever an important field changed vs
-		// what we last sent.
+		// Round 22 (opt 1) / Round 23 (hot-apply) / 1.79.x (bandwidth): edge-gate +
+		// heartbeat. A full self-heal packet every getHealMs() (the server's healHz,
+		// clamped to the area cap), plus IMMEDIATE capped packets whenever an
+		// important field changed vs what we last sent (see shouldSendPlayerState).
 		const now = Date.now();
-		// Main-city refactor: in a shared town, position streams at 10Hz while the heavy
-		// player state (hp/sp/etc.) streams at 1Hz, so a 32-player room stays cheap. This
-		// bypasses the normal change-gated floor below.
+		// Main-city refactor: in a shared town the packet is position-light and the
+		// heavy player state (hp/sp/guard/defense) rides only the heartbeat. 1.79.x:
+		// the old fixed 10Hz/1Hz floors now derive from the SERVER's town relay cap
+		// + heal rate, and the same edge/heartbeat gate as the field path applies —
+		// a town full of STANDING players no longer streams 10Hz forever.
 		if (isSharedTownNow()) {
-			if (now - this._mpLastPlayerStateAt < 100) return; // 10Hz position floor
-			const includeState = (now - (this._mpTownStateAt || 0)) >= 1000;
+			if (!this.shouldSendPlayerState(now, snap)) return;
+			const includeState = (now - (this._mpTownStateAt || 0)) >= this.main.getHealMs();
 			const out: any = {
 				pos: snap.pos, face: snap.face, anim: snap.anim, dead: snap.dead,
 				cs: snap.cs, cg: snap.cg, xa: snap.xa, xf: snap.xf,
 				al: snap.al, ax: snap.ax, ay: snap.ay,
 				cax: snap.cax, cay: snap.cay, caz: snap.caz,
+				// 1.79.x: fl/gd also ride the light packet so the CANONICAL payload
+				// is complete for the binary/short-key encoders (they materialize
+				// these two flags unconditionally — an absent value would be
+				// invented on decode).
+				fl: snap.fl, gd: snap.gd,
 			};
 			if (includeState) {
 				out.hp = snap.hp; out.maxHp = snap.maxHp; out.sp = snap.sp; out.maxSp = snap.maxSp;
@@ -10982,28 +11143,47 @@ export class NetSync {
 		this.main.connection.updatePlayerState(out);
 	}
 
-	/** Round 22 (opt 1) / Round 23 (hot-apply): decide whether to EMIT a playerState
-	 * packet now. Enforces a FLOOR at the option-driven send rate — every
-	 * `getPlayerStateMs()` the full state always goes out, preserving the whole-state
-	 * self-healing contract (never pure-delta). The option is read LIVE each tick, so
-	 * changing it in the options tab hot-applies on the next packet. Between floors we
-	 * send IMMEDIATELY when an important field changed vs the last-sent snapshot:
-	 * dead/hp/maxHp/sp/maxSp/cg/cs/em/cl/anim, any face component, or the position
-	 * moved > 4px euclidean (XY). `now` = Date.now(); `snap` = the freshly-packed
-	 * (rounded) state. */
+	/** 1.79.x (bandwidth): decide whether to EMIT a playerState packet now. The
+	 * old every-frame FLOOR became a SELF-HEAL HEARTBEAT (getHealMs = the
+	 * server's healHz, clamped to the current area's relay cap): a full packet
+	 * goes out at that rate no matter what, preserving the whole-state
+	 * self-healing contract. Between heartbeats we send immediately — still
+	 * capped at min(own option rate, server area relay cap), so no upstream
+	 * packet is ever silently dropped by the relay throttle — whenever an
+	 * important field changed vs the last-sent snapshot (dead/hp/maxHp/sp/
+	 * maxSp/cg/cs/em/cl/anim, aim edges, guard token, status swings, any face
+	 * component, or position moved > 4px euclidean XY). While SOFT-DEAD or in a
+	 * cutscene the pinned pose is static: only the heartbeat flows, EXCEPT the
+	 * dead/cutscene FLAG flips themselves which stay immediate (mirrors must
+	 * despawn/respawn/fade at network latency). `now` = Date.now(); `snap` =
+	 * the freshly-packed (rounded) state. */
 	private shouldSendPlayerState(now: number, snap: any): boolean {
-		if (now - this._mpLastPlayerStateAt >= this.main.getPlayerStateMs()) return true;
 		const prev = this._mpLastPlayerStateSnap;
 		if (!prev) return true;
+		const healMs = this.main.getHealMs();
+		// Urgent flag flips bypass every cap (rare — at most twice per cycle).
 		if (snap.dead !== prev.dead) return true;
+		if (snap.cs !== prev.cs) return true;
+		// Pinned states (soft death / cutscene): static pose, heartbeat only —
+		// this kills the old per-frame death-pose stream.
+		if (this._mpDead || snap.cs) return (now - this._mpLastPlayerStateAt >= healMs);
+		if (this.playerStateChanged(snap, prev)) {
+			const capMs = Math.min(this.main.getPlayerStateMs(), 1000 / this.main.getAreaCapHz());
+			return (now - this._mpLastPlayerStateAt >= capMs);
+		}
+		return (now - this._mpLastPlayerStateAt >= healMs);
+	}
+
+	/** The important-field diff behind the playerState edge gate (semantics are
+	 * the old inline checks, extracted verbatim). */
+	private playerStateChanged(snap: any, prev: any): boolean {
 		if (snap.hp !== prev.hp) return true;
 		if (snap.maxHp !== prev.maxHp) return true;
 		if (snap.sp !== prev.sp) return true;
 		if (snap.maxSp !== prev.maxSp) return true;
 		if (snap.cg !== prev.cg) return true;
-		if (snap.cs !== prev.cs) return true;
 		// Aim-line edge: fade in/out must start at network latency, not at the
-		// next 10/30Hz floor. While the line is live, aim-direction / anchor
+		// next capped packet. While the line is live, aim-direction / anchor
 		// changes also ship immediately (values are already rounded).
 		if (snap.al !== prev.al) return true;
 		if (snap.al && (snap.ax !== prev.ax || snap.ay !== prev.ay)) return true;
@@ -11110,6 +11290,12 @@ export class NetSync {
 	/** 1.71.11: member-side replayed enemy-telegraph effect handles per puppet uid,
 	 * so the host's stop relay can end looping glows (see applyEnemyFxStop). */
 	private _enemyTelegraphFx: { [uid: number]: Array<{ sheet: string, key: string, handle: any, loop?: boolean }> } = {};
+	/** 1.78.x: last time a per-key enemyFx stop actually matched a tracked replay.
+	 * A duplicate per-key stop arriving right after the clear-wrap's per-key stop
+	 * for the same effect legitimately finds nothing — buffering a pending stop
+	 * for it would suppress the NEXT real spawn of that key for 5s (back-to-back
+	 * ShootAttacks). */
+	private _enemyFxLastStop: { [k: string]: number } = {};
 
 	/** 1.73.x: stops that arrived BEFORE the member's replayed copy materialized
 	 * (sheet still loading -> nothing tracked yet) used to be dropped, so a
@@ -11555,9 +11741,13 @@ export class NetSync {
 							}
 							// Hard lifetime cap: a looping replay whose stop packet is lost for ANY reason
 							// (host sheet unloaded at spawn, dropped packet, late spawn) must not run
-							// forever. 8s is far beyond every real windup/charge telegraph in the game
-							// (~1-4s), so a legit loop is never cut; an orphaned one self-heals.
-							try { if (typeof handle.duration === 'number' && handle.duration < 0) handle.duration = 8; } catch (_) { /* ignore */ }
+							// forever. 1.78.x: 8s was NOT beyond every legit loop — fight-state loops
+							// (heatGolemAura burns from aura-start until the knockdown, heatGolemSteamed
+							// steams through the whole WEAK phase) live far longer, so the member's
+							// burning/steam vanished mid-fight (member log: aura relayed at fight start,
+							// long dead by the first break). 120s is a pure orphan backstop — legit ends
+							// arrive via the per-handle stop relay / per-key clear stops / pending-stop.
+							try { if (typeof handle.duration === 'number' && handle.duration < 0) handle.duration = 120; } catch (_) { /* ignore */ }
 							if ((window as any)._mpFxDiag) console.log('[mpfx] MEMBER loopspawn uid=' + uid + ' ' + fx.sheet + '/' + fx.key + ' list=' + list.length); // ROUND 160: flag-gated
 						}
 						list.push({ sheet: fx.sheet, key: fx.key, handle, loop: isLoop });
@@ -11593,12 +11783,25 @@ export class NetSync {
 				}
 				if (!list.length) delete this._enemyTelegraphFx[uid];
 			}
-			if ((matchedLoop && (window as any)._mpFxDiag) || (!matched && (window as any)._mpFxStopDiag)) console.log('[mpfx] MEMBER fxstop uid=' + uid + ' ' + sheet + '/' + key + ' matched=' + matched); // ROUND 160: matched case flag-gated
+			if (matched) {
+				if (matchedLoop) console.log('[mpfx] MEMBER loopstop uid=' + uid + ' ' + sheet + '/' + key); // 1.78.x: always-on — once per loop end
+				this._enemyFxLastStop[uid + '|' + sheet + '|' + key] = Date.now();
+			}
+			if (!matched && (window as any)._mpFxStopDiag) console.log('[mpfx] MEMBER fxstop uid=' + uid + ' ' + sheet + '/' + key + ' matched=false');
 			if (!matched && sheet && key) {
-				const now = Date.now();
-				const stops = this._enemyFxPendingStop;
-				for (const k in stops) if (now - stops[k] > 5000) delete stops[k];
-				stops[uid + '|' + sheet + '|' + key] = now;
+				// 1.78.x: don't buffer when this key was JUST satisfied — the clear wrap's
+				// per-key stop arrives BEFORE the Effect.stop wrap's duplicate for the same
+				// effect (the clear wrap runs before the engine's entry.stop()), so the
+				// duplicate legitimately matches nothing; buffering it would suppress a real
+				// re-spawn for 5s (back-to-back ShootAttacks).
+				const pk = uid + '|' + sheet + '|' + key;
+				const lastAt = this._enemyFxLastStop[pk] || 0;
+				if (Date.now() - lastAt > 5000) {
+					const now = Date.now();
+					const stops = this._enemyFxPendingStop;
+					for (const k in stops) if (now - stops[k] > 5000) delete stops[k];
+					stops[pk] = now;
+				}
 			}
 		} catch (_) { /* ignore */ }
 	}
@@ -12331,7 +12534,7 @@ export class NetSync {
 					const old = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : measured;
 					e._mpProjWindowMs = Math.max(16, Math.min(250, old * 0.7 + measured * 0.3));
 				} else if (!(e._mpProjWindowMs > 0)) {
-					e._mpProjWindowMs = Math.max(16, Math.min(250, this.blockInterval * 1000));
+					e._mpProjWindowMs = Math.max(16, Math.min(250, this.hostileBlockInterval() * 1000));
 				}
 				e._mpProjBaseX = s.x; e._mpProjBaseY = s.y; e._mpProjBaseZ = s.z;
 				e._mpProjBaseAt = now;
@@ -13677,14 +13880,38 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		this.buildStoredUidSet();
 		this._mpBaseTimer -= ig.system.tick;
 		if (this._mpBaseTimer <= 0) {
-			this._mpBaseTimer = 1 / 15; // base stream: fixed ~15Hz (idle enemies)
+			this._mpBaseTimer = this.baseBlockInterval(); // base stream: idle enemies (area-capped)
 			this.sendBaseBlock();
 		}
 		this.sendTimer -= ig.system.tick;
 		if (this.sendTimer <= 0) {
-			this.sendTimer = this.blockInterval; // hostile stream: option-driven (30/60Hz)
+			this.sendTimer = this.hostileBlockInterval(); // hostile stream (field-capped)
 			this.sendHostileBlock();
 		}
+	}
+
+	/** 1.80.x (combat caps): the EFFECTIVE hostile-stream cadence =
+	 * min(server field relay cap, the 怪物同步频率 option). The server's 'H'
+	 * relay window uses the same field cap, so no packet we send in good faith
+	 * is dropped upstream (the old fixed blockInterval wasted up to 50% of the
+	 * uplink when the option exceeded the cap). Shared by the projectile and
+	 * playerBall streams (same combat cadence). */
+	private hostileBlockInterval(): number {
+		const opt = 1 / this.blockInterval;
+		const cap = (this.main && typeof (this.main as any).relayFieldHz === 'number' && (this.main as any).relayFieldHz > 0)
+			? (this.main as any).relayFieldHz : 30;
+		return 1 / Math.max(1, Math.min(cap, opt));
+	}
+
+	/** 1.80.x (combat caps): the EFFECTIVE base-stream cadence (idle enemies) =
+	 * min(server TOWN relay cap, the option) — idle enemies are cheap position
+	 * markers, so they ride the town cap even out in the field. The server's
+	 * 'B' relay window uses the same town cap. */
+	private baseBlockInterval(): number {
+		const opt = 1 / this.blockInterval;
+		const cap = (this.main && typeof (this.main as any).relayTownHz === 'number' && (this.main as any).relayTownHz > 0)
+			? (this.main as any).relayTownHz : 10;
+		return 1 / Math.max(1, Math.min(cap, opt));
 	}
 
 	/** Round 23: the quiet entityState stream — every live host enemy WITHOUT a current
@@ -13698,7 +13925,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		const Enemy = (ig.ENTITY as any).Enemy;
 		// Round 22 (opt 2): a FULL block roughly once per second keeps the delta
 		// self-healing — a late joiner or a dropped block recovers within a second.
-		this._mpBaseFullAccum += 1 / 15;
+		this._mpBaseFullAccum += this.baseBlockInterval();
 		let forceFull = this._mpBaseFullAccum >= 1;
 		if (forceFull) this._mpBaseFullAccum = 0;
 		// Round 22 (opt 2): a LATE JOINER (new remote mirror) gets a FULL block on its
@@ -13763,7 +13990,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		const out: IEnemySnap[] = [];
 		const list = ig.game.entities;
 		const Enemy = (ig.ENTITY as any).Enemy;
-		this._mpHostileFullAccum += this.blockInterval;
+		this._mpHostileFullAccum += this.hostileBlockInterval();
 		let forceFull = this._mpHostileFullAccum >= 1;
 		if (forceFull) this._mpHostileFullAccum = 0;
 		const playerCount = Object.keys(this.main.players || {}).length;
@@ -13813,7 +14040,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			mi: e.mapId || 0,
 			t: e.enemyName || (e.enemyType && (e.enemyType as any).name) || '',
 			x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
-			fx: face.x, fy: face.y,
+			// 1.80.x (combat bandwidth): quantize the unit face pair to 2 decimals —
+			// the raw floats printed 16-18 chars each (~28B wasted per enemy/block).
+			fx: Math.round(face.x * 100) / 100, fy: Math.round(face.y * 100) / 100,
 			a: typeof e.currentAnim === 'string' ? e.currentAnim : '',
 			h: e.params ? e.params.currentHp : 0,
 			m: e.params && e.params.getStat ? e.params.getStat('hp') : 0,
@@ -13881,12 +14110,49 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		// real position through the burrow->emerge cycle (the >250px snap branch in
 		// interpolatePuppets teleports it instantly on emerge).
 		const burrowed = this._mpEnemyUntargetable(e);
-		if (forceFull || burrowed || !prev || this.enemySnapChanged(prev, snap)) {
+		// 1.80.x (static/dynamic split): in the c/d wire modes the STATIC field set
+		// (mi/t/m/msp/tos/ats/nm/mk — everything that only changes on spawn/handoff)
+		// rides the FIRST appearance, the ~1s force-full heartbeat and late-joiner
+		// blocks; a merely-dynamic change ships a stripped entry and the RECEIVER
+		// merges its per-uid static cache (the server merges its own cache for
+		// legacy receivers). Legacy mode keeps today's behavior: any change ships
+		// the FULL snapshot.
+		const split = !!(this.main as any).mpNetSchema && (this.main as any).mpNetSchema !== 'legacy';
+		if (forceFull || burrowed || !prev
+			|| (split ? this.enemyStaticChanged(prev, snap) : this.enemySnapChanged(prev, snap))) {
 			deltaMap.set(e.uid, snap);
 			out.push(snap);
+		} else if (split && this.enemySnapChanged(prev, snap)) {
+			deltaMap.set(e.uid, snap);
+			out.push(this.stripEnemyStatic(snap));
 		} else {
 			out.push({ i: e.uid } as IEnemySnap);
 		}
+	}
+
+	/** 1.80.x (static/dynamic split): the fields that never change for a given
+	 * enemy uid once it exists (only on spawn / host handoff). Compared with
+	 * undefined-normalized defaults so an appearing/disappearing optional field
+	 * (nm/mk/ats) still forces a full snapshot. */
+	private enemyStaticChanged(a: IEnemySnap, b: IEnemySnap): boolean {
+		if ((a.mi || 0) !== (b.mi || 0)) return true;
+		if ((a.t || '') !== (b.t || '')) return true;
+		if ((a.m || 0) !== (b.m || 0)) return true;
+		if ((a.msp || 0) !== (b.msp || 0)) return true;
+		if ((a.tos || 0) !== (b.tos || 0)) return true;
+		if ((a.ats || '') !== (b.ats || '')) return true;
+		if ((a.nm || '') !== (b.nm || '')) return true;
+		if ((a.mk || '') !== (b.mk || '')) return true;
+		return false;
+	}
+
+	/** 1.80.x (static/dynamic split): the wire form of a dynamic-only entry —
+	 * the full snapshot minus the 8 static fields. */
+	private stripEnemyStatic(s: IEnemySnap): IEnemySnap {
+		const out: any = Object.assign({}, s);
+		delete out.mi; delete out.t; delete out.m; delete out.msp;
+		delete out.tos; delete out.ats; delete out.nm; delete out.mk;
+		return out as IEnemySnap;
 	}
 
 	/** Round 23: prune a stream's delta map of uids that left the block (killed /
@@ -15497,8 +15763,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (!conn || !conn.isOpen()) return;
 			this._mpProjSendTimer -= ig.system.tick;
 			if (this._mpProjSendTimer > 0) return;
-			this._mpProjSendTimer = this.blockInterval;
+			this._mpProjSendTimer = this.hostileBlockInterval();
 			const list: any[] = [];
+			// 1.78.x (flame-ring stream starvation): CombatProxyEntity entries (the
+			// golem's circling flame ring, rocks, icicles) are FEW but LONG-LIVED —
+			// when Ball/Stone spam (the golem's 30-proxy ShootAttack) filled the
+			// shared 64-entry cap first, the ring dropped out of the stream for whole
+			// bursts and member copies reap-flickered (vanish + respawn churn reads
+			// as the flames blinking/stacking). Proxies collect into their own list
+			// and ride the block FIRST; balls fill the remainder.
+			const plist: any[] = [];
 			const entities = ig.game.entities;
 			const Projectile = (ig.ENTITY as any).Projectile;
 			const Stone = (ig.ENTITY as any).Stone;
@@ -15596,7 +15870,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					}
 					if (!pn) continue;
 					const vel = e.coll.vel || { x: 0, y: 0 };
-					list.push({
+					plist.push({
 						i: e.uid, k: 'G', src, pn,
 						x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
 						vx: Math.round(vel.x), vy: Math.round(vel.y),
@@ -15606,10 +15880,13 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						// ~0.4s stale-reap (which read as "the guest never sees it shatter").
 						d: e.destroyType ? 1 : 0,
 					});
-					if (list.length >= 64) break;
+					if (plist.length >= 64) break;
 				}
 			}
-			if (!list.length) return;
+			// 1.78.x: merge proxies FIRST (long-lived, must never starve), then balls
+			// up to the wire cap (the server rejects blocks over 128 entries).
+			const merged: any[] = plist.length ? plist.concat(list).slice(0, 128) : list;
+			if (!merged.length) return;
 			// ROUND 156 diag (antlion rocks/claws): confirm the block actually leaves the
 			// host (1/s throttle — the stream runs at blockInterval).
 			if (this._mpProjDiagMap()) {
@@ -15617,11 +15894,11 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				if (nowS - this._mpProjDiagLastSend > 1000) {
 					this._mpProjDiagLastSend = nowS;
 					let g = 0;
-					for (const it of list) { if (it.k === 'G') g++; }
-					console.log('[mpproj] host SEND n=' + list.length + ' G=' + g + ' map=' + this.mapName);
+					for (const it of merged) { if (it.k === 'G') g++; }
+					console.log('[mpproj] host SEND n=' + merged.length + ' G=' + g + ' map=' + this.mapName);
 				}
 			}
-			conn.updateProjectileState(this.mapName, list);
+			conn.updateProjectileState(this.mapName, merged);
 		} catch (_) { /* never break the frame */ }
 	}
 
@@ -15668,6 +15945,15 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 								if (e.effects && e.effects.onKill && typeof e.destroy === 'function') e.destroy();
 								else e.kill(true);
 							} catch (_) { /* ignore */ }
+							// 1.78.x (zombie-copy guard, d-path): a failed kill must NOT drop the
+							// bookkeeping — deleting the entry would orphan a LIVE copy (a flame
+							// ring circling its puppet forever). Retry the hard kill; if even that
+							// fails, stale-mark the copy and KEEP the entry so the sweep in
+							// reapStaleProjectiles finishes it instead of respawning it.
+							if (!e._killed) {
+								try { if (typeof e.kill === 'function') e.kill(true); } catch (_) { /* ignore */ }
+								if (!e._killed) { e._mpProjSeen = 0; continue; }
+							}
 						}
 						delete this.projectiles[s.i as any];
 						continue;
@@ -15751,7 +16037,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					const old = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : measured;
 					e._mpProjWindowMs = Math.max(16, Math.min(250, old * 0.7 + measured * 0.3));
 				} else if (!(e._mpProjWindowMs > 0)) {
-					e._mpProjWindowMs = Math.max(16, Math.min(250, this.blockInterval * 1000));
+					e._mpProjWindowMs = Math.max(16, Math.min(250, this.hostileBlockInterval() * 1000));
 				}
 				e._mpProjBaseX = s.x; e._mpProjBaseY = s.y; e._mpProjBaseZ = s.z;
 				e._mpProjBaseAt = now;
@@ -15984,6 +16270,19 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				if (action && action.rootStep) {
 					const kept: any[] = [];
 					let cur = action.rootStep;
+					// 1.78.x (darth-moth laser invisible on members): MOVE_FORWARD is the
+					// laser proxy's TIMELINE anchor — the host's beam lives exactly as long
+					// as the 0.8s sweep, then CLEAR_EFFECTS ends it. With the step stripped,
+					// the member's cloned chain hit CLEAR_EFFECTS the SAME FRAME the beam
+					// spawned — zero lifetime, completely invisible along with the
+					// ground-hit sparks looping inside the beam effect. The copy's POSITION
+					// stays stream-driven (the _mpProxyLerp dead-reckon below), so substitute
+					// a plain WAIT of the step's declared `time`: the action timeline (and
+					// thus the beam's lifespan) matches the host without handing position
+					// authority to native motion. Only MOVE_FORWARD carries an exact `time`;
+					// distance/maxTime-capped moves would overshoot, so they stay dropped.
+					const WAIT_STEP: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.WAIT;
+					const MOVE_FWD_STEP: any = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.MOVE_FORWARD;
 					while (cur) {
 						if (!isHostOnly(cur)) {
 							const clone = Object.assign(Object.create(Object.getPrototypeOf(cur)), cur);
@@ -16024,6 +16323,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 								clone.branches = nb;
 							}
 							kept.push(clone);
+						} else if (MOVE_FWD_STEP && WAIT_STEP && cur instanceof MOVE_FWD_STEP
+							&& typeof (cur as any).time === 'number' && (cur as any).time > 0) {
+							kept.push(new WAIT_STEP({ time: (cur as any).time }));
 						}
 						cur = cur._nextStep;
 					}
@@ -16034,8 +16336,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// WAIT leaves the appear effect to finish (alpha 1 + grow) and lets the reap kill the
 					// copy silently once the host stops streaming this projectile.
 					try {
-						const WAIT = (ig as any).ACTION_STEP && (ig as any).ACTION_STEP.WAIT;
-						if (WAIT) kept.push(new WAIT({ time: 1000000 }));
+						if (WAIT_STEP) kept.push(new WAIT_STEP({ time: 1000000 }));
 					} catch (_) { /* ignore */ }
 					if (kept.length && typeof e.setAction === 'function') {
 						for (let i = 0; i < kept.length - 1; i++) kept[i]._nextStep = kept[i + 1];
@@ -16113,6 +16414,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			}
 			e._mpProj = true;
 			e._mpRockNative = true;
+			e._mpProxyPn = s.pn; // 1.78.x: proxy-name stamp for the zombie-sweep log
 			return e;
 		} catch (err) {
 			// ROUND 156 diag: a swallowed exception here was the prime suspect for the
@@ -16138,7 +16440,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (!conn || !conn.isOpen() || typeof conn.playerBall !== 'function') return;
 			this._mpPlayerBallSendTimer -= ig.system.tick;
 			if (this._mpPlayerBallSendTimer > 0) return;
-			this._mpPlayerBallSendTimer = this.blockInterval;
+			this._mpPlayerBallSendTimer = this.hostileBlockInterval();
 			// dungeon gate (bounce puzzles live in dungeons)
 			const sm: any = (sc as any).map;
 			if (!(sm && typeof sm.isDungeon === 'function' && sm.isDungeon())) return;
@@ -16151,6 +16453,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (this._mpBallStreamMapName !== this.mapName) {
 				this._mpBallStreamMapName = this.mapName;
 				this._mpBallStreamAlive = {};
+				this._mpBallStaticSent = {};
 			}
 			const prevAlive: any = this._mpBallStreamAlive || {};
 			const aliveNow: any = {};
@@ -16188,15 +16491,30 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				try { el = (e.attackInfo && typeof e.attackInfo.element === 'number') ? e.attackInfo.element : 0; } catch (_) { el = 0; }
 			let chg = 0;
 			try { chg = (e.attackInfo && typeof e.attackInfo.hasHint === 'function' && e.attackInfo.hasHint('CHARGED')) ? 1 : 0; } catch (_) { chg = 0; }
-				list.push({
-					i: e.uid, el, chg,
-					// 1.75.x: the matched proxy name drives the receiver's visual pick
-					// (skill projectiles keep their real look; omitted for key/assault
-					// balls, which never reach this loop anyway).
-					pn: matchedPn || undefined,
-					x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
-					vx: Math.round(vel.x), vy: Math.round(vel.y),
-				});
+				// 1.80.x (combat bandwidth): el/chg/pn never change during a ball's
+				// ~1-2s flight — ship them only on the ball's FIRST block; follow-up
+				// blocks carry i/x/y/z/vx/vy and receivers merge their per-uid cache
+				// (the server merges for legacy receivers). Legacy mode ships full.
+				const staticSent = !!(this._mpBallStaticSent as any)[e.uid];
+				const split = !!(this.main as any).mpNetSchema && (this.main as any).mpNetSchema !== 'legacy';
+				if (split && staticSent) {
+					list.push({
+						i: e.uid,
+						x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
+						vx: Math.round(vel.x), vy: Math.round(vel.y),
+					});
+				} else {
+					list.push({
+						i: e.uid, el, chg,
+						// 1.75.x: the matched proxy name drives the receiver's visual pick
+						// (skill projectiles keep their real look; omitted for key/assault
+						// balls, which never reach this loop anyway).
+						pn: matchedPn || undefined,
+						x: Math.round(e.coll.pos.x), y: Math.round(e.coll.pos.y), z: Math.round(e.coll.pos.z),
+						vx: Math.round(vel.x), vy: Math.round(vel.y),
+					});
+					if (split) (this._mpBallStaticSent as any)[e.uid] = 1;
+				}
 				aliveNow[e.uid] = 1;
 				if (list.length >= 32) break;
 			}
@@ -16221,6 +16539,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				}
 				if (stillAlive) { aliveNow[uidStr] = 1; continue; }
 				list.unshift({ i: di, dead: 1 });
+				delete (this._mpBallStaticSent as any)[uidStr];
 			}
 			this._mpBallStreamAlive = aliveNow;
 			if (!list.length) return;
@@ -16240,7 +16559,35 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (!data.map || data.map !== this.mapName) return;   // ball for a map we left
 			if (data.from && data.from === this.main.name) return; // own echo (defensive)
 			const now = Date.now();
-			for (const s of data.entries) {
+			// 1.80.x (combat bandwidth) MERGE PASS: follow-up entries carry only
+			// i/x/y/z/vx/vy — merge the per-key static cache (el/chg/pn absorbed
+			// from the ball's first entry); dead markers free the slot. A missed
+			// first entry drops the ball (1-2s lifetime, no heartbeat by design).
+			let entries = data.entries;
+			{
+				// Cap guard: dead markers normally drain the table; this clears
+				// stragglers from a disconnected sender (max 32 entries/block).
+				if (Object.keys(this._mpBallStaticRx).length > 256) this._mpBallStaticRx = Object.create(null);
+				const merged: any[] = [];
+				for (const s of entries) {
+					if (!s || typeof s.i !== 'number') continue;
+					const key0 = 'pb_' + (data.from || '?') + '_' + s.i;
+					if (s.dead === 1) {
+						delete this._mpBallStaticRx[key0];
+						merged.push(s);
+						continue;
+					}
+					if (s.el === undefined && s.pn === undefined) {
+						const st = this._mpBallStaticRx[key0];
+						if (st) merged.push(Object.assign({}, st, s));
+						continue; // no static yet — skip this ball until its first entry
+					}
+					this._mpBallStaticRx[key0] = { el: s.el, chg: s.chg, pn: s.pn };
+					merged.push(s);
+				}
+				entries = merged;
+			}
+			for (const s of entries) {
 				if (!s || typeof s.i !== 'number') continue;
 				const key = 'pb_' + (data.from || '?') + '_' + s.i;
 				// 1.74.x: DEAD marker — the thrower's ball died since its last live entry
@@ -16320,7 +16667,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					const old = (typeof e._mpProjWindowMs === 'number' && e._mpProjWindowMs > 0) ? e._mpProjWindowMs : measured;
 					e._mpProjWindowMs = Math.max(16, Math.min(250, old * 0.7 + measured * 0.3));
 				} else if (!(e._mpProjWindowMs > 0)) {
-					e._mpProjWindowMs = Math.max(16, Math.min(250, this.blockInterval * 1000));
+					e._mpProjWindowMs = Math.max(16, Math.min(250, this.hostileBlockInterval() * 1000));
 				}
 				e._mpProjBaseX = s.x; e._mpProjBaseY = s.y; e._mpProjBaseZ = s.z;
 				e._mpProjBaseAt = now;
@@ -16936,6 +17283,23 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				const pe: any = pents[i];
 				if (pe && pe._mpProxyVisual && !pe._killed && now - (pe._mpProxyVisualBorn || 0) > 25000) {
 					try { pe.kill(true); } catch (_) { /* ignore */ }
+				}
+				// 1.78.x (heat-golem flame-ring ZOMBIE sweep): a G-kind stream copy is owned
+				// ONLY by the host stream — its _mpProjSeen refreshes solely in
+				// applyProjectileState. If ANY bookkeeping hole orphaned a live copy (a
+				// deleted this.projectiles entry, a kill path that silently failed), the
+				// map loop below can never reach it and it circles its puppet forever,
+				// stacking with every later legit copy (the golem's post-break flame ring).
+				// The staleness stamp lives ON the entity, independent of the bookkeeping:
+				// no host block for >300ms (or a d-path stale-mark) -> kill silently.
+				if (pe && !pe._killed && pe._mpProj && pe._mpRockNative) {
+					const seenAt: number = (typeof pe._mpProjSeen === 'number' && pe._mpProjSeen > 0)
+						? pe._mpProjSeen : (pe._mpProjBorn || now);
+					if (now - seenAt > 300) {
+						console.log('[mpproj] zombie-sweep kill pn=' + ((pe as any)._mpProxyPn || '?')
+							+ ' ageMs=' + (now - (pe._mpProjBorn || seenAt)) + ' staleMs=' + (now - seenAt));
+						try { pe.kill(true); } catch (_) { /* ignore */ }
+					}
 				}
 			}
 			// 1.74.x: expire hit-kill tombstones (>500ms) so a FUTURE throw with a
@@ -18712,6 +19076,23 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			try { if (pl) (pl as any)._mpSoftDead = true; } catch (_) { /* ignore */ }
 			// A dead player's aim line fades out immediately (the mirror is gone).
 			try { if (pl) (pl as any)._mpAimLine = false; } catch (_) { /* ignore */ }
+			// 1.81.x (corpse lock): detach every enemy still locked on the dying mirror
+			// NOW — the staged kill below only frees them via the ROUND 103 updateTarget
+			// check ~500ms later (after the death FX window), which read as monsters
+			// beating the corpse for a while before switching. Handles host enemies and
+			// member puppets alike (the puppet _mpTg aggro lock is lifted first, exactly
+			// like the ROUND 32 own-death clear). Idempotent; runs per dead-state packet.
+			try {
+				const entT: any = pl && pl.entity;
+				if (entT && Array.isArray(entT.targetedBy)) {
+					for (const tb of entT.targetedBy.slice()) {
+						if (!tb || tb._killed || !tb.setTarget) continue;
+						try { if (tb._mpEngaged && tb._mpEngaged.name === player) tb._mpEngaged = null; } catch (_) { /* ignore */ }
+						try { tb._mpTg = false; } catch (_) { /* ignore */ }
+						try { tb.setTarget(null); } catch (_) { /* ignore */ }
+					}
+				}
+			} catch (_) { /* ignore */ }
 			if (pl && pl.entity && !(pl.entity as any)._killed) {
 				const entD: any = pl.entity;
 				// Fix 3: clear pending interpolation targets so the corpse never drifts
@@ -19121,9 +19502,37 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		// Build a mapId -> live map-enemy index ONCE per block (not per puppet) so
 		// ensurePuppet's adoption lookup is O(1) instead of re-scanning all ~550 entities
 		// for every unadopted enemy in the block (that was the member-side frame hitch).
+		// 1.80.x (static/dynamic split) MERGE PASS: a dynamic-only entry carries no
+		// static keys — merge the per-uid static cache (absorbed from static-bearing
+		// entries) BEFORE the loop below reads t/mi/m/msp/tos/ats/nm/mk. A cache miss
+		// (lost the very first block) drops the entry; the ~1s force-full heartbeat
+		// re-ships everything full so the puppet appears within a second.
+		let list2 = list;
+		if (list.length) {
+			list2 = [];
+			for (const s of list) {
+				if (!s || typeof s.i !== 'number') { list2.push(s); continue; }
+				if (s.t !== undefined) {
+					// A static-bearing entry refreshes the cache wholesale (a field
+					// that disappeared on the host must not linger in the cache).
+					if (!this._mpEnemyStatic) this._mpEnemyStatic = new Map();
+					this._mpEnemyStatic.set(s.i, {
+						mi: s.mi, t: s.t, m: s.m, msp: s.msp, tos: s.tos, ats: s.ats, nm: s.nm, mk: s.mk,
+					});
+					if (this._mpEnemyStatic.size > 1024) this._mpEnemyStatic.delete(this._mpEnemyStatic.keys().next().value);
+					list2.push(s);
+				} else if (typeof s.x === 'number') {
+					const st = this._mpEnemyStatic ? this._mpEnemyStatic.get(s.i) : undefined;
+					if (st) list2.push(Object.assign({}, st, s) as IEnemySnap);
+					// else: no cache yet -> wait for the next full block
+				} else {
+					list2.push(s); // bare liveness marker
+				}
+			}
+		}
 		let mapEnemyIdx: { [mapId: number]: any } | null = null;
 		let localQuestIds: { [mapId: number]: boolean } | null = null;
-		for (const s of list) {
+		for (const s of list2) {
 			if (!s || typeof s.i !== 'number') continue;
 			// 1.75.x (per-player quest waves): a VISIBLE member-owned tmp.quest_* enemy
 			// must never be re-adopted from the host's hidden copy of the same mapId —
@@ -19215,8 +19624,12 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// Round 19 (Part 4): while the LOCAL player is in a cutscene, puppets
 					// must NOT re-aggro us (we can't defend mid-story). We still drop any
 					// existing player-target; we just never acquire/re-acquire it.
-					if (aimedAtMe && !this.inCutscene) { if (pl && !e.target && !e._killed) e.setTarget(pl); }
-					else if (pl && e.target === pl && !aimedAtMe) e.setTarget(null);
+					// 1.81.x (corpse lock): while the LOCAL player is soft-dead, never let a puppet
+					// (re)acquire the corpse from a stale tg window — the host drops the target on
+					// its side immediately now, but in-flight blocks can still carry the old lock
+					// for a packet or two. Lift the _mpTg guard so the clear actually lands.
+					if (aimedAtMe && !this.inCutscene && !this._mpDead) { if (pl && !e.target && !e._killed) e.setTarget(pl); }
+					else if (pl && e.target === pl && (!aimedAtMe || this._mpDead)) { try { e._mpTg = false; } catch (_) { /* ignore */ } e.setTarget(null); }
 					// ROUND 31 (item 5): an ENGAGED puppet (one the member attacked — see
 					// forwardEnemyDamage) whose engine lose-check just dropped its target is
 					// re-pinned here every block, decoupled from member hit cadence and from
@@ -19229,7 +19642,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// enemy at someone (tg on) and it just isn't aimed at us, do NOT re-pin a
 					// fake local target — that would flip the bar red on us while the host
 					// enemy is actually fighting elsewhere.
-					if (!tgNow && !this.inCutscene && pl && !e.target && !e._killed && e._mpEngaged && e.setTarget) {
+					if (!tgNow && !this.inCutscene && !this._mpDead && pl && !e.target && !e._killed && e._mpEngaged && e.setTarget) {
 						try { e.setTarget(pl); e.targetLoseTimer = 0; } catch (_) { /* ignore */ }
 					}
 					// ROUND 47 (the "stays red forever" fix): once the HOST says this enemy
@@ -19631,8 +20044,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * silver guard number. Each streamed shield is reconstructed as the SAME
 	 * COMBAT_SHIELDS class with the SAME numeric fields, so the puppet's native
 	 * isShielded reproduces the host's factor / hitResist / stableOverride / direction
-	 * gates exactly. Synced connections are tagged (_mpShieldSync) so shields from any
-	 * other source are left untouched; an absent/empty list clears only synced ones.
+	 * gates exactly. Synced connections are tagged (_mpShieldSync); since 1.78.x the detach pass
+	 * also strips UNTAGGED connections — on a puppet those are native leftovers from
+	 * locally-fired hit reactions, and the host stream owns the list end-to-end.
 	 * duration is pinned to -1 (no timer expiry) — attach/detach is host-driven via the
 	 * stream. Shield visual FX (domes) are NOT reproduced; damage correctness is the
 	 * goal. */
@@ -19689,9 +20103,25 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// detaches the old connection; the attach pass below re-creates it fresh.
 			for (let i = e.shieldsConnections.length; i--;) {
 				const c: any = e.shieldsConnections[i];
-				if (!c || !c._mpShieldSync) continue;
-				const key = ((c.shield && c.shield.name) || '') + '|' + c._mpShieldKind;
-				if (want[key] && this.shieldSnapMatches(c.shield, want[key])) continue;
+				if (!c) continue;
+				if (c._mpShieldSync) {
+					const key = ((c.shield && c.shield.name) || '') + '|' + c._mpShieldKind;
+					if (want[key] && this.shieldSnapMatches(c.shield, want[key])) continue;
+				} else {
+					// 1.78.x (golem break-guard desync): an UNMARKED connection is a NATIVE
+					// shield — on a puppet it can only come from a LOCALLY-fired hit
+					// reaction (the golem's ICE_DISK WeakStart / RING_BREAK run their
+					// ADD_SHIELD steps on the puppet even though its AI never runs). The
+					// host stream owns the puppet's shield list end-to-end: a native conn
+					// stacks its guard factor on top of the synced one (break-state hits
+					// still reading 格挡) and, being name-keyed, survives every later sync
+					// pass forever. Strip it — the attach pass re-creates anything the
+					// host actually reports. (A local REMOVE_SHIELD likewise can't shake
+					// the synced set for more than one block.)
+					this._mpProjDiagOnce('shN' + (e._mpUid || 0) + ((c.shield && c.shield.name) || '?'),
+						'[mpshield] stripped NATIVE shield conn on puppet uid=' + (e._mpUid || 0)
+						+ ' name=' + ((c.shield && c.shield.name) || '?') + ' bf=' + (c.shield && c.shield.baseFactor));
+				}
 				try {
 					if (typeof e.removeShield === 'function') e.removeShield(c);
 					else e.shieldsConnections.splice(i, 1);
@@ -19867,32 +20297,53 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* never break the show path */ }
 	}
 
-	/** heat-dng midboss co-op intro: the boss-appear chain (bossAppars /
-	 * jellyfishRespawn events) runs on EVERY client once the relayed intro
-	 * replay sets map.bossIntro locally, and it SPAWN_ENEMYs heat.jellyfish
-	 * adds. Only the HOST's copies are real, killable enemies (they reach
+	/** Member-side suppression of event-spawned heat.jellyfish arena adds.
+	 * Two heat-dng battles replay their enemy-spawning events on EVERY client
+	 * while only the HOST's copies are real, killable enemies (they reach
 	 * members through the normal enemy block) — a member's own copies would
-	 * fight the local player AND stream out as invincible csPuppet ghosts.
+	 * fight the local player AND stream out as invincible csPuppet ghosts:
+	 *  - f1/midboss: the boss-appear chain (bossAppars / jellyfishRespawn)
+	 *    runs on every client once the relayed intro sets map.bossIntro.
+	 *  - f3/room-07 (1.81.x): the golem-arena BattleStart — relayed via
+	 *    cutsceneRelay.isF3GolemBattleTrigger since 1.81.x — SPAWN_ENEMYs two
+	 *    jellyfish, and the member-side JellySpawner loop (tmp.jellyfishSpawn)
+	 *    keeps spawning its own copies while the member's activeCnt lags the
+	 *    puppet stream.
 	 * Called from the Game.spawnEntity wrap: when this returns true the spawn
 	 * was killed silently and must not be flagged/streamed. Suppression needs
-	 * the whole set: MEMBER side, midboss map, a heat.jellyfish event spawn,
-	 * the fight chain live locally (map.bossIntro set by enter/bossAppars on
-	 * any path), and the host present (fresh enemy blocks) — a member alone
-	 * on the map (host elsewhere, no blocks) keeps its own adds so the
-	 * member-owned solo fight stays vanilla-complete. */
-	public suppressMidbossAddSpawn(r: any, settings: any): boolean {
+	 * the whole set: MEMBER side, a covered map, a heat.jellyfish event spawn,
+	 * the fight chain live locally (map.bossIntro / tmp.barrierUp set on any
+	 * path), and the host present (fresh enemy blocks) — a member alone on the
+	 * map (host elsewhere, no blocks) keeps its own adds so the member-owned
+	 * solo fight stays vanilla-complete. */
+	public suppressMemberEventAddSpawn(r: any, settings: any): boolean {
 		try {
 			if (!r || r._killed || this.main.host) return false;
 			const map = this.mapName || '';
-			if (map !== 'heat-dng/f1/midboss' && map !== 'heat-dng.f1.midboss') return false;
 			const t = (settings && settings.enemyInfo && typeof settings.enemyInfo.type === 'string')
 				? settings.enemyInfo.type : ((r && r.enemyName) || '');
 			if (t !== 'heat.jellyfish') return false;
 			const vars: any = (ig as any).vars;
-			if (!vars || typeof vars.get !== 'function' || !vars.get('map.bossIntro')) return false;
+			if (!vars || typeof vars.get !== 'function') return false;
 			if (Date.now() - this._mpLastBlockAt > 3000) return false; // host not on this map
+			if (map === 'heat-dng/f1/midboss' || map === 'heat-dng.f1.midboss') {
+				// midboss arena: adds spawn once the boss-appear chain set map.bossIntro.
+				if (!vars.get('map.bossIntro')) return false;
+			} else if (map === 'heat-dng/f3/room-07' || map === 'heat-dng.f3.room-07') {
+				// 1.81.x (f3.room-07 golem-arena opener): the room's BattleStart is a
+				// ONCE_PER_ENTRY trigger on the PER-CLIENT tmp.battleStart, so a member
+				// crossing the strip fired it locally only (now relayed via
+				// cutsceneRelay.isF3GolemBattleTrigger). Every client's replay/native
+				// run SPAWN_ENEMYs two jellyfish, and the member-side JellySpawner
+				// (tmp.jellyfishSpawn) keeps re-spawning its own copies — all of them
+				// must stay host-owned. tmp.barrierUp is set by the (possibly relayed)
+				// BattleStart before its first SPAWN_ENEMY and cleared by BattleEnd,
+				// so it marks exactly the sealed-battle window; the post-battle chest
+				// spawners (map.spawnChest) run after it drops and stay unaffected.
+				if (!vars.get('tmp.barrierUp')) return false;
+			} else return false;
 			try { r.kill(true); } catch (_) { /* silent kill is best-effort */ }
-			console.log('[netsync] midboss jellyfish add suppressed (host owns the adds)');
+			console.log('[netsync] member-side jellyfish add suppressed (host owns the adds, map=' + map + ')');
 			return true;
 		} catch (_) { return false; }
 	}
@@ -20138,6 +20589,78 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// host's true value within a block.
 			try { if ((e as any).currentAction && typeof (e as any).cancelAction === 'function') (e as any).cancelAction(); } catch (_) { /* ignore */ }
 			try { e.invincibleTimer = 0; } catch (_) { /* ignore */ }
+			// 1.78.x (heat-golem flame ring, native-copy fix): the member's OWN map enemy
+			// spawns natively when the relayed trigger flips its spawn var (room-05's
+			// tmp.golem) and runs its REAL AI for the few frames until this adoption lands
+			// — HeatAuraStart natively fires SHOOT_PROXY flameRing + ADD_SHIELD aura 0.1 +
+			// a looping aura FX (member log: '[mpshield] stripped NATIVE shield conn ...
+			// aura bf=0.1' right at adoption proves the whole action ran). The NATIVE ring
+			// is no _mpProj stream copy, so no reap/sweep path ever removes it: the host's
+			// RING_BREAK kills only the stream copy, the native ring keeps circling (破防后
+			// 火焰不消失) and stacks with the regen copy (特效叠加); it also feeds the
+			// puppet's local HAS_PROXY condition, so the local RING_BREAK fired only when
+			// the member's own 8-hit tracker filled — the "sometimes" of the report.
+			// Purge every native CombatProxyEntity / shield conn / looping attached effect
+			// at adoption — the host streams proxies as G-kind copies, shields via the
+			// enemy block and effects via the FX relay, so the puppet ends up a clean
+			// telepresence. (Whether the local AI wins the pre-adoption race varies frame
+			// to frame; the purge makes both outcomes converge.)
+			try {
+				const CPE: any = (sc as any).CombatProxyEntity;
+				const purgeNativeProxy = (list: any[]) => {
+					for (let i = list.length; i--;) {
+						const p: any = list[i];
+						if (p && CPE && p instanceof CPE && !(p as any)._mpProj && !p._killed) {
+							try { if (typeof p.destroy === 'function') p.destroy(); else p.kill(true); }
+							catch (_) { try { p.kill(true); } catch (_) { /* ignore */ } }
+						}
+					}
+				};
+				if (CPE) {
+					if (Array.isArray((e as any).entityAttached)) purgeNativeProxy((e as any).entityAttached);
+					if (Array.isArray((e as any).actionAttached)) purgeNativeProxy((e as any).actionAttached);
+				}
+			} catch (_) { /* best effort */ }
+			// Native shield conns from the same pre-adoption AI burst — syncPuppetShields
+			// strips them at the next full block anyway; doing it here just shortens the
+			// double-guard window to zero.
+			try {
+				const conns: any[] = (e as any).shieldsConnections;
+				if (Array.isArray(conns)) {
+					for (let i = conns.length; i--;) {
+						const c: any = conns[i];
+						if (c && !c._mpShieldSync) {
+							try { if (typeof (e as any).removeShield === 'function') (e as any).removeShield(c); else conns.splice(i, 1); }
+							catch (_) { try { conns.splice(i, 1); } catch (_) { /* ignore */ } }
+						}
+					}
+				}
+			} catch (_) { /* best effort */ }
+			// Native LOOPING attached effects from the same burst (HeatAuraStart's aura
+			// glow): the FX relay replays the host's copy on this puppet, so a native loop
+			// would double with it and — having no relay stop — keep burning through the
+			// knockdown, where the host's own is cleared. Stop loops that aren't tracked
+			// relay replays; one-shot spawn/dust effects finish on their own. Race-safe:
+			// if the relayed copy hasn't spawned yet (async sheet load) only the native
+			// dies and the relayed lands later; if it has, it's in the tracked list.
+			try {
+				const EffCtor: any = (ig as any).ENTITY && (ig as any).ENTITY.Effect;
+				const trackedFx: any[] = this._enemyTelegraphFx[s.i] || [];
+				const purgeNativeLoopFx = (list: any[]) => {
+					for (let i = list.length; i--;) {
+						const f: any = list[i];
+						if (f && EffCtor && f instanceof EffCtor && !f._killed
+							&& typeof f.duration === 'number' && f.duration < 0
+							&& !trackedFx.some((rec: any) => rec && rec.handle === f)) {
+							try { f.stop(); } catch (_) { /* ignore */ }
+						}
+					}
+				};
+				if (EffCtor) {
+					if (Array.isArray((e as any).entityAttached)) purgeNativeLoopFx((e as any).entityAttached);
+					if (Array.isArray((e as any).actionAttached)) purgeNativeLoopFx((e as any).actionAttached);
+				}
+			} catch (_) { /* best effort */ }
 			// Clear any stale target the map enemy carried at adoption; the (now FULL,
 			// bot-like) AI re-acquires one on its next update — which is normally the
 			// local player, exactly like the game's own follower bots pick up their
@@ -20367,6 +20890,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		this._mpHostileLastPlayerCount = -1;
 		this._mpUidSeen = Object.create(null);
 		this._mpMapSeen = Object.create(null);
+		// 1.80.x (static/dynamic split): we are the host now — drop the member-side
+		// static cache.
+		this._mpEnemyStatic = null;
 		// Round 24: roster is unknown until both streams report a full block; reap
 		// resets alongside the other member-side state above.
 		this._mpFullBlockSeen = 0;

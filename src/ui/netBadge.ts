@@ -788,6 +788,15 @@ function pumpNetBadges(): void {
             const ping = eff && eff.ping >= 0 ? Math.round(eff.ping) + 'ms' : '—';
             text = t('netPingLabel') + ': ' + ping + '  '
                 + t('netLossLabel') + ': ' + (eff ? eff.lossPct : 0) + '%';
+            // 1.79.x: server relay caps + heal rate + the party's effective wire
+            // schema (标准 binary / 调试 JSON / 兼容 legacy) on the second line.
+            try {
+                const m: any = mpGetMain && mpGetMain();
+                if (m) {
+                    const mode = m.mpNetSchema === 'c' ? '标准' : m.mpNetSchema === 'd' ? '调试' : '兼容';
+                    text += '\n上限: 野' + m.relayFieldHz + '/城' + m.relayTownHz + 'Hz · 自愈' + m.healHz + 'Hz · ' + mode;
+                }
+            } catch (_) { /* cosmetic */ }
         }
     } else {
         text = (hit.name || '') + '  ' + t('memberLevel') + ' ' + (hit.level != null ? hit.level : '?');

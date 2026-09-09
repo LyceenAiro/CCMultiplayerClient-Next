@@ -23,17 +23,22 @@ interface IProbeResult { ok: boolean; pingMs: number; }
 
 /** ROUND 79 (feature): probe a server's mod version via its /version endpoint
  * (the SAME config.version the login handshake reports). Returns '' when the
- * endpoint is missing / times out (an older server without the route). */
-function probeVersion(server: IServer): Promise<string> {
+ * endpoint is missing / times out (an older server without the route).
+ * 1.79.x: the endpoint also reports the relay caps + heal rate — surfaced as
+ * "30/10/1Tick" on the connect screen so players see the server's bandwidth
+ * quality BEFORE joining (older servers omit the fields).
+ * 1.80.x: the endpoint also reports the LIVE occupancy (online/maxPlayers) —
+ * shown as "在线3/20" so a full server is visible before the login attempt. */
+function probeVersion(server: IServer): Promise<{ version: string, caps: string, players: string }> {
 	return new Promise((resolve) => {
 		const url = server.type + '://' + server.hostname + ':' + server.port + '/version?_=' + Date.now();
 		let settled = false;
-		const timer = setTimeout(() => { if (!settled) { settled = true; resolve(''); } }, PROBE_TIMEOUT_MS);
-		const done = (v: string): void => {
+		const timer = setTimeout(() => { if (!settled) { settled = true; resolve({ version: '', caps: '', players: '' }); } }, PROBE_TIMEOUT_MS);
+		const done = (v: string, caps: string, players: string): void => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			resolve(v);
+			resolve({ version: v, caps, players });
 		};
 		try {
 			$.ajax({
@@ -41,10 +46,23 @@ function probeVersion(server: IServer): Promise<string> {
 				dataType: 'json',
 				timeout: PROBE_TIMEOUT_MS,
 				cache: false,
-				success: (data: any) => done((data && typeof data.version === 'string' && data.version) ? data.version : ''),
-				error: () => done(''),
+				success: (data: any) => {
+					const v = (data && typeof data.version === 'string' && data.version) ? data.version : '';
+					let caps = '';
+					if (v && data && typeof data.relayMaxTickField === 'number' && typeof data.relayMaxTickTown === 'number') {
+						// Compact "field/town/heal" tick line (e.g. 30/10/1Tick).
+						const heal = typeof data.healHz === 'number' ? data.healHz : 1;
+						caps = data.relayMaxTickField + '/' + data.relayMaxTickTown + '/' + heal + 'Tick';
+					}
+					let players = '';
+					if (v && data && typeof data.online === 'number' && typeof data.maxPlayers === 'number' && data.maxPlayers > 0) {
+						players = t('serverPlayersFmt').replace('%1', String(data.online)).replace('%2', String(data.maxPlayers));
+					}
+					done(v, caps, players);
+				},
+				error: () => done('', '', ''),
 			});
-		} catch (_) { done(''); }
+		} catch (_) { done('', '', ''); }
 	});
 }
 
@@ -341,11 +359,17 @@ export function showServerList(config: MultiplayerConfig): Promise<IServer> {
 				});
 				// ROUND 79 (feature): the version arrives independently of the socket.io
 				// script probe - fill the card's version line whenever it lands.
-				probeVersion(server).then((v) => {
+				// 1.79.x: also shows the server's relay caps + heal rate.
+				// 1.80.x: and the live occupancy (在线3/20).
+				probeVersion(server).then((r) => {
 					if (seq !== probeSeq || settled) return;
 					const row = body.children('.mpServerRow').eq(i);
 					if (!row.length) return;
-					row.find('.mpServerVer').text(v ? 'MP v' + v : '');
+					const parts: string[] = [];
+					if (r.version) parts.push('MP v' + r.version);
+					if (r.caps) parts.push(r.caps);
+					if (r.players) parts.push(r.players);
+					row.find('.mpServerVer').text(parts.join(' · '));
 				});
 			});
 		};

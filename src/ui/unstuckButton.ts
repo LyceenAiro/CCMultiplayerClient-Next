@@ -10,7 +10,13 @@ import { showMpToast } from './toasts';
  * game's OWN fall-into-water sequence:
  *
  *   1. the player's respawn point is temporarily set next to a RANDOM hostile
- *      monster (preferring ones that currently hold a combat target);
+ *      monster (preferring ones that currently hold a combat target) —
+ *      1.81.x: the landing tile is VALIDATED against the map (floor exists,
+ *      feet/head not inside walls, no danger/fall terrain) and snapped to the
+ *      highest standable level at or below the monster, so wall-perched
+ *      standby enemies (Faj'ro moths idling on walls) no longer teleport the
+ *      player INTO the wall; unstandable anchors are skipped and several
+ *      monsters are tried before falling back to the last-safe-ground point;
  *   2. `player.quickFall(ig.TERRAIN.WATER)` runs the vanilla water fall:
  *      splash at the old spot, respawn-line to the new point, reappear effect,
  *      then instantDamage(floor(maxHp * fallDmgFactor)) — the standard ~10%
@@ -31,6 +37,80 @@ function isAttached(b: any): boolean {
 	return !!(b && b.hook && b.hook.parentHook);
 }
 
+function shuffled(arr: any[]): any[] {
+	for (let i = arr.length - 1; i > 0; i--) {
+		const j = (Math.random() * (i + 1)) | 0;
+		const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+	}
+	return arr;
+}
+
+/** 1.81.x (unstuck wall-moth fix): find a VALID standing position near a
+ * monster anchor, never blindly at the anchor's own z. Faj'ro moths (and
+ * similar ambush enemies) idle in a STANDBY state perched on walls (spawned
+ * with a level offset, zGravityFactor 0 — e.g. heat-dng.f4.room-03 moths at
+ * z=64 above the level-2 floor): the old code teleported the player to a
+ * random tile 48px off the moth AT the moth's z, landing them on/inside the
+ * wall — the very softlock the button exists to escape.
+ *
+ * For each candidate tile (shuffled 8-neighbour ring at 48px, then a 96px
+ * cardinal fallback ring) the map levels are scanned from the anchor's own
+ * level DOWNWARD; the first level that is genuinely standable wins:
+ *   - real floor:        !ig.game.isOverHole(box at exactly the level height,
+ *                        BLOCK/FENCE entities like bridges count as ground)
+ *   - feet not in a wall: !isAreaBlocked at the level height (tile check is
+ *                        the level's own collision slice; entity check covers
+ *                        crates/doors across the whole body box)
+ *   - head not in a wall: !isAreaBlocked one body-height slice up (catches
+ *                        tiles that are floor but sit INSIDE a wall column)
+ *   - not danger/fall terrain (lava/coal/water/hole edges) via
+ *                        ig.terrain.getPointTerrain — landing there would
+ *                        instantly re-trigger a fall onto the same spot
+ * Never lands ABOVE the anchor's level: a wall moth hovering over the arena
+ * floor puts the player on the floor below it (into the fight), and wall-top
+ * surfaces above the anchor are never picked. Returns null when nothing
+ * around the anchor is standable (caller tries the next anchor, then the
+ * vanilla last-safe-ground fallback). */
+function findLandingSpot(player: any, anchor: any): { x: number; y: number; z: number } | null {
+	const g: any = (ig as any).game;
+	const terrain: any = (ig as any).terrain;
+	const pc = player.coll, ac = anchor.coll;
+	if (!g || !g.levels || !terrain || !pc || !ac) return null;
+	const w: number = pc.size.x, h: number = pc.size.y, d: number = pc.size.z || 28;
+	// ground level under the anchor (flying enemies hover above baseZPos; a
+	// zGravityFactor-0 standby perch keeps its own z in baseZPos)
+	const baseZ: number = (typeof ac.baseZPos === 'number' && isFinite(ac.baseZPos)) ? ac.baseZPos : ac.pos.z;
+	let startLv = -1;
+	try { startLv = g.getLevelIdx(baseZ); } catch (_) { return null; }
+	if (typeof startLv !== 'number' || startLv < 0) return null;
+	const cx = ac.pos.x + ac.size.x / 2;
+	const cy = ac.pos.y + ac.size.y / 2;
+	const ring1 = shuffled([
+		{ x: 0, y: 48 }, { x: 48, y: 0 }, { x: 0, y: -48 }, { x: -48, y: 0 },
+		{ x: 34, y: 34 }, { x: 34, y: -34 }, { x: -34, y: 34 }, { x: -34, y: -34 },
+	]);
+	const ring2 = shuffled([{ x: 0, y: 96 }, { x: 96, y: 0 }, { x: 0, y: -96 }, { x: -96, y: 0 }]);
+	const tries = ring1.concat(ring2);
+	for (let t = 0; t < tries.length; t++) {
+		const tx = cx + tries[t].x, ty = cy + tries[t].y;
+		const bx = tx - w / 2, by = ty - h / 2;
+		for (let li = startLv; li >= 0; li--) {
+			const lv = g.levels[li];
+			if (!lv || !lv.collision) continue; // a level without a collision map is air
+			const lz = lv.height;
+			try { if (g.isOverHole(bx, by, lz, w, h, true)) continue; } catch (_) { continue; }
+			try { if (g.isAreaBlocked(bx, by, lz, w, h, d, true)) continue; } catch (_) { continue; }
+			if (d > 16) { try { if (g.isAreaBlocked(bx, by, lz + d - 2, w, h, 1, true)) continue; } catch (_) { continue; } }
+			let ter = 0;
+			try { ter = terrain.getPointTerrain(tx, ty, lz, w, h) | 0; } catch (_) { ter = 0; }
+			if (ter && ((typeof terrain.isDangerTerrain === 'function' && terrain.isDangerTerrain(ter))
+				|| (typeof terrain.isFallTerrain === 'function' && terrain.isFallTerrain(ter)))) continue;
+			return { x: tx, y: ty, z: lz };
+		}
+	}
+	return null;
+}
+
 /** Pick a random hostile monster and point the player's respawn at its feet. */
 function aimRespawnAtMonster(player: any): void {
 	try {
@@ -47,20 +127,22 @@ function aimRespawnAtMonster(player: any): void {
 			if (e.params && typeof e.params.isDefeated === 'function' && e.params.isDefeated()) continue;
 			if (e.target) hostile.push(e); else idle.push(e);
 		}
-		const pool = hostile.length ? hostile : idle;
+		// 1.81.x: try several anchors (hostile first, then idle) and validate
+		// every landing tile — a wall-perched standby moth is still a fine
+		// anchor (the player lands on the floor below it), only genuinely
+		// unstandable surroundings are skipped.
+		const pool = shuffled(hostile).concat(shuffled(idle));
 		if (!pool.length) return; // no monster: keep the vanilla last-safe-ground point
-		const target = pool[(Math.random() * pool.length) | 0];
-		const c = target.coll;
-		// land one tile (48px) off the monster in a random cardinal direction
-		const cx = c.pos.x + c.size.x / 2;
-		const cy = c.pos.y + c.size.y / 2;
-		const dir = (Math.random() * 4) | 0;
-		const off = dir === 0 ? { x: 0, y: 48 } : dir === 1 ? { x: 48, y: 0 } : dir === 2 ? { x: 0, y: -48 } : { x: -48, y: 0 };
-		// ground level under the monster (flying enemies hover above baseZPos)
-		const z = (typeof c.baseZPos === 'number' && isFinite(c.baseZPos)) ? c.baseZPos : c.pos.z;
-		if (typeof player.setRespawnPoint === 'function') {
-			player.setRespawnPoint({ x: cx + off.x, y: cy + off.y, z });
+		const maxAnchors = Math.min(pool.length, 8);
+		for (let i = 0; i < maxAnchors; i++) {
+			const spot = findLandingSpot(player, pool[i]);
+			if (!spot) continue;
+			if (typeof player.setRespawnPoint === 'function') {
+				player.setRespawnPoint(spot);
+			}
+			return;
 		}
+		// nothing standable near any monster: keep the vanilla last-safe-ground point
 	} catch (e) { console.warn('[multiplayer] unstuck: monster pick failed', e); }
 }
 

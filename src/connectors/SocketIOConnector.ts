@@ -3,6 +3,7 @@ import { IConnection, IChangeMapResult, IPlayerProfile, IBotStateEntry, ILootDro
 import { Multiplayer, MP_VERSION } from '../multiplayer';
 import { IServer } from '../server';
 import { areaTypeOfMap } from '../util/areaUtil';
+import { encodeHotEvent, decodeHotEvent } from '../sync/wireSchema';
 
 import type { Socket } from 'socket.io-client';
 
@@ -60,6 +61,9 @@ export class SocketIoConnector implements IConnection {
 	private netProbeTimer: any = null;
 	private netProbeSeq = 0;
 	private netProbes: Array<{ seq: number, t: number, got: boolean, rtt?: number }> = [];
+	// 1.80.x (idle kick): main.mpLastInputAt already reported via netPing ia —
+	// only NEW input since this stamp rides the next ping.
+	private _mpPingInputAt = 0;
 
 	// ---- Round 21: network debug stats ----
 	// The socket.io engine emits 'packetCreate' (outgoing) and 'packet' (incoming);
@@ -426,6 +430,17 @@ export class SocketIoConnector implements IConnection {
                 tradeLockHours?: number,
                 // ROUND 162 (progress wall): server-blocked map IDs (lowercase dotted).
                 blockedMaps?: string[],
+                // 1.79.x (bandwidth): relay caps by area type + heal heartbeat Hz.
+                relayMaxTickField?: number,
+                relayMaxTickTown?: number,
+                healHz?: number,
+                // 1.79.x (bandwidth): party-effective wire schema ('c'/'d'/'legacy').
+                netSchema?: string,
+                // 1.80.x (idle kick): AFK auto-disconnect limits in MINUTES per
+                // area type (0 = that area never auto-disconnects). Old servers
+                // omit both -> client stays at 0 (feature off).
+                afkField?: number,
+                afkTown?: number,
                 // 1.71.0: save-mirror metadata (mirror-rollback mode only).
                 mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>,
                 // 1.78.x: wrong-password rejections carry authFailed so the
@@ -437,7 +452,7 @@ export class SocketIoConnector implements IConnection {
 				this.username = username;
 
 				if (data.success) {
-					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, tradeEnabled: data.tradeEnabled !== false, tradeRatio: (typeof data.tradeRatio === 'number' && isFinite(data.tradeRatio) && data.tradeRatio >= 1) ? data.tradeRatio : 2, tradeLockMs: (typeof data.tradeLockMs === 'number' && isFinite(data.tradeLockMs) && data.tradeLockMs > 0) ? data.tradeLockMs : 0, tradeLockHours: (typeof data.tradeLockHours === 'number' && isFinite(data.tradeLockHours) && data.tradeLockHours >= 0) ? data.tradeLockHours : 48, blockedMaps: Array.isArray(data.blockedMaps) ? data.blockedMaps : undefined, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined, passwordRequired: data.passwordRequired === true});
+					resolve({success: data.success, host: data.host, mapName: data.mapName, save: data.save ?? null, hpScale: data.hpScale, hpScaleBoss: data.hpScaleBoss, attackScale: data.attackScale, defenseScale: data.defenseScale, focusScale: data.focusScale, resistFlat: data.resistFlat, resistPercent: data.resistPercent, breakScale: data.breakScale, statusScale: data.statusScale, playerCollision: data.playerCollision, softDeathReviveHpNormal: data.softDeathReviveHpNormal, softDeathReviveHpBoss: data.softDeathReviveHpBoss, softDeathReviveTimeNormal: data.softDeathReviveTimeNormal, softDeathReviveTimeBoss: data.softDeathReviveTimeBoss, perfectGuardBaseMs: data.perfectGuardBaseMs, perfectGuardPingFactor: data.perfectGuardPingFactor, tradeEnabled: data.tradeEnabled !== false, tradeRatio: (typeof data.tradeRatio === 'number' && isFinite(data.tradeRatio) && data.tradeRatio >= 1) ? data.tradeRatio : 2, tradeLockMs: (typeof data.tradeLockMs === 'number' && isFinite(data.tradeLockMs) && data.tradeLockMs > 0) ? data.tradeLockMs : 0, tradeLockHours: (typeof data.tradeLockHours === 'number' && isFinite(data.tradeLockHours) && data.tradeLockHours >= 0) ? data.tradeLockHours : 48, blockedMaps: Array.isArray(data.blockedMaps) ? data.blockedMaps : undefined, relayMaxTickField: (typeof data.relayMaxTickField === 'number' && isFinite(data.relayMaxTickField) && data.relayMaxTickField >= 1 && data.relayMaxTickField <= 60) ? data.relayMaxTickField : 30, relayMaxTickTown: (typeof data.relayMaxTickTown === 'number' && isFinite(data.relayMaxTickTown) && data.relayMaxTickTown >= 1 && data.relayMaxTickTown <= 60) ? data.relayMaxTickTown : 10, healHz: (typeof data.healHz === 'number' && isFinite(data.healHz) && data.healHz >= 0.5 && data.healHz <= 60) ? data.healHz : 1, netSchema: (data.netSchema === 'c' || data.netSchema === 'd' || data.netSchema === 'legacy') ? data.netSchema : undefined, afkField: (typeof data.afkField === 'number' && isFinite(data.afkField) && data.afkField >= 0 && data.afkField <= 43200) ? data.afkField : 0, afkTown: (typeof data.afkTown === 'number' && isFinite(data.afkTown) && data.afkTown >= 0 && data.afkTown <= 43200) ? data.afkTown : 0, isNew: !!data.isNew, mirrors: Array.isArray(data.mirrors) ? data.mirrors : undefined, passwordRequired: data.passwordRequired === true});
 					// Round 16: start the 1/s latency probe once authenticated. This
 					// also covers reconnects (identify runs again in the reconnect
 					// handler; stopPing cleared the previous timer on disconnect).
@@ -493,6 +508,10 @@ export class SocketIoConnector implements IConnection {
 				// payload; the server only checks it for password-protected
 				// accounts). Reused from _mpPassword on reconnect re-identify.
 				password: this._mpPassword,
+				// 1.79.x (bandwidth): wire-schema preference ('c' = 标准 binary,
+				// 'd' = 调试 short-key JSON). The server arbitrates the party-wide
+				// mode from the members' preferences and pushes netSchema updates.
+				schema: this._mpSchemaPref,
 			});
 		});
 	}
@@ -546,7 +565,19 @@ export class SocketIoConnector implements IConnection {
 			if (!this.isOpen() || !this.socket) return;
 			const now = Date.now();
 			const seq = this.netProbeSeq++;
-			this.socket.emit('netPing', { t: now, seq });
+			// 1.80.x (idle kick): ride a 1-bit INPUT ACTIVITY flag on the existing
+			// 1/s probe — ia:1 means "real keyboard/mouse input happened since the
+			// previous ping" (the server's AFK watchdog only advances a socket's
+			// last-active stamp on this flag). Old servers ignore the field.
+			let ia: number | undefined;
+			try {
+				const lastInput = (this.main as any).mpLastInputAt;
+				if (typeof lastInput === 'number' && lastInput > this._mpPingInputAt) {
+					ia = 1;
+					this._mpPingInputAt = lastInput;
+				}
+			} catch (_) { /* non-fatal */ }
+			this.socket.emit('netPing', ia ? { t: now, seq, ia } : { t: now, seq });
 			this.netProbes.push({ seq, t: now, got: false });
 			if (this.netProbes.length > 15) this.netProbes.shift();
 		}, 1000);
@@ -805,7 +836,13 @@ export class SocketIoConnector implements IConnection {
 		// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag = true traces the
 		// send decision, including whether syncEmit's solo-instance skip would drop it.
 		try { if ((window as any)._mpIceDiag) console.log('[mpice] emit throwBall', ballInfo && ballInfo.ballInfo, 'solo=', this.main.isSoloInstance()); } catch (_) { /* ignore */ }
-		this.syncEmit('throwBall', ballInfo);
+		// 1.80.x (combat bandwidth): the throw direction is a unit float pair —
+		// quantize to 2 decimals BEFORE encoding (the C codec's i8x100 step
+		// would quantize anyway; doing it here keeps legacy JSON identical too).
+		if (ballInfo && ballInfo.dir && typeof ballInfo.dir.x === 'number' && typeof ballInfo.dir.y === 'number') {
+			ballInfo.dir = { x: Math.round(ballInfo.dir.x * 100) / 100, y: Math.round(ballInfo.dir.y * 100) / 100 };
+		}
+		this.syncEmit('throwBall', encodeHotEvent('throwBall', this.wireMode(), ballInfo));
 	}
 
 	public combatHit(hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number, shieldDmg?: number, full?: number, stb?: number, bdf?: number, afc?: number, hx?: number, hy?: number, auid?: number }): void {
@@ -945,10 +982,10 @@ export class SocketIoConnector implements IConnection {
 	// Round 13: the party leader streams live bot state (pos/anim/hp/level); members
 	// apply it to their local puppet copies.
 	public botState(state: { map: string, bots: IBotStateEntry[] }): void {
-		this.syncEmit('botState', state);
+		this.syncEmit('botState', encodeHotEvent('botState', this.wireMode(), state));
 	}
 	public onBotState(callback: (data: { map?: string, from?: string, bots: IBotStateEntry[] }) => void): void {
-		this.socket.on('botState', (data: any) => callback(data));
+		this.socket.on('botState', (data: any) => callback(decodeHotEvent('botState', data)));
 	}
 
 	// Round 27 (item 2): tell the party which map WE are on so off-map teammates'
@@ -1187,12 +1224,12 @@ export class SocketIoConnector implements IConnection {
 	// members replay it positioned on their same-uid puppet (member puppets run no AI, so
 	// they are silent without this relay).
 	public emitEnemySound(s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }): void {
-		this.syncEmit('enemySound', s);
+		this.syncEmit('enemySound', encodeHotEvent('enemySound', this.wireMode(), s));
 	}
 
 	// 1.71.9 (issue 7): host-only STOP_SOUNDS relay for looped enemy sounds.
 	public enemySoundStop(uid: number): void {
-		this.syncEmit('enemySoundStop', { uid });
+		this.syncEmit('enemySoundStop', encodeHotEvent('enemySoundStop', this.wireMode(), { uid }));
 	}
 
 	// ROUND 34 (item 3): any client -> its instance — the local player's own attack sound
@@ -1398,12 +1435,14 @@ export class SocketIoConnector implements IConnection {
 
 	// ROUND 132: player thrown-ball position stream (bounce-puzzle visibility).
 	public playerBall(map: string, entries: any[]): void {
-		this.syncEmit('playerBall', { map, entries });
+		this.syncEmit('playerBall', encodeHotEvent('playerBall', this.wireMode(), { map, entries }));
 	}
 	public onPlayerBall(callback: (data: { from: string, map: string, entries: any[] }) => void): void {
 		this.socket.on('playerBall', (data: any) => {
-			if (!data || typeof data.map !== 'string' || !Array.isArray(data.entries)) return;
-			callback({ from: (typeof data.from === 'string' ? data.from : ''), map: data.map, entries: data.entries });
+			// 1.80.x (combat streams): decode c/d wire formats to canonical first.
+			const d = decodeHotEvent('playerBall', data);
+			if (!d || typeof d.map !== 'string' || !Array.isArray(d.entries)) return;
+			callback({ from: (typeof d.from === 'string' ? d.from : ''), map: d.map, entries: d.entries });
 		});
 	}
 
@@ -1491,11 +1530,45 @@ export class SocketIoConnector implements IConnection {
 		this.socket.emit('updateEntityHealth', {id, hp: health, maxHp});
 	}
 	public updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }): void {
-		this.socket.emit('updatePlayerStats', stats);
+		// 1.79.x: syncEmit — a solo instance has nobody to feed the party HUD, so
+		// the packet is pure upstream waste there (it used to be a bare emit).
+		// Encoded in the party's effective wire schema (标准 binary / 调试 JSON).
+		this.syncEmit('updatePlayerStats', encodeHotEvent('updatePlayerStats', this.wireMode(), stats));
+	}
+	/** The party-effective wire schema for the three hot streams ('legacy' on
+	 * old servers until the first netSchema push arrives). */
+	private wireMode(): string {
+		try { return this.main.mpNetSchema || 'legacy'; } catch (_) { return 'legacy'; }
+	}
+	// ---- 1.79.x (bandwidth): wire-schema preference + server arbitration ----
+	/** The player's own preference ('c' 标准 / 'd' 调试), reported in the handshake
+	 * and on every change. The SERVER decides the party-wide effective mode. */
+	public netSchemaPref(v: 'c' | 'd'): void {
+		this._mpSchemaPref = v;
+		this.socket.emit('netSchemaPref', { v });
+	}
+	/** Sets the handshake-reported preference BEFORE the first identify (the
+	 * handshake payload reads it; netSchemaPref also notifies a live server). */
+	public setSchemaPref(v: 'c' | 'd'): void {
+		this._mpSchemaPref = v;
+	}
+	public onNetSchema(callback: (mode: string) => void): void {
+		this.socket.on('netSchema', (data: any) => {
+			callback(data && data.mode ? String(data.mode) : 'legacy');
+		});
+	}
+	private _mpSchemaPref: 'c' | 'd' = 'c';
+	// ---- 1.80.x (idle kick): server backstop notice ----
+	/** The server's AFK watchdog kicked us (the client-side timer normally wins
+	 * with the graceful path first; this catches patched/legacy clients). */
+	public onAfkKick(callback: (info: { minutes: number }) => void): void {
+		this.socket.on('afkKick', (data: any) => {
+			callback({ minutes: (data && typeof data.minutes === 'number' && isFinite(data.minutes)) ? data.minutes : 0 });
+		});
 	}
 	// ---- NEW sync system ----
 	public updatePlayerState(state: any): void {
-		this.syncEmit('playerState', state);
+		this.syncEmit('playerState', encodeHotEvent('playerState', this.wireMode(), state));
 	}
 	/** Solo-instance optimization: ~1Hz minimal position beacon (see NetSync). Emits
 	 * a bare {pos} playerState that keeps the server's memberPos cache fresh while we
@@ -1524,7 +1597,7 @@ export class SocketIoConnector implements IConnection {
 		// it so the member's full-block counter only counts genuine full-roster reports.
 		const payload: any = { map, e: entities, cb: !!combat, st: stream === 'base' ? 'B' : 'H' };
 		if (full) payload.f = 1;
-		this.socket.emit('entityState', payload);
+		this.socket.emit('entityState', encodeHotEvent('entityState', this.wireMode(), payload));
 	}
 	// Round 19: cutscene-spawned monster stream (see applyCutsceneEntity). The server
 	// relays it to the instance stamped with the sender as `from` (protocol.js).
@@ -1554,21 +1627,26 @@ export class SocketIoConnector implements IConnection {
 	// as `projectileState` via broadcastHostState (no-op unless the sender is the instance
 	// host); the payload is whitelisted server-side.
 	public updateProjectileState(map: string, list: any[]): void {
-		this.syncEmit('projectileState', { map, e: list });
+		this.syncEmit('projectileState', encodeHotEvent('projectileState', this.wireMode(), { map, e: list }));
 	}
 	public onPlayerState(callback: (player: string, state: any) => void): void {
-		this.socket.on('playerState', (data: any) => callback(data.player, data));
+		this.socket.on('playerState', (data: any) => callback(data.player, decodeHotEvent('playerState', data)));
 	}
 	public onEntityState(callback: (map: string, entities: any[], combat: boolean, full: boolean, stream?: 'base' | 'hostile') => void): void {
 		this.socket.on('entityState', (data: any) => {
+			// 1.80.x (combat streams): decode c/d wire formats to canonical FIRST —
+			// the D wrapper carries the stream tag under the short key 's', so the
+			// per-stream tick counters below must read the DECODED form. Entries may
+			// be static-split — netSync merges its per-uid cache.
+			const d = decodeHotEvent('entityState', data);
 			// Round 22 (EXTRA 2): count member-received enemy blocks for the tick rate.
 			// ROUND 81: per-stream counters from the relayed `st` tag; untagged blocks
 			// (pre-tag protocol) only contribute to the combined total.
-			if (data.st === 'B') this.downBaseBlockAccum++;
-			else if (data.st === 'H') this.downHostileBlockAccum++;
+			if (d.st === 'B') this.downBaseBlockAccum++;
+			else if (d.st === 'H') this.downHostileBlockAccum++;
 			else this.downUnclassifiedBlockAccum++;
-			const stream: 'base' | 'hostile' | undefined = data.st === 'B' ? 'base' : (data.st === 'H' ? 'hostile' : undefined);
-			callback(data.map, data.e, !!data.cb, data.f === 1, stream);
+			const stream: 'base' | 'hostile' | undefined = d.st === 'B' ? 'base' : (d.st === 'H' ? 'hostile' : undefined);
+			callback(d.map, d.e, !!d.cb, d.f === 1, stream);
 		});
 	}
 	public onCutsceneEntity(callback: (from: string, data: { map: string, list: any[] }) => void): void {
@@ -1581,8 +1659,10 @@ export class SocketIoConnector implements IConnection {
 	// entityState; entries are the host's own projectile snaps (validated server-side).
 	public onProjectileState(callback: (map: string, list: any[]) => void): void {
 		this.socket.on('projectileState', (data: any) => {
-			if (!data || typeof data.map !== 'string' || !Array.isArray(data.e)) return;
-			callback(data.map, data.e);
+			// 1.80.x (combat streams): decode c/d wire formats to canonical first.
+			const d = decodeHotEvent('projectileState', data);
+			if (!d || typeof d.map !== 'string' || !Array.isArray(d.e)) return;
+			callback(d.map, d.e);
 		});
 	}
 	public updateEntityState(id: number, state: string): void {
@@ -1632,7 +1712,8 @@ export class SocketIoConnector implements IConnection {
 		this.socket.on('throwBall', (data: IBallInfo) => {
 			// ROUND 164 (ice-skill sync diagnostics): window._mpIceDiag wire trace.
 			try { if ((window as any)._mpIceDiag) console.log('[mpice] wire throwBall', data && data.ballInfo, 'from=', data && data.combatant); } catch (_) { /* ignore */ }
-			callback(data);
+			// 1.80.x (combat streams): decode c/d wire formats to canonical first.
+			callback(decodeHotEvent('throwBall', data));
 		});
 	}
 	public onCombatHit(callback: (hit: { player: string, damage: number, element?: number, critical?: boolean, ax?: number, ay?: number, attack?: number, monster?: boolean, perfect?: boolean, regular?: boolean, knockback?: boolean, attackType?: number }) => void): void {
@@ -1759,16 +1840,20 @@ export class SocketIoConnector implements IConnection {
 	 * NetSync.applyEnemySound). Server validates the payload field-by-field. */
 	public onEnemySound(callback: (s: { uid: number, path: string, volume?: number, variance?: number, loop?: boolean, global?: boolean, radius?: number, speed?: number }) => void): void {
 		this.socket.on('enemySound', (data: any) => {
-			if (data && typeof data.uid === 'number' && typeof data.path === 'string') {
-				callback(data);
+			// 1.80.x (combat streams): decode c/d wire formats to canonical first.
+			const d = decodeHotEvent('enemySound', data);
+			if (d && typeof d.uid === 'number' && typeof d.path === 'string') {
+				callback(d);
 			}
 		});
 	}
 	/** 1.71.9 (issue 7): host relayed STOP_SOUNDS for an enemy uid. */
 	public onEnemySoundStop(callback: (uid: number) => void): void {
 		this.socket.on('enemySoundStop', (data: any) => {
-			if (data && typeof data.uid === 'number' && Number.isInteger(data.uid) && data.uid > 0) {
-				callback(data.uid);
+			// 1.80.x (combat streams): decode c/d wire formats to canonical first.
+			const d = decodeHotEvent('enemySoundStop', data);
+			if (d && typeof d.uid === 'number' && Number.isInteger(d.uid) && d.uid > 0) {
+				callback(d.uid);
 			}
 		});
 	}
@@ -1901,7 +1986,7 @@ export class SocketIoConnector implements IConnection {
 	}
 	public onPlayerStats(callback: (player: string, stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }) => void): void {
 		this.socket.on('updatePlayerStats', (data: any) => {
-			callback(data.player, data);
+			callback(data.player, decodeHotEvent('updatePlayerStats', data));
 		});
 	}
 	// Round 17: a player in our instance reported its own RTT (server-relayed

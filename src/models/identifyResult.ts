@@ -70,6 +70,28 @@ interface IIdentifyResult {
      * dotted form). The teleport gate refuses these before any map load;
      * omitted by older servers -> feature off. */
     blockedMaps?: string[];
+    /** 1.79.x (bandwidth): server-side MAX RELAY rates (Hz) for the three hot
+     * streams, by the sender's area type (field = paths/dungeons, town = shared
+     * towns). Clients align their send floors + edges to these so no upstream
+     * packet is silently dropped by the relay cap. Older servers omit both ->
+     * client falls back to 30 / 10. */
+    relayMaxTickField?: number;
+    relayMaxTickTown?: number;
+    /** 1.79.x (bandwidth): self-heal heartbeat frequency (Hz; float allowed).
+     * The three hot streams send one unconditional full packet at this rate
+     * (effective = min(healHz, current area cap)). Older servers omit -> 1. */
+    healHz?: number;
+    /** 1.79.x (bandwidth): the party-effective wire schema pushed by the server
+     * ('c' = 标准 binary, 'd' = 调试 short-key JSON, 'legacy' = old long-key
+     * JSON). Omitted by older servers -> legacy everywhere (feature off). */
+    netSchema?: string;
+    /** 1.80.x (idle kick): AFK auto-disconnect limits in MINUTES per area type
+     * (field / town). 0 = that area never auto-disconnects. The client watches
+     * raw keyboard/mouse input only (game events never reset the clock) and
+     * disconnects + returns to the title screen when the limit is exceeded;
+     * the server's watchdog is the backstop. Older servers omit both -> 0/0. */
+    afkField?: number;
+    afkTown?: number;
     /** 1.71.0: save-mirror metadata in mirror-rollback mode (newest first). */
     mirrors?: Array<{ index: number, at: string, slot: string, bytes: number }>;
     /** 1.78.x: the account has NO password hash yet (legacy / brand new) — the

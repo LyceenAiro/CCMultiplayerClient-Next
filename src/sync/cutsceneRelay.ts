@@ -110,6 +110,16 @@ class CutsceneRelay implements ICutsceneRelay {
 			// local fight has not started (a genuine first start always passes;
 			// the engine's endCondition blocks every later native fire anyway).
 			if (this.isMidbossIntroTrigger(trig)) return !this.midbossFightStarted();
+			// 1.81.x (heat-dng.f3.room-07 golem-arena opener): BattleStart is a
+			// PARALLEL ONCE_PER_ENTRY trigger armed by the PER-CLIENT tmp.battleStart
+			// TouchTrigger var and carries no enemy-target signature steps — the
+			// generic encounter path below (map._entity triggerVar + signature)
+			// silently disqualifies it, so a MEMBER crossing the strip fired the
+			// battle locally only: its two event jellyfish spawned as owner-local
+			// copies the host never owned (member-side adds get reaped — "敌人一出
+			// 现就直接死亡"), while the host's own trigger never engaged (主机看不
+			// 到敌人). Scoped by map + name + condition, like the midboss case.
+			if (this.isF3GolemBattleTrigger(trig)) return true;
 			const EVT: any = (ig as any).EVENT_TYPE || {};
 			const isCutscene = trig.eventType === EVT.CUTSCENE || trig.eventType === EVT.COMBAT_CUTSCENE;
 			// Encounter-battle intros are PARALLEL events carrying the dramatic
@@ -306,6 +316,30 @@ class CutsceneRelay implements ICutsceneRelay {
 			if (!raw || raw.name !== 'enter') return false;
 			const cond = typeof raw.startCondition === 'string' ? raw.startCondition.trim() : '';
 			return cond === 'map.battleStart';
+		} catch (_) { return false; }
+	}
+
+	/** 1.81.x: heat-dng.f3.room-07 golem-arena opening trigger. The room's
+	 * BattleStart (mapId 21, PARALLEL, ONCE_PER_ENTRY, condition tmp.battleStart)
+	 * spawns the first two heat.jellyfish adds + seals the arena (tmp.barrierUp)
+	 * + SET_FORCE_COMBAT. Its arming var is per-client and its steps carry no
+	 * SET_SCREEN_ENEMY_TARGET/SET_FINAL_DRAMATIC_EFFECT, so neither the generic
+	 * ONCE-trigger relay nor hasEncounterSignature ever matched it. Relaying the
+	 * START (gather + local replay) lets the host's replay spawn the REAL adds
+	 * while member-side replays only run the per-client presentation (their
+	 * event spawns are suppressed host-owned, see netSync
+	 * suppressMemberEventAddSpawn). */
+	private isF3GolemBattleTrigger(trig: any): boolean {
+		try {
+			if (!trig || trig._killed) return false;
+			const mapName: string = ((ig.game as any).mapName || '') as string;
+			if (mapName !== 'heat-dng/f3/room-07' && mapName !== 'heat-dng.f3.room-07') return false;
+			const EVT: any = (ig as any).EVENT_TYPE || {};
+			if (trig.eventType !== EVT.PARALLEL) return false;
+			const raw = trig._mpCsSettings;
+			if (!raw || raw.name !== 'BattleStart') return false;
+			const cond = typeof raw.startCondition === 'string' ? raw.startCondition.trim() : '';
+			return cond === 'tmp.battleStart';
 		} catch (_) { return false; }
 	}
 
@@ -564,10 +598,24 @@ class CutsceneRelay implements ICutsceneRelay {
 			// & co.) fires MID-FIGHT on whichever client notices the empty wave counter
 			// first, and gathering the rest to that player's coordinates yanks them out
 			// of combat (broken combos, players dropped into hazards/next to allies).
-			// Story cutscenes still gather — the scene needs the party inside the zone
-			// — but an encounter intro plays where everyone already stands, so only the
-			// local event replay runs (dramatic effect/camera), no teleport.
-			if (!this.isEncounterTrigger(trig)) {
+			// 1.78.x (heat-dng.f3.room-05 BattleStart lockout): the no-yank rule above
+			// is only right for intros that fire MID-FIGHT. The INITIAL arena trigger
+			// (the golem's BattleStart) fires when ONE player crosses the TouchTrigger
+			// while the rest still stand outside — the replayed event then seals the
+			// arena walls (tmp.barrierUp) with them locked out for the whole fight.
+			// Split by the arena lock: sc.model.isForceCombat() is true exactly while
+			// a SET_FORCE_COMBAT encounter holds this client (the wave-2 case); the
+			// initial trigger finds everyone unlocked, so gather them to the
+			// triggerer (who is by definition inside the arena) BEFORE the local
+			// replay seals the walls. Story cutscenes always gather (unchanged).
+			let skipGather = false;
+			if (this.isEncounterTrigger(trig)) {
+				try {
+					const mdl: any = (sc as any).model;
+					skipGather = !!(mdl && typeof mdl.isForceCombat === 'function' && mdl.isForceCombat());
+				} catch (_) { skipGather = true; /* unknown state — keep the 1.76.x no-yank behavior */ }
+			}
+			if (!skipGather) {
 				try { g.playerEntity.setPos(data.p[0], data.p[1], data.p[2]); } catch (_) { /* ignore */ }
 			} else {
 				console.log('[cutscenerelay] encounter intro relay mi=' + data.mi + ' — gather teleport skipped (mid-fight)');

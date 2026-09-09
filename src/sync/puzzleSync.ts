@@ -85,6 +85,8 @@ const PUZZLE_FULL_INTERVAL = 1000;  // ms — host full snapshot
 const PUZZLE_FAST_INTERVAL = 1 / 30; // seconds — moving pushable pillars/boxes at 30Hz
 const PUZZLE_OWN_TTL = 700;         // ms without an owner heartbeat -> release
 const PUZZLE_OWN_HEARTBEAT = 400;   // ms — owner re-asserts even when stationary
+const FLOOR_HOLD_HEARTBEAT = 300;   // ms — holder re-asserts a pressed WHILE_ON_TOP plate
+const FLOOR_HOLD_TTL = 900;         // ms without a heartbeat -> the remote hold expires
 const PUZZLE_LERP_RATE = 16;        // ~16% of the remaining distance per frame
 
 interface IPuzzleEntry {
@@ -137,6 +139,8 @@ let steamOvenReplayDepth = 0;
 let steamOvenHookInstalled = false;
 /** 1.77.x: Lorry motion/touch suppression hooks (heat-dng.f1.room-02). */
 let lorryHooksInstalled = false;
+/** 0.2.5: WHILE_ON_TOP floor-switch remote-hold hook (heat-dng.f3.room-06). */
+let floorSwitchHooksInstalled = false;
 
 export function installPuzzleSync(getMain: () => Multiplayer | undefined): IPuzzleSync {
 	if (!shared) shared = new PuzzleSync(getMain);
@@ -154,6 +158,9 @@ class PuzzleSync implements IPuzzleSync {
 	private remoteOwners = new Map<number, { name: string, claim: number, at: number }>();
 	private ownedLast = new Map<number, boolean>();
 	private ownHeartbeat = new Map<number, number>();
+	/** 0.2.5: heartbeat throttle for WHILE_ON_TOP floor plates held down by
+	 * LOCAL weight (mapId -> last send time). */
+	private floorHoldHb = new Map<number, number>();
 	private interp = new Map<number, { e: any, tx: number, ty: number, tz: number }>();
 	/** 1.71.6: push boxes that are currently FOLLOWERS (their position comes from
 	 * the network). Their local z-physics is frozen every frame so the engine
@@ -203,6 +210,7 @@ class PuzzleSync implements IPuzzleSync {
 		this.installBounceFxHooks();
 		this.installSteamOvenHook();
 		this.installLorryHooks();
+		this.installFloorSwitchHooks();
 	}
 
 	public tick(): void {
@@ -222,6 +230,7 @@ class PuzzleSync implements IPuzzleSync {
 				this.placedBoxIds.clear();
 				this.followers.clear();
 				this.riderSentAt.clear();
+				this.floorHoldHb.clear();
 			}
 			return;
 		}
@@ -239,6 +248,7 @@ class PuzzleSync implements IPuzzleSync {
 			this.followers.clear();
 			this.riderSentAt.clear();
 			this.lorryStreamAt = 0;
+			this.floorHoldHb.clear();
 		}
 		this.expireRemoteOwners((g.entities as any[]) || []);
 		// 1.77.x: flag/unflag the room-02 lorries as host-driven puppets (members)
@@ -346,7 +356,25 @@ class PuzzleSync implements IPuzzleSync {
 				const ssig = this.stateSignature(entry);
 				const prev = this.lastSig.get(mi);
 				this.lastSig.set(mi, ssig);
-				if (prev === undefined || prev === ssig) continue;
+				if (prev === undefined || prev === ssig) {
+					// 0.2.5 (heat-dng.f3.room-06 WHILE_ON_TOP plates): a held
+					// pressure plate never changes state again while held, but
+					// every remote copy only stays pressed via its remote-hold
+					// flag (applyEntry) — re-assert ~3Hz or they auto-release
+					// and both sides start ping-ponging on/off. Only the client
+					// whose OWN local weight holds the plate heartbeats (the
+					// pre-wrap _isStillPressed, NOT the hold flag itself), so
+					// remote-held copies never keep themselves alive.
+					if (prev !== undefined && e.isOn && this.isWhileOnTopSwitch(e)
+						&& this.localWeightOnSwitch(e)) {
+						const lastHb = this.floorHoldHb.get(mi) || 0;
+						if (Date.now() - lastHb >= FLOOR_HOLD_HEARTBEAT) {
+							this.floorHoldHb.set(mi, Date.now());
+							entries.push(entry);
+						}
+					}
+					continue;
+				}
 				entries.push(entry);
 				continue;
 			}
@@ -563,6 +591,30 @@ class PuzzleSync implements IPuzzleSync {
 				};
 			}
 		} catch (e) { console.warn('[puzzlesync] bounce-FX hooks failed', e); }
+	}
+
+	/** 0.2.5 (heat-dng.f3.room-06 pressure plates): wrap FloorSwitch's native
+	 * _isStillPressed so a REMOTE-held WHILE_ON_TOP plate counts as pressed
+	 * while its hold flag is fresh (see applyEntry). The pre-wrap original is
+	 * stashed as _mpOrigStillPressed: the heartbeat sender (localWeightOnSwitch)
+	 * must consult LOCAL weight only, never the hold flag itself, or a
+	 * remote-held copy would keep its own "hold" alive forever. Harmless in
+	 * single-player — the hold flag is simply never set there. */
+	private installFloorSwitchHooks(): void {
+		if (floorSwitchHooksInstalled) return;
+		floorSwitchHooksInstalled = true;
+		try {
+			const E: any = (ig.ENTITY as any);
+			const FS: any = E && E.FloorSwitch;
+			if (!FS || !FS.prototype || typeof FS.prototype._isStillPressed !== 'function') return;
+			const origPressed = FS.prototype._isStillPressed;
+			FS.prototype._mpOrigStillPressed = origPressed;
+			FS.prototype._isStillPressed = function (this: any) {
+				let held = false;
+				try { held = !!origPressed.call(this); } catch (_) { /* fall back to the hold flag */ }
+				return held || (this._mpRemoteHoldUntil || 0) > Date.now();
+			};
+		} catch (err) { console.warn('[puzzlesync] floor-switch hooks failed', err); }
 	}
 
 	/** ROUND 165 (steam-oven FX relay): a local SteamOven just started steaming (an
@@ -813,6 +865,30 @@ class PuzzleSync implements IPuzzleSync {
 			const map = ((ig.game as any).mapName || '') as string;
 			return map === 'cold-dng.b1.room7';
 		} catch (_) { return false; }
+	}
+
+	/** 0.2.5: a WHILE_ON_TOP floor switch (the non-permanent pressure plate,
+	 * e.g. the heat-dng.f3.room-06 turnout buttons). PERMANENT/UNDOABLE plates
+	 * are monotonic and stay on the generic path. */
+	private isWhileOnTopSwitch(e: any): boolean {
+		try {
+			const E: any = (ig.ENTITY as any);
+			return !!(E && E.FloorSwitch && e instanceof E.FloorSwitch
+				&& e.switchType && !e.switchType.permanent);
+		} catch (_) { return false; }
+	}
+
+	/** 0.2.5: true while something on THIS client physically weighs the plate
+	 * down (our player or a synced crate). Deliberately calls the PRE-WRAP
+	 * _isStillPressed — the wrapped one also honours the remote-hold flag,
+	 * which must never count as a reason to keep heartbeating. */
+	private localWeightOnSwitch(e: any): boolean {
+		try {
+			const proto: any = (ig.ENTITY as any).FloorSwitch.prototype;
+			const orig = proto && proto._mpOrigStillPressed;
+			if (typeof orig === 'function') return !!orig.call(e);
+		} catch (_) { /* ignore */ }
+		return false;
 	}
 
 	private isPuzzleEntity(e: any): boolean {
@@ -1400,6 +1476,26 @@ class PuzzleSync implements IPuzzleSync {
 			const m = this.getMain();
 			if (this.isLorryRoomSwitch(e) && e.activeTime && !(m && m.host)) s.hits = Math.round(((e.timer || 0) as number) * 10);
 		}
+		// 1.78.x (heat-dng.f4.room-06 twin steam valves): counted timed
+		// OneTimeSwitches (addValue + fixCount, no variable) ship their LIVE counter
+		// in `hits` — a field OneTimeSwitch never uses (the room-02 lorry countdown
+		// above is a disjoint propeller-switch branch with an empty addValue, so the
+		// two never collide). Receivers use it to replicate the SOLVED state — see
+		// applyEntry. Counter changes (0→1→0 on a failed window, 1→2 on the solve)
+		// are genuine state changes and ride the normal change detector.
+		if (typeof e.addValue === 'string' && e.addValue) {
+			try {
+				let cv = (ig as any).vars.get(e.addValue) | 0;
+				// 1.78.x save heal: pre-fix transient mirrors could be setOff()'d
+				// (onKill/onHideRequest on map unload) WITHOUT a matching ballHit add,
+				// leaving this PERSISTENT map.* counter negative — the counter can then
+				// never reach fixCount again and the puzzle is soft-locked even solo.
+				// Clamp it back to 0 on sight (idempotent, heals the save as soon as
+				// the player enters the room with a fixed build).
+				if (cv < 0) { (ig as any).vars.set(e.addValue, 0); cv = 0; }
+				s.hits = cv;
+			} catch (_) { /* ignore */ }
+		}
 		if (e._hidden) s.hd = 1;
 		return s;
 	}
@@ -1409,6 +1505,36 @@ class PuzzleSync implements IPuzzleSync {
 		// state — a peer standing on their copy must never drop OUR wall (mixed
 		// client versions / the host full snapshot may still carry it).
 		if (this.isLocalOnlyFloorSwitch(e)) return;
+		// 0.2.5 (heat-dng.f3.room-06 pressure plates): WHILE_ON_TOP floor
+		// switches are HOLD-synced, never state-mirrored. The old generic path
+		// (isOn = s.on + vars.set) deadlocked into an infinite on/off ping-pong:
+		// a peer's on=1 pressed OUR copy, our native update released it the very
+		// next frame (nothing LOCAL weighs it down) and shipped on=0, the
+		// standing peer's native weight re-pressed its copy and shipped on=1,
+		// ... — the reported rapid flicker, at network round-trip rate. Now:
+		// on=1 sets a short remote-hold flag and runs the NATIVE activate
+		// (vars.add / anim / fx, exactly like local weight); the wrapped
+		// _isStillPressed treats a fresh hold as pressed, so the plate survives
+		// until the holder's heartbeats stop (stepped off / left / crashed ->
+		// TTL expiry — self-healing). on=0 only clears the hold; it must NEVER
+		// force our copy off while OUR OWN player/crate still stands on it —
+		// that forced-off was precisely what kept the ping-pong alive. The
+		// native deactivate on the next frame then keeps the backing var
+		// balanced by ±1 per genuine press/release on every client, so the two
+		// plates sharing tmp.turnout1 also count correctly.
+		if (this.isWhileOnTopSwitch(e)) {
+			if (typeof s.on === 'number') {
+				try {
+					if (s.on === 1) {
+						(e as any)._mpRemoteHoldUntil = Date.now() + FLOOR_HOLD_TTL;
+						if (!e.isOn && typeof e.activate === 'function') e.activate(true);
+					} else {
+						(e as any)._mpRemoteHoldUntil = 0;
+					}
+				} catch (_) { /* ignore */ }
+			}
+			return;
+		}
 		// 1.77.x (host-managed room-02 lorries): fully self-contained branch.
 		// Host: consumes member rider heartbeats (own = rider name) and ignores
 		// everything else (it is the authority). Members: follow the host's
@@ -1565,6 +1691,50 @@ class PuzzleSync implements IPuzzleSync {
 				if (OT && e instanceof OT) {
 					const permanent = !e.activeTime;
 					if (permanent && !want) return; // stale off must never revert a solved switch
+					// 1.78.x (heat-dng.f4.room-06 twin steam valves): counted timed
+					// switches (addValue + fixCount, no variable) get a dedicated branch —
+					// the generic isOn mirror below is BROKEN for them twice over:
+					//  1. it never replicated the backing counter, so the puzzle only
+					//     completed on the disk-THROWER's client (the peer's map.steam4
+					//     stayed 0 → its platform/camera never unlocked), and an early
+					//     transient isOn=true echo could even swallow the peer's OWN
+					//     local steam hits (ballHit skips the increment while isOn);
+					//  2. vanilla couples isOn with counter accounting (ballHit adds,
+					//     setOff subtracts — also from onKill/onHideRequest), so a bare
+					//     relayed isOn=true got setOff()'d WITHOUT a matching add when
+					//     the player left the map mid-window, driving the PERSISTENT
+					//     map.* counter NEGATIVE — repeated cycles soft-lock the puzzle
+					//     in the player's save (unsolvable even solo).
+					// SOLVED replication: the sender ships its live counter in `hits`;
+					// >= fixCount is monotonic (can never drop back). SET ours to match
+					// (set, not add: our own local hits may already have counted), then
+					// run the NATIVE permanent-on transition directly (isOn + timer/
+					// activeTime freeze + setOn fx/anim/coll) instead of waiting for the
+					// deferred varsChanged — its permanence branch requires activeTime>0,
+					// which the freeze has already cleared. A leftover local attempt
+					// timer can thus never setOff()-subtract the var back out; a sibling
+					// switch on the same var ships its own entry in the same burst and
+					// gets the same treatment (self-healing via reliable ordered
+					// delivery if its timer expired first).
+					// TRANSIENT states (mid-window on/off) mirror the ANIMATION ONLY —
+					// isOn/coll/vars stay untouched, so local hits keep counting and
+					// kill/hide can never unbalance the counter again.
+					const hasAddValue = typeof e.addValue === 'string' && !!e.addValue;
+					if (hasAddValue) {
+						if (permanent) return; // already fully solved locally
+						if (want && (e.fixCount || 0) > 0 && typeof s.hits === 'number' && s.hits >= e.fixCount) {
+							try {
+								if (((ig as any).vars.get(e.addValue) | 0) < e.fixCount) (ig as any).vars.set(e.addValue, s.hits);
+								e.timer = 0;
+								e.activeTime = 0;
+								e.isOn = true;
+								if (typeof e.setOn === 'function') e.setOn();
+							} catch (_) { /* ignore */ }
+						} else {
+							try { if (typeof s.anim === 'string' && s.anim && typeof e.setCurrentAnim === 'function') e.setCurrentAnim(s.anim, true, null, true); } catch (_) { /* ignore */ }
+						}
+						return;
+					}
 					const changed = e.isOn !== want;
 					if (changed) e.isOn = want;
 					try {

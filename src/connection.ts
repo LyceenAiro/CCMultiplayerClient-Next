@@ -368,6 +368,18 @@ export interface IConnection {
     updatePlayerProfile(profile: IPlayerProfile): void;
     // Frequent live combat stats (currentHp/currentSp) for the in-game party HUD.
     updatePlayerStats(stats: { hp?: number, maxHp?: number, sp?: number, maxSp?: number, em?: number, el?: number, ov?: boolean }): void;
+    /** 1.79.x (bandwidth): report the wire-schema preference ('c' 标准 binary /
+     * 'd' 调试 short-key JSON). The server arbitrates the party-wide mode. */
+    netSchemaPref(v: 'c' | 'd'): void;
+    /** Same preference, but only sets the local default used by the NEXT
+     * handshake (no live emit — used right before opening a connection). */
+    setSchemaPref(v: 'c' | 'd'): void;
+    /** 1.79.x (bandwidth): the server pushes the party-effective wire schema
+     * ('c' | 'd' | 'legacy') whenever it changes (join/leave/preference flip). */
+    onNetSchema(callback: (mode: string) => void): void;
+    /** 1.80.x (idle kick): the SERVER's AFK watchdog disconnected us (the
+     * client-side timer normally wins with the graceful path first). */
+    onAfkKick(callback: (info: { minutes: number }) => void): void;
 
     // ---- social (lobby architecture) ----
     friendAdd(name: string): void;

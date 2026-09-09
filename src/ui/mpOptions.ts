@@ -62,6 +62,12 @@ interface IMpOptions {
      * reads it live every tick (getPlayerStateMs), so a change takes effect on the
      * next packet with no latch/rejoin. */
     playerStateRate: number;
+    /** 1.79.x (bandwidth): wire schema for the three hot streams. 'c' 标准 =
+     * compact binary (daily use); 'd' 调试 = short-key JSON (readable in packet
+     * captures). The SERVER arbitrates the party-wide mode (all members must pick
+     * 调试 for 调试 to actually engage; any 标准 player or old client downgrades
+     * the party to 标准/legacy). Change is pushed live via netSchemaPref. */
+    netSchema: 'c' | 'd';
     /** Round 21: show the bottom-right network debug overlay (up/down bits per
      * second + packet loss %). Read live by the HUD pump. */
     showNetDebug: boolean;
@@ -99,6 +105,7 @@ const DEFAULTS: IMpOptions = {
     showPing: false,
     hostTickRate: 30,
     playerStateRate: 30,   // ROUND 117: default raised 10 -> 30 Hz (user request)
+    netSchema: 'c',        // 1.79.x: 标准 (binary) by default; 调试 = short-key JSON
     showNetDebug: false,
     showNetDebugCumulative: false,
     showNetTool: false,
@@ -129,6 +136,7 @@ function loadOptions(): IMpOptions {
         showPing: DEFAULTS.showPing,
         hostTickRate: DEFAULTS.hostTickRate,
         playerStateRate: DEFAULTS.playerStateRate,
+        netSchema: DEFAULTS.netSchema,
         showNetDebug: DEFAULTS.showNetDebug,
         showNetDebugCumulative: DEFAULTS.showNetDebugCumulative,
         showNetTool: DEFAULTS.showNetTool,
@@ -155,6 +163,8 @@ function loadOptions(): IMpOptions {
                 if (parsed.hostTickRate === 15 || parsed.hostTickRate === 30 || parsed.hostTickRate === 60) out.hostTickRate = parsed.hostTickRate;
                 // Round-23 key: allowlist 10/20/30/60 Hz only; anything else -> default 30 (ROUND 117).
                 if ([10, 20, 30, 60].indexOf(parsed.playerStateRate) !== -1) out.playerStateRate = parsed.playerStateRate;
+                // 1.79.x key: allowlist c/d only.
+                if (parsed.netSchema === 'c' || parsed.netSchema === 'd') out.netSchema = parsed.netSchema;
                 if (typeof parsed.showNetDebug === 'boolean') out.showNetDebug = parsed.showNetDebug;
                 if (typeof parsed.showNetDebugCumulative === 'boolean') out.showNetDebugCumulative = parsed.showNetDebugCumulative;
                 // Round 76: absent on older saves -> default (off).
@@ -286,6 +296,13 @@ const HOST_TICK_LABELS = ['15 tick', '30 tick', '60 tick'];
  * like the host tick rate. Hot-applies: netSync reads the option live every tick. */
 const PLAYER_STATE_RATES = [10, 20, 30, 60];
 const PLAYER_STATE_LABELS = ['10 Hz', '20 Hz', '30 Hz', '60 Hz'];
+
+/** 1.79.x (bandwidth): wire-schema choices for the three hot streams. 标准 =
+ * compact binary (daily default); 调试 = short-key JSON for packet inspection.
+ * The SERVER arbitrates the party-wide mode; the onApplied row callback pushes
+ * the new preference live (and the next handshake re-reports it). */
+const NET_SCHEMA_VALUES: Array<'c' | 'd'> = ['c', 'd'];
+const NET_SCHEMA_LABELS = ['标准', '调试'];
 
 /** ROUND 142: a slider row for the mod tab — a label + the engine's own
  * sc.OptionFocusSlider, the same draggable stepped bar the native 文本速度
@@ -482,6 +499,20 @@ export function installMpOptionsTab(getMain: () => Multiplayer | undefined): voi
                     // live every tick (shouldSendPlayerState's floor), so the rows' onApplied
                     // can be a no-op (the next packet uses the new rate immediately).
                     rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optPlayerStateRate'), t('optPlayerStateRateDesc'), 'playerStateRate', PLAYER_STATE_LABELS, PLAYER_STATE_RATES, () => { /* netSync reads live every tick */ });
+                    this.list.addButton(rows[r], true); r++;
+                    // 1.79.x (bandwidth): wire encoding for the hot sync streams
+                    // (标准 binary / 调试 short-key JSON). Pushed to the server
+                    // live; it arbitrates the party mode and pushes netSchema
+                    // back (multiplayer.ts re-latches mpNetSchema).
+                    rows[r] = buildSliderRow(r, this.rowButtonGroup, t('optNetSchema'), t('optNetSchemaDesc'), 'netSchema', NET_SCHEMA_LABELS, NET_SCHEMA_VALUES, () => {
+                        try {
+                            const m: any = getMain();
+                            const c: any = m && m.connection;
+                            if (c && typeof c.netSchemaPref === 'function' && c.isOpen()) {
+                                c.netSchemaPref(getMpOption('netSchema') === 'd' ? 'd' : 'c');
+                            }
+                        } catch (_) { /* the next handshake re-reports it */ }
+                    });
                     this.list.addButton(rows[r], true); r++;
                     // Round 21: network debug overlay toggles. The HUD pump reads the
                     // options live each second, so a change needs no immediate action.
@@ -1206,15 +1237,21 @@ function applyNetHudNow(getMain: () => Multiplayer | undefined): void {
 
 // ---- ROUND 76 (advanced network tool): full per-event network-usage table ----
 
-/** ROUND 76: build the per-event network-usage table text (header + top rows, by
- * combined rate). The callers (applyNetHudNow) render it; the per-event windows
- * reset on every read, so the rates always describe the last second. Returns ''
- * when the connector lacks the per-event counters (older build). */
+/** ROUND 76: build the per-event network-usage table text (header + top rows).
+ * The callers (applyNetHudNow) render it; the per-event windows reset on every
+ * read, so the rates always describe the last second. Returns '' when the
+ * connector lacks the per-event counters (older build).
+ * ROUND 1.78.x (net tool stable order): rows are sorted by COMBINED CUMULATIVE
+ * total (up+down all-time bytes) instead of the 1s real-time rate — totals only
+ * grow, so a row's position is stable instead of reshuffling every second as
+ * burst traffic comes and goes. Ties (mostly idle events at 0) break by name so
+ * the order is fully deterministic. */
 function buildNetToolText(conn: any): string {
     try {
         const up = conn.getUploadEventStats();
         const down = (typeof conn.getDownloadEventStats === 'function') ? conn.getDownloadEventStats() : [];
-        // Merge both directions per event name, keep the top rows by combined rate.
+        // Merge both directions per event name, keep the top rows by combined
+        // CUMULATIVE total (stable order — see the function comment).
         const merged: { [name: string]: any } = Object.create(null);
         for (const r of up) { const e = merged[r.event] || (merged[r.event] = {}); e.up = r; }
         for (const r of down) { const e = merged[r.event] || (merged[r.event] = {}); e.down = r; }
@@ -1225,7 +1262,7 @@ function buildNetToolText(conn: any): string {
             const downBps = e.down ? e.down.bytesPerSec : 0;
             rows.push({ name, upBps, downBps, upCount: e.up ? e.up.count : 0, downCount: e.down ? e.down.count : 0, upTotal: e.up ? e.up.total : 0, downTotal: e.down ? e.down.total : 0 });
         }
-        rows.sort((a, b) => (b.upBps + b.downBps) - (a.upBps + a.downBps));
+        rows.sort((a, b) => ((b.upTotal + b.downTotal) - (a.upTotal + a.downTotal)) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
         const top = rows.slice(0, 14);
         // Sum ALL rows (not only the displayed top) so the 合计 line is directly
         // comparable with the engine-level header — any leftover difference is
