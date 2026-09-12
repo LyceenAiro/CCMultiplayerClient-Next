@@ -4,21 +4,22 @@
 
 [![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
 
-An **online multiplayer mod** for [CrossCode](https://www.cross-code.com/). It lets
+An **online multiplayer mod** for [CrossCode](https://www.cross-code.com/), forked
+from [CCMultiplayerClient](https://github.com/CCDirectLink/CCMultiplayerClient). It lets
 several players share the same world: each sees the other players' avatars
 walking around, and the **host's** enemies, projectiles and combat are
 synchronized to everyone else over a central relay server
 ([CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next)).
 
-> **Status:** early development.
-> Main-story test progress: Temple Mine.
+> **Status:** early development. **Current release: 3.0.0** (handshake version —
+> client and server must match).
+> Main-story test progress: Faj'ro Temple (completed).
 > The mod was originally written for CrossCode **1.1.0** and the old
 > **CCLoader v2**. This codebase is **still based on CCLoader v2** (currently
 > the actively-maintained loader),
 > but has been adapted to **CrossCode 1.4.2** (the final game release). It builds cleanly,
-> and the network protocol has been verified end-to-end against the server. However, in-game multiplayer
-> has **not yet been fully battle-tested on a live 1.4.2 install** — see
-> [Known limitations](#known-limitations--to-verify-in-game).
+> and multiplayer has been playtested on live 1.4.2 sessions through Faj'ro Temple.
+> Later story areas are still being unlocked behind the server progress wall.
 >
 > **Development note:** This project is developed with **vibe coding**
 > (AI-assisted development).
@@ -77,8 +78,9 @@ synchronized to everyone else over a central relay server
 - [Project layout](#project-layout)
 - [Network protocol](#network-protocol)
 - [Porting notes (1.1.0 → 1.4.2, on CCLoader v2)](#porting-notes-110--142-on-ccloader-v2)
-- [Known limitations & to verify in-game](#known-limitations--to-verify-in-game)
+- [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
@@ -91,14 +93,14 @@ CrossCode is a single-player game, so "multiplayer" here is really
   of truth for enemies.
 - When a non-host client loads a map, every `Enemy` / `EnemySpawner` entity is
   **stripped out of the map data** before the level builds, and replaced with
-  network-driven **mirror entities** spawned from the host's world.
+  network-driven **mirror entities** (puppets) spawned from the host's world.
 - The host continuously broadcasts entity **position, animation, state, target
   and health**; clients apply those to their mirrors. To stop the local AI /
   physics from fighting the network, a mirror's `coll.pos`, `face`,
   `currentAnim` and `currentState` are replaced with read-only accessors whose
   values only the network may change.
 - Each remote player is rendered locally as a special `multiplayer` enemy
-  (defined in [`assets/assets/data/enemies/multiplayer.json`](assets/assets/data/enemies/multiplayer.json))
+  (defined in [`assets/data/enemies/multiplayer.json`](assets/data/enemies/multiplayer.json))
   whose `anims` are the normal player animations, then re-textured with the
   local player's proxies so it looks like a person.
 - The host can change over the session (**host migration**): if the host
@@ -106,7 +108,8 @@ CrossCode is a single-player game, so "multiplayer" here is really
   back to local control.
 
 Communication is a socket.io relay: clients never talk to each other directly,
-everything goes through `CCMultiplayerServer-Next`.
+everything goes through `CCMultiplayerServer-Next`. The current wire schema is
+compact by default (`netSchema` = standard; a debug schema is optional).
 
 ## Features
 
@@ -115,11 +118,15 @@ everything goes through `CCMultiplayerServer-Next`.
 - **Server list screen** (Minecraft-style): add / delete servers, **direct
   connect** by `host:port`, a live **reachability indicator** (online/offline +
   latency), all without editing the config file.
-- **Version gate** — the server rejects a client whose mod version differs.
-- **Account login** — username is the identity (LAN trust); duplicate logins are
-  rejected and recent usernames are remembered.
+- **Version gate** — the server rejects a client whose mod version differs
+  (current: **3.0.0**).
+- **Account login** — username is the identity (LAN trust); optional password;
+  duplicate logins are rejected and recent usernames are remembered.
 - **Main-city auto-match** — see
   [Main-city (shared town) mechanics](#main-city-shared-town-mechanics).
+- **Progress wall** — the server can list blocked maps (`blockedMaps`). Entry is
+  refused at the door, and anyone already inside is returned to a safe map
+  (Rhombus Square hub by default). Current lock: `autumn-fall.path-01`.
 
 **World & combat sync**
 
@@ -129,75 +136,30 @@ everything goes through `CCMultiplayerServer-Next`.
   the server migrates the host when it leaves.
 - **Player state** — position / facing / animation / HP / SP / charge /
   cutscene / element / combat-class / guard timing.
-- **Enemy sync** — host-authoritative, two cadences (15 Hz base + an
-  option-driven hostile stream), plus enemy sounds / attacks / loot.
-- **Dungeon mechanism sync (1.71.0)** — push/pull boxes, sliding blocks,
-  floating platforms, switches, ice pillars and other puzzle entities sync
-  inside dungeons via a compact `puzzleState` relay + host snapshots.
-- **Dungeon box authority & smoothing (1.71.2)** — only one player can grip a
-  push/pull box; the gripping client is the sole position authority, and other
-  players' boxes follow with per-frame interpolation.
-- **Dungeon box progress is personal (1.71.3)** — "box pushed onto the switch /
-  plate half-lowered" is each player's own save progress (`map.entity…_placed`):
-  `PushPullDest` plates are never networked, and a box that is already placed in
-  YOUR save neither sends nor receives position, so one player's solved puzzle
-  can never overwrite (or delete) another player's unsolved copy.
-- **Dungeon platform authority (1.71.4)** — OL/Dynamic/Extract platform positions
-  are host-authoritative: members apply the host's positions but never echo their
-  own half-finished transition back, so the Temple Chamber 1 pillars sink/rise to
-  their final height instead of oscillating at ~80%.
-- **Dungeon box echo isolation & one-time switch latch (1.71.5)** — unowned
-  push/pull boxes are also host-authoritative (gripping members stay owners), a
-  box is snapped back to its real ground before a grip if it was pulled below
-  ground by stale packets, and permanent
-  `OneTimeSwitch`es (the Temple Chamber 1 attack switch) stay ON once any peer
-  reports them on — a late joiner's stale "not triggered" state can no longer
-  revert the party's solved mechanism or leave an unattackable switch behind.
-- **Follower box vertical freeze (1.71.6)** — while a box's position is
-  network-driven, its local z-physics is frozen; pulling a mechanism-raised box
-  off its platform keeps it on the peer's real floor instead of dropping it into
-  the pit.
-- **Quest kill-progress sync (1.71.7)** — in multiplayer, real enemy defeats now advance the
-  players' quest "kill N" subtasks: **without story sync** enabled, a kill only counts when
-  the enemy died on the map YOU are on; **with story sync** any party member's
-  kill is relayed to the whole party regardless of map.
-- **Real gravity after box release (1.71.8)** — when a teammate lets go of a
-  box, the map-instance host no longer keeps it frozen at the network height:
-  engine gravity resumes immediately, so Temple Chamber 1's upper-left box can
-  be pushed off its ledge and actually falls to the lower floor instead of
-  being pulled back up to the ledge.
-- **1.71.9 fixes & QoL** — keyboard-typable port field in the server list; shared-town shop
-  counters clear stale combat state and auto-retry when a quest-solved dialog is
-  stacked; remote skill charges darken the screen with one non-stacking effect
-  tied to the party charge time-stop; light/full-party banners no longer render
-  blank rectangles; member network badges show the **relative latency** between you and that
-  player; side-quest sync no longer rolls back or removes progress on end
-  (already-solved players see a temporary "[Sync]" quest entry, no rewards);
-  main-story sync clamps ahead-teammates to the leader's progress every frame;
-  names are hidden during synced story videos; buffalo charge footstep loops
-  are stopped correctly; sync-start fanfare volume increased; off-screen teammate
-  arrows and area/world-map teammate avatars were added.
-- **1.71.10 external UI scale** — the Multiplayer options tab gains an
-  **External UI Scale** setting (Auto / 50% / 75% / 100% / 125% / 150% / 200% /
-  300% / 400%). It scales every mod-owned DOM surface — panels, server list,
-  login, chat, toasts, tooltips, story banners, save block and off-screen
-  teammate arrows — in one go. Auto uses the game's launch window size as
-  100% and then follows window resizing; the fixed tiers are exact
-  multipliers. In-canvas name tags follow the same setting (Auto = native
-  game zoom).
-- **Host handoff preserves enemy state (1.71.0)** — a sleeping/passive enemy
-  stays asleep when the instance host migrates.
-- **Host handoff keeps enemy spawn settings (1.71.2)** — the original
-  `enemyInfo` attributes (`activeIf`, etc.) are shipped with the enemy block and
-  restored on respawn, so the Temple Mine elevator bots stay asleep before the
-  story unlock instead of waking instantly.
-- **Story-leader action relay (1.71.0)** — external animations (sitting down,
-  poses) the story leader performs are replayed on every member's leader
-  mirror.
-- **Combat feedback** — enemy hits, guards & perfect guards, counter /
-  guard-break FX, skill sound/FX replay, and party-wide charge time-stop.
+- **Enemy sync** — host-authoritative, two cadences (base + option-driven
+  hostile stream), plus enemy sounds / attacks / loot / AR messages / FX.
+- **Dungeon mechanism sync** — push/pull boxes, sliding blocks, floating
+  platforms, switches, ice pillars and other puzzle entities sync via a compact
+  `puzzleState` relay + host snapshots. Box grip ownership is host-authoritative
+  with per-frame interpolation; already-placed boxes stay personal save state.
+- **Quest kill-progress sync** — with **story sync**, any party member's kill
+  advances the whole party; without it, only same-map kills count.
+- **Story sync** — party-wide main-story / side-quest progress with a leader
+  authority stream, gather-on-trigger cutscenes, and skip votes.
+- **Boss handoff** — host relays boss phase and scripted boss-defeat cutscenes so
+  members stay in sync with the host's cinematic.
+- **Trading** — player-to-player trade with server-side ratio and a lockout
+  window after save import / mirror rollback (anti-dupe).
+- **Soft-death revive** — in combat, a downed player can be revived after a
+  countdown (HP fraction and time are server-configurable; boss fights use
+  stricter defaults).
+- **Combat feedback** — enemy hits, guards & perfect guards (with ping
+  compensation for members), counter / guard-break FX, skill sound/FX replay,
+  and party-wide charge time-stop.
 - **Death & respawn** — downed players become spectators; a full-party wipe
   reloads the checkpoint in lockstep.
+- **Guest QoL** — temporary cutscene companions, dream-FX cleanup, cutscene
+  unstuck, skill-guard, and similar hardening for diverged clients.
 
 **Social & party**
 
@@ -209,9 +171,9 @@ everything goes through `CCMultiplayerServer-Next`.
   friends can follow as "mod bots". In dungeons every network bot is culled
   (vanilla rule: follower entities are hidden inside dungeons), and they return
   automatically on leaving.
-- **Story-locked companions (1.71.0)** — companions are only unkickable when
+- **Story-locked companions** — companions are only unkickable when
   the game's own `SET_MEMBER_LOCKED` flag is on, exactly matching the vanilla
-  Social menu logic; once a story event unlocks them the normal kick works again.
+  Social menu logic.
 - **Room players** — see who is in your current map instance, plus a live online
   counter.
 - **Party chat** — press Enter for a chat input with history and speech-bubble
@@ -225,24 +187,23 @@ everything goes through `CCMultiplayerServer-Next`.
   portraits and the element indicator, with hover tooltips.
 - **Network debug HUD** — live upload/download rates, packet loss, cumulative
   totals.
-- **Mod options tab** — a dedicated "Multiplayer" options tab in the game menu.
+- **Mod options tab** — a dedicated "Multiplayer" options tab in the game menu,
+  including **external UI scale** and wire-schema preference.
 - **Quick-menu (SHIFT) inspection** — online players and party bots are
   inspectable, with an add/remove-friend button.
 - **Direct save+upload** — the bag-menu / ESC-menu save buttons upload straight
   to the server while connected.
-- **Command box (F8)** — run `mp.*` console commands without DevTools.
+- **Off-screen teammate arrows** and area/world-map teammate avatars.
+- **Item-use / heal indicators** for other players.
 
 **Saves & persistence**
 
 - **Cloud saves** — your save is streamed from the server on login and restored;
   it uploads (chunked + rate-limited) on save and on exit-to-title.
-- **Save mirror rollback (1.71.0)** — the server keeps the last **five distinct
+- **Save mirror rollback** — the server keeps the last **five distinct
   save images** per player. The login screen's **Rollback from Mirror** button
   logs in with the save stream held, shows the five snapshots with timestamps,
-  and restores whichever one you pick.
-- **Mirror picker close (1.71.4)** — the rollback picker has a **×** button that
-  logs out, closes the socket and returns to the title screen without entering
-  the game.
+  and restores whichever one you pick (picker can be closed with **×**).
 - **Anti-spam** — area-save throttling and a login-time upload suppression window.
 - **Local persistence** — server list, options, login history and chat history
   survive restarts (localStorage).
@@ -283,9 +244,9 @@ Behaviour:
 | Component | Version |
 | --- | --- |
 | CrossCode | **1.4.2** (final release; the game is no longer updated) |
-| Mod loader | **CCLoader v2** (the current, actively-maintained loader) — it bundles the `simplify` library this mod uses |
-| Node.js (build + server) | ≥ 18 |
-| Relay server | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next) |
+| Mod loader | **CCLoader v2** — it bundles the `simplify` library this mod uses |
+| Node.js (build) | ≥ 18 |
+| Relay server | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next) **3.0.0** (Node ≥ 14) |
 
 ## Building
 
@@ -298,10 +259,18 @@ This produces `dist/`:
 
 ```
 dist/
-├─ mod.js               # the mod, one bundled classic script (runs via CCLoader v2 `main`)
-├─ mod.js.map
-├─ data/enemies/multiplayer.json   # game asset (mirror-player enemy type)
-└─ config/config.json              # default server list
+├─ mod.js       # the mod, one bundled classic script (CCLoader v2 `main`)
+└─ mod.js.map
+```
+
+Game assets and the default server list are **not** copied into `dist/` —
+CCLoader v2 loads them from the mod folder:
+
+```
+assets/
+├─ data/enemies/multiplayer.json          # mirror-player enemy type
+└─ media/sound/storysync/*.ogg            # story-sync fanfare / quest sounds
+config/config.json                        # default server list
 ```
 
 Useful scripts:
@@ -318,8 +287,8 @@ Useful scripts:
    (see the [CCLoader repo](https://github.com/CCDirectLink/CCLoader)). It ships
    with the `simplify` library mod, which this mod depends on.
 2. Copy this mod folder into the game's `assets/mods/` directory so that the
-   mod's `package.json` / `ccmod.json` sits at `assets/mods/multiplayer/`, with
-   the compiled `dist/` next to it.
+   mod's `package.json` sits at `assets/mods/multiplayer/`, with the compiled
+   `dist/` next to it.
 3. The manifest's `main` already points at the bundle (`"main": "dist/mod.js"`),
    and `ccmodDependencies` declares `simplify`, so the loader wires everything up.
 
@@ -329,7 +298,7 @@ Useful scripts:
    ```bash
    cd CCMultiplayerServer-Next
    npm install
-   npm start          # listens on *:1423
+   npm start          # listens on *:15151 by default
    ```
 2. Add the server to `config/config.json` (or use the bundled default).
 3. Launch the game with CCLoader v2. On the **title screen** the second menu
@@ -338,14 +307,13 @@ Useful scripts:
 
 ## Configuration
 
-`config/config.json` (copied to `dist/config/config.json` at build time) lists
-the servers shown in the in-game picker:
+`config/config.json` lists the servers shown in the in-game picker:
 
 ```json
 {
 	"servers": [
-		{ "hostname": "localhost", "port": 1423, "type": "http" },
-		{ "display": "Public server", "hostname": "example.com", "port": 1423, "type": "http" }
+		{ "hostname": "localhost", "port": 15151, "type": "http" },
+		{ "display": "Public server", "hostname": "example.com", "port": 15151, "type": "http" }
 	]
 }
 ```
@@ -353,32 +321,55 @@ the servers shown in the in-game picker:
 - `hostname` / `port` / `type` — where the socket.io relay lives (`type` is the
   URL scheme, `http` or `https`).
 - `display` — optional friendly name shown in the server picker.
+- Default port when adding a new entry in the UI is **15151**.
+
+Server-side gameplay knobs (monster scaling, trade, AFK, progress wall, admin
+page, …) live in the **server** `config.json` — see the server README.
 
 ## Project layout
 
 ```
 src/
 ├─ main.ts                     # CCLoader v2 entry point (`main` stage, waits for modsLoaded)
-├─ multiplayer.ts              # orchestrator: connect, GUI hijack, entity registry
-├─ config.ts / configFile.ts   # server-list config loading (via simplify)
+├─ multiplayer.ts              # orchestrator: connect, GUI hijack, entity registry, version
+├─ config.ts / configFile.ts   # server-list config loading
 ├─ connection.ts               # IConnection interface (the wire protocol surface)
 ├─ connectors/SocketIOConnector.ts  # socket.io implementation of IConnection
 ├─ simplify.d.ts               # typings for the Simplify library bundled with CCLoader v2
 ├─ loadScreenHook.ts           # LEGACY: reused the Load-game menu (now ui/serverList.ts)
 ├─ types.d.ts                  # shared Vec2/Vec3 shapes
+├─ i18n.ts                     # UI strings (en / zh-CN / zh-TW, …)
 ├─ mpEntity.ts / player.ts / server.ts / ballInfo.ts / entityDefinition.ts
+├─ models/identifyResult.ts
+├─ util/areaUtil.ts            # area path / type / unlock helpers
 ├─ listeners/
 │  ├─ game/                    # watch LOCAL game state → broadcast changes
-│  │  ├─ entityListener.ts  playerListener.ts   # per-frame entity/player pumps
-│  │  ├─ onPlayerMove/Animation/HealthChange.ts # "me" → server
+│  │  ├─ entityListener.ts  playerListener.ts
+│  │  ├─ onPlayerMove/Animation/HealthChange.ts
 │  │  ├─ onEntityMove/Animation/HealthChange/StateChange/TargetChange.ts
-│  │  ├─ onEntitySpawn.ts onKill.ts             # host authoritative spawn/kill
-│  │  ├─ onMapEnter.ts onMapLoaded.ts onTeleport.ts
+│  │  ├─ onEntitySpawn.ts onKill.ts
+│  │  └─ onMapEnter.ts onMapLoaded.ts onTeleport.ts
 │  └─ connection/              # apply REMOTE state → local world
 │     ├─ onSetHost.ts onPlayerChangeMap.ts onRegisterEntity.ts onKillEntity.ts
 │     ├─ onThrowBall.ts onUpdatePosition/Animation/AnimationTimer.ts
 │     └─ onUpdateEntity{Position,Animation,State,Target,Health}.ts
-└─ models/identifyResult.ts
+├─ sync/                       # higher-level multiplayer systems
+│  ├─ netSync.ts               # host enemy stream, puppets, combat relay
+│  ├─ storySync.ts             # story / quest sync controller
+│  ├─ puzzleSync.ts            # dungeon puzzle entities
+│  ├─ cutsceneRelay.ts         # gather-on-trigger story moments
+│  ├─ cutsceneActorGuard.ts    # missing scene actors + unstuck
+│  ├─ tempPartyBot.ts          # temporary cutscene companions
+│  ├─ dreamFxGuard.ts          # orphaned dream FX / rumble cleanup
+│  ├─ tradeSync.ts             # player trade
+│  ├─ bubbleSync.ts / ghostChests.ts / skillGuard.ts / saveUploadQueue.ts
+│  ├─ wireSchema.ts / pvpIsolation.ts
+└─ ui/                         # DOM / in-game UI
+   ├─ serverList.ts  mpOptions.ts  chatBox.ts  socialMenuInject.ts
+   ├─ socialOverlay.ts  quickMenuInject.ts  netBadge.ts  uiScale.ts
+   ├─ teammateIndicators.ts  mapTeamAvatars.ts  itemUseIndicator.ts
+   ├─ healSync.ts  aimLineIndicators.ts  saveButtons.ts  toasts.ts
+   ├─ unstuckButton.ts  versionDisplay.ts  deathLineHud.ts  shopDiag.ts
 ```
 
 ## Network protocol
@@ -387,24 +378,27 @@ Plain socket.io events. Client→server and server→client use the same event
 names; the server relays to the relevant room members. The handshake:
 
 ```
-client → server  "handshake"          { username, version, client }
-server → client  "handshakeResponse"  { success, host, username, mapName }
+client → server  "handshake"          { username, password?, version, client }
+server → client  "handshakeResponse"  { success, host, username, mapName, …tuning }
 ```
 
-Then, per map membership:
+`handshakeResponse` also carries server gameplay tuning (monster HP/ATK scales,
+soft-death revive, trade rules, relay rate caps, `blockedMaps`, …). After
+handshake the save is streamed as paced `saveDownload` parts.
 
-| Event | Direction | Payload | Notes |
-| --- | --- | --- | --- |
-| `changeMap` | C→S | `{name, marker}` | server relays membership via `onPlayerChangeMap` |
-| `onPlayerChangeMap` | S→C | `{player, enters, position, map, marker}` | spawn/remove a remote avatar |
-| `updatePosition` / `updateAnimation` / `updateAnimationTimer` | both | pos / `{face,anim}` / timer | "me" avatar state |
-| `registerEntity` / `killEntity` | both | `{id,type,pos,settings}` / `{id}` | host-authoritative entities |
-| `updateEntityPosition` / `…Animation` / `…State` / `…Target` / `…Health` | both | `{id, …}` | mirror entity state |
-| `throwBall` | both | `{ballInfo, combatant, dir, party}` | projectiles |
-| `puzzleState` | C→S/S→C | `{map, entries}` | 1.71.0 dungeon puzzle snapshots; 1.71.2 adds `own`/`ot` box-grip ownership; 1.71.3 stops relaying PushPullDest / solved-box progress (personal save state) |
-| `questKill` | C→S/S→C | `{enemy, map}` | 1.71.7 quest kill-progress relay: story-sync parties cross maps; otherwise same instance only |
-| `saveMirrorRestore` | C→S | `{index}` | 1.71.0 restore one of the five save mirrors |
-| `setHost` | S→C | `isHost` | host migration |
+High-level event groups (not exhaustive — the wire is large):
+
+| Group | Examples | Notes |
+| --- | --- | --- |
+| Session | `changeMap` / `onPlayerChangeMap`, `setHost`, `logout` | membership + host migration |
+| Avatar | `updatePosition`, `updateAnimation`, `playerState` | "me" avatar + compact player block |
+| Enemies | `entityState`, `registerEntity` / `killEntity`, `enemyAttack`, `enemySound`, `enemyFx` | host-authoritative |
+| Combat | `throwBall`, `combatHit`, `combatResult`, `latePerfectGuard`, `skillFx` | hits, guards, skills |
+| Dungeon | `puzzleState`, `elevatorSync`, `bombState` / `bombHandoff`, `bubbleState` | puzzle entities |
+| Story | `cutsceneTrigger`, `cutsceneEntity`, `bossPhase`, `bossDefeat`, `questKill`, `spawnVar` | story / boss / quest |
+| Social | `party*`, `friend*`, `trade*` | party, friends, trading |
+| Saves | `saveChunk`, `saveDownload`, `saveMirrorRestore` | cloud save + mirror rollback |
+| Meta | `mpPing` / `netPing`, `netSchemaPref`, admin acks | ping, schema, admin |
 
 ## Porting notes (1.1.0 → 1.4.2, on CCLoader v2)
 
@@ -416,15 +410,15 @@ the build.
 
 **Loading mechanism (unchanged — CCLoader v2)**
 - Still a classic script loaded via the manifest's `main` stage, bootstrapped
-  off the global `modsLoaded` DOM event, with `ccmod.json` declaring the
+  off the global `modsLoaded` DOM event, with `ccmodDependencies` declaring the
   runtime deps (`ccloader`, `crosscode`, `simplify`). A `package.json` manifest
   is also kept in sync for npm.
 
 **Build tooling (modernised)**
 - webpack → **esbuild**, emitting a single classic (IIFE) script `dist/mod.js`
-  that v2 runs directly. (socket.io-client is *not* bundled — under v2 the mod
-  fetches the matching client library from the server at connect time via
-  `simplify.loadScript`, exactly as before.)
+  that v2 runs directly. Runtime socket.io is still fetched from the relay
+  server at connect time via `simplify.loadScript` (matching client/server
+  library versions); the npm package is used for TypeScript types.
 - Hand-maintained `src/@types/*` →
   [`ultimate-crosscode-typedefs`](https://github.com/CCDirectLink/ultimate-crosscode-typedefs)
   (CrossCode 1.4.0), vendored under `vendor/`, plus a small local
@@ -446,30 +440,23 @@ the build.
   frame. Now stores the real state.
 
 **Server**
-- Unchanged functionally — it is a game-agnostic socket.io relay. Refreshed
-  `package.json` metadata and verified `socket.io@4.x` interop with the client's
-  `socket.io-client@4.8.x`, including a live handshake test.
+- Game-agnostic socket.io relay, but heavily extended for Next (accounts,
+  cloud saves + mirrors, parties, friends, trading, admin UI, progress wall,
+  rate caps). Requires matching client **3.0.0**.
 
-## Known limitations & to verify in-game
-
-These are the spots that can only be confirmed on a **live 1.4.2 + CCLoader v2**
-install (they cannot be validated by compiling):
+## Known limitations
 
 - **Title-screen button hijack.** `initializeGUI()` relabels a title-screen
   button by a *fixed index* (`buttons[1]` or `[2]` depending on platform). It
-  now warns instead of crashing if the layout changed, but the index should be
-  confirmed against the real 1.4.2 title screen.
-- **Server list screen** is a dedicated DOM overlay (add / delete / direct
-  connect / connectivity ping) opened from the relabelled title-screen button;
-  worth a smoke test on the real 1.4.2 title screen.
-- **Combat correctness.** The mirror-entity property-locking trick
-  (`coll.pos`, `face`, `currentAnim`, `currentState`) is inherently
-  version-sensitive; expect to tune it for 1.4.2 combat.
-- **DLC / New Game+ content.** The mod predates the *A New Home* DLC; enemy
-  types and maps added after 1.1.0 are synced by the same generic mechanism but
-  were never tested.
+  warns instead of crashing if the layout changed.
+- **Later story areas.** Content past the current progress wall
+  (`autumn-fall.path-01` and beyond) is not fully playtested yet.
+- **DLC / New Game+ content.** Enemy types and maps added after 1.1.0 use the
+  same generic sync path but may still need tuning.
 - `ig.game.teleport` / `spawnEntity` are wrapped by direct assignment; other
   mods doing the same could conflict.
+- The in-game F8 debug command box is **disabled for players** (tester-only
+  surface; it could desync the server).
 
 If you test on a live install, the browser console (`[multiplayer] …` logs) is
 the first place to look.
@@ -477,10 +464,12 @@ the first place to look.
 ## Troubleshooting
 
 - **"Could not locate the title-screen button to hijack"** — the title screen
-  layout differs; adjust `buttonNumber`/`children[2]` in `multiplayer.ts`.
-- **No servers in the picker** — `config/config.json` wasn't copied; run
-  `npm run build` and reinstall the mod folder.
-- **"Could not login"** — that username is already connected to the server.
+  layout differs; adjust `buttonNumber` in `multiplayer.ts`.
+- **No servers in the picker** — `config/config.json` wasn't present; add one
+  or reinstall the mod folder.
+- **"Could not login"** — that username is already connected to the server, or
+  the password is wrong / the account is locked.
+- **Version mismatch** — client and server must both be **3.0.0**.
 - **Mod doesn't appear / doesn't load in CCLoader v2** — confirm the manifest's
   `main` points at `dist/mod.js`, that `dist/mod.js` was actually built, and
   that the `simplify` mod is installed and enabled (it's listed under
@@ -488,3 +477,8 @@ the first place to look.
 - **"Could not find our own mod via simplify.getMod()"** — the mod folder must
   be named/detected as `multiplayer` (the manifest `name`), which is what
   Simplify looks up.
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE)
+file for details.
