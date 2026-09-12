@@ -60,7 +60,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '0.2.6';
+export const MP_VERSION = '3.0.0';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -347,6 +347,8 @@ export class Multiplayer {
 	 * normalized to lowercase DOTTED form (config.js sanitizes; older servers
 	 * omit the field -> empty set -> feature off). */
 	public blockedMaps: Set<string> = new Set<string>();
+	/** 0.2.6: throttle for walk-back-from-blocked-edge (ms). */
+	private _mpWallWalkBackUntil = 0;
 	/** ROUND 162: two-map non-blocked history (onMapEnter; normalized dotted
 	 * form) — kick-back targets when a player somehow ends up INSIDE a blocked
 	 * map (the engine's own previousMap is preferred; these are the fallback). */
@@ -425,18 +427,25 @@ public bubbleSync?: IBubbleSync;
 	/** ROUND 162: we somehow ENDED UP inside a blocked map (save-spawn before
 	 * login, a loadLevel path that bypassed the teleport gate, or the map was
 	 * blocked mid-session) — teleport back out. Target preference: the engine's
-	 * own previousMap, then the non-blocked history, then the mod's established
-	 * safe town. Deferred + re-checked: callers are in login/map-enter contexts
-	 * where an immediate re-teleport would race the in-flight load. */
+	 * own previousMap, then the non-blocked history, then the established safe
+	 * town (rhombus-sqr.central). Deferred + re-checked: callers are in
+	 * login/map-enter contexts where an immediate re-teleport would race the
+	 * in-flight load. 0.2.6: retries the hub teleport if we are still inside
+	 * after the first attempt (login-time races left players stranded, and a
+	 * stranded save then hit the restore-fail "start fresh" path = save reset). */
 	public kickFromBlockedMap(map: string): void {
 		try {
 			console.warn('[multiplayer] progress wall: inside blocked map ' + map + '; kicking back');
-			setTimeout(() => {
+			const attempt = (left: number) => {
 				try {
 					const g: any = ig.game;
 					const normOf = (v: any) => String(v || '').trim().toLowerCase().split('/').join('.');
 					const cur = normOf(g && g.mapName);
 					if (!cur || !this.isMapBlocked(cur)) return; // already left by other means
+					if (!g || !g.playerEntity || (ig as any).loading || (typeof g.isTeleporting === 'function' && g.isTeleporting())) {
+						if (left > 0) setTimeout(() => attempt(left - 1), 800);
+						return;
+					}
 					let target = '';
 					const prev = normOf(g && g.previousMap);
 					if (prev && prev !== cur && !this.isMapBlocked(prev)) target = prev;
@@ -444,10 +453,119 @@ public bubbleSync?: IBubbleSync;
 					else if (this.prevSafeMap && this.prevSafeMap !== cur && !this.isMapBlocked(this.prevSafeMap)) target = this.prevSafeMap;
 					else target = 'rhombus-sqr.central';
 					try { showMpToast({ title: t('mpWallKicked') }); } catch (_) { /* ignore */ }
+					console.warn('[multiplayer] progress wall: teleporting out of ' + cur + ' -> ' + target);
 					g.teleport(target);
-				} catch (_) { /* ignore */ }
-			}, 1500);
+					// Re-check shortly after: if the first target itself failed or the
+					// teleport was swallowed during login, escalate to the hub.
+					if (left > 0) {
+						setTimeout(() => {
+							try {
+								const now = normOf(ig.game && (ig.game as any).mapName);
+								if (now && this.isMapBlocked(now)) attempt(left - 1);
+							} catch (_) { /* ignore */ }
+						}, 1200);
+					}
+				} catch (_) {
+					if (left > 0) setTimeout(() => attempt(left - 1), 800);
+				}
+			};
+			setTimeout(() => attempt(3), 1500);
 		} catch (_) { /* ignore */ }
+	}
+
+	/** 0.2.6 (progress wall boundary): TeleportGround starts a BLOCKING
+	 * DO_ACTION walk-into-the-edge + TELEPORT event. Cancelling only
+	 * ig.game.teleport leaves the player mid-walk inside the boundary with
+	 * slip-through / ignoreCollision — "走进边界后再也无法出来". Refuse the
+	 * whole event and walk the player back out. */
+	public walkBackFromBlockedEdge(player: any, ground: any): void {
+		try {
+			if (!player || !player.coll || !ig.game || !ig.game.playerEntity) return;
+			if ((sc as any).model && (sc as any).model.isCutscene && (sc as any).model.isCutscene()) return;
+			const now = Date.now();
+			if (this._mpWallWalkBackUntil && now < this._mpWallWalkBackUntil) return;
+			this._mpWallWalkBackUntil = now + 2500;
+			// Let the player walk again if the ground already flipped ignoreCollision.
+			try { if (ground && ground.coll) ground.coll.ignoreCollision = false; } catch (_) { /* ignore */ }
+			const pos = player.coll.pos;
+			const size = ground && ground.coll && ground.coll.size;
+			const gpos = ground && ground.coll && ground.coll.pos;
+			let dx = 0, dy = 0;
+			if (gpos && size) {
+				const gx = gpos.x + size.x / 2;
+				const gy = gpos.y + size.y / 2;
+				dx = pos.x - gx;
+				dy = pos.y - gy;
+			}
+			if (Math.abs(dx) < 12 && Math.abs(dy) < 12) {
+				// Standing on the pad centre: push opposite the pad's spawn face.
+				// rookie-harbor.east "north" has dir SOUTH (arrive facing south) —
+				// walking IN is northward, so push south.
+				const dir = String((ground && ground.dir) || 'SOUTH');
+				if (dir === 'SOUTH') dy = 56;
+				else if (dir === 'NORTH') dy = -56;
+				else if (dir === 'EAST') dx = 56;
+				else dx = -56;
+			} else {
+				const len = Math.sqrt(dx * dx + dy * dy) || 1;
+				dx = (dx / len) * 56;
+				dy = (dy / len) * 56;
+			}
+			const lvl = (player.coll.pos && (player.coll.pos as any).lvl !== undefined)
+				? String((player.coll.pos as any).lvl) : '0';
+			const tx = pos.x + dx;
+			const ty = pos.y + dy;
+			const steps: any[] = [{
+				type: 'DO_ACTION',
+				entity: { player: true },
+				repeating: false,
+				wait: true,
+				keepState: false,
+				action: [
+					{ type: 'SET_SLIP_THROUGH', value: false },
+					{ type: 'SET_RELATIVE_SPEED', value: 1 },
+					{ type: 'MOVE_TO_POINT', target: { x: tx, y: ty, lvl }, precise: false, maxTime: 1.2 },
+					{ type: 'SET_SLIP_THROUGH', value: false },
+				],
+			}];
+			const ev = new (ig as any).Event({ steps });
+			(ig.game as any).events.callEvent(ev, (ig as any).EventRunType.PARALLEL);
+			console.log('[multiplayer] progress wall: walking player back from blocked edge -> '
+				+ Math.round(tx) + ',' + Math.round(ty));
+		} catch (_) { /* never break collision */ }
+	}
+
+	/** 0.2.6: hook TeleportGround so a blocked target never starts the
+	 * walk-in + TELEPORT blocking event. Idempotent. */
+	private installProgressWallGuards(): void {
+		try {
+			const TG: any = (ig.ENTITY as any) && (ig.ENTITY as any).TeleportGround;
+			if (!TG || typeof TG.inject !== 'function') return;
+			if ((TG as any)._mpWallGuard) return;
+			(TG as any)._mpWallGuard = true;
+			const self = this;
+			TG.inject({
+				collideWith: function (this: any, a: any, d: any) {
+					try {
+						if (this.map && self.isMapBlocked(this.map)) {
+							const g: any = ig.game;
+							const touching = !!(g && typeof g.isPlayerTouch === 'function' && g.isPlayerTouch(this, a, d));
+							const zOk = !!(a && a.coll && this.coll && a.coll.pos.z === this.coll.pos.z);
+							if (touching && zOk && g.isInterruptible && g.isInterruptible()
+								&& !(sc as any).model.isMapLeaveBlocked()) {
+								self.onProgressWallBlock(this.map);
+								self.walkBackFromBlockedEdge(a, this);
+							}
+							return; // never start the walk+teleport event
+						}
+					} catch (_) { /* fall through to native */ }
+					return this.parent(a, d);
+				},
+			});
+			console.log('[multiplayer] progress wall TeleportGround guard installed');
+		} catch (e) {
+			console.warn('[multiplayer] progress wall TeleportGround guard failed', e);
+		}
 	}
 
 	public getAreaPathOfMap(mapName: string): string {
@@ -3786,7 +3904,7 @@ public bubbleSync?: IBubbleSync;
 				return;
 			}
 		} catch (e) { /* fall through */ }
-		console.warn('[multiplayer] nw.gui DevTools unavailable here; use the in-game command box (press F8)');
+		console.warn('[multiplayer] nw.gui DevTools unavailable here');
 	}
 
 	/** Executes a chat-style command, e.g. run("skipPrologue") / run("saveHere"). */
@@ -4659,6 +4777,10 @@ public bubbleSync?: IBubbleSync;
 				this.tempPartyBots = installTempPartyBotSupport(() => this);
 				this.tempPartyBots.install();
 			} catch (e) { console.warn('[multiplayer] temp party bot install failed', e); }
+			// 0.2.6 (progress wall): TeleportGround walk-in + TELEPORT must not
+			// start at all for a blocked target — cancelling only the teleport
+			// left players stuck inside the boundary.
+			try { this.installProgressWallGuards(); } catch (e) { console.warn('[multiplayer] progress wall guard failed', e); }
 			// 1.77.x (cutscene actor guard): missing/hidden scene actors (spawnCond-
 			// gated NPCs, already-defeated monsters) wedged the blocking event call
 			// forever on diverged clients. JIT-materialize them at ig.Event.getEntity,
@@ -5744,9 +5866,34 @@ public bubbleSync?: IBubbleSync;
 			// uploaded our _mp pseudo-players). Restoring such a save crashes
 			// the party HUD (addObserver on an undefined PartyMemberModel).
 			this.cleanRestoredParty(slot.getData());
+			// 0.2.6 (progress wall): loadSlot teleports to c.map. If the save
+			// was written while standing inside a blocked map, that teleport is
+			// cancelled by the wall gate and the half-applied load races
+			// ig.game.start() ("Failed to restore... starting fresh" = save
+			// reset). Rewrite the spawn to the hub BEFORE loadSlot.
+			try {
+				const d: any = slot.getData();
+				const savedMap = d && d.map;
+				if (savedMap && this.isMapBlocked(savedMap)) {
+					console.warn('[multiplayer] progress wall: save spawn "' + savedMap
+						+ '" is blocked — redirecting restore to rhombus-sqr.central');
+					d.map = 'rhombus-sqr.central';
+					d.position = null;
+				}
+			} catch (_) { /* ignore */ }
 			(ig as any).storage.loadSlot(slot, true);
 			this._mpRestorePending = false;
 			console.log('[multiplayer] Restored server save' + (data !== raw ? ' (bridge start, playtime zeroed)' : ''));
+			// Belt-and-braces: if anything still landed us inside a blocked map,
+			// kick out on the next frames (loadSlot's teleport may still race).
+			try {
+				setTimeout(() => {
+					try {
+						const cur = (ig.game && (ig.game as any).mapName) || '';
+						if (cur && this.isMapBlocked(cur)) this.kickFromBlockedMap(cur);
+					} catch (_) { /* ignore */ }
+				}, 800);
+			} catch (_) { /* ignore */ }
 		} catch (e) {
 			this._mpRestorePending = false;
 			console.error('[multiplayer] Failed to restore server save, starting fresh', e);

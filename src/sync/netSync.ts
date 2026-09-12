@@ -887,6 +887,16 @@ export class NetSync {
 		if (typeof (conn as any).onBossPhase === 'function') {
 			(conn as any).onBossPhase((data: any) => this.applyBossPhase(data));
 		}
+		// 0.2.6: HOST's scripted boss-defeat cutscene just started (manualKill var
+		// written). Stage the same BossDies cinematic on this client IMMEDIATELY —
+		// do NOT wait for the entityState h<=0 block. That wait is the root cause of
+		// "客机死亡动画等主机播完才开始": by the time h<=0 arrives and local staging
+		// runs (or fails and falls through to reap), the host's cinematic is already
+		// playing/ending and the member only sees a generic death when the corpse
+		// leaves the stream.
+		if (typeof (conn as any).onBossDefeat === 'function') {
+			(conn as any).onBossDefeat((data: any) => this.applyBossDefeat(data));
+		}
 		// A party teammate genuinely fell into a fall terrain (water/hole/...) —
 		// replay the splash + fall-damage visual on their mirror (replica-local
 		// terrain falls are suppressed, so genuine falls arrive via this relay).
@@ -982,6 +992,10 @@ export class NetSync {
 		// 1.75.x (boss-phase quick revive): wrap EnemyType.resolveHpBreak so the
 		// host notices the exact frame a boss crosses a phase threshold.
 		this.installBossPhaseHook();
+		// 0.2.6: wrap ig.vars.set so the HOST relays the exact frame its scripted
+		// boss writes the manualKill var (engine death path). Members stage
+		// BossDies from that packet, not from a later h<=0 entityState block.
+		this.installBossDefeatRelay();
 		// ...and wrap sc.Cutscene.startCombatCutscene for event-driven phase
 		// transitions (e.g. tree-dng f4 whale <-> ape) that have no hpBreak.
 		this.installCombatCutsceneHook();
@@ -1042,6 +1056,11 @@ export class NetSync {
 			// and run as that member's own story enemy (streamed as a cutscene entity),
 			// otherwise the host's hidden copy keeps re-hiding it and the waves never show.
 			try { this.installQuestEnemyShowHook(); } catch (e) { console.warn('[netsync] quest-enemy show hook failed', e); }
+			// 0.2.6 (heat-dng.f3.room-07): block the member-side ALWAYS add-spawner
+			// loop (JellySpawner / midboss jellyfishRespawn) while the host owns the
+			// adds — otherwise it keeps SPAWN_ENEMYing copies that the suppress path
+			// then kills ("刷出一个敌人然后瞬间死亡").
+			try { this.installEncounterSpawnerGate(); } catch (e) { console.warn('[netsync] encounter-spawner gate failed', e); }
 			// 1.75.x (quest enemy AR labels): capture REAL enemy SHOW_AR_MSG steps so
 			// teammates replay [饥饿的叫声] / [舔树] floating windows on their puppets.
 			try { this.installEnemyArMsgHook(); } catch (e) { console.warn('[netsync] enemy AR hook failed', e); }
@@ -6402,6 +6421,69 @@ export class NetSync {
 				e._mpBossCineAt = Date.now();
 				try { e.dying = (sc as any).DYING_STATE ? (sc as any).DYING_STATE.DYING : 2; } catch (_) { /* ignore */ }
 				try { e.defeatNotified = true; } catch (_) { /* ignore */ }
+				// 0.2.6 (客机死亡姿态 / 向上飞走): freeze the corpse at the death spot
+				// and KEEP lockEntity. BossDies only SHOW_EFFECTs the boss (no SET_ANIM /
+				// SET_ENTITY_POS on it — those post-kill steps target the PLAYER), so
+				// unlocking is unnecessary. unlockEntity restored native coll.pos and
+				// let ActorEntity float physics re-engage: megamoth.float.height keeps
+				// driving z toward hover altitude and the flight currentAnim stays —
+				// the "dead" moth visibly flew upward. Zero vel + gravity + float, and
+				// leave the pos lock in place so physics writes are dropped.
+				try {
+					if (e.coll) {
+						if (e.coll.vel) { e.coll.vel.x = 0; e.coll.vel.y = 0; e.coll.vel.z = 0; }
+						e.coll.zGravityFactor = 0;
+						if (e.coll.float) {
+							e.coll.float.height = 0;
+							e.coll.float.variance = 0;
+							if (typeof e.coll.float.maxSpeed === 'number') e.coll.float.maxSpeed = 0;
+						}
+					}
+					if (e.vel) { e.vel.x = 0; e.vel.y = 0; e.vel.z = 0; }
+					if ((e as any).float) {
+						(e as any).float.height = 0;
+						(e as any).float.variance = 0;
+					}
+				} catch (_) { /* ignore */ }
+				// Snap to the last host-streamed death position (still lockEntity'd
+				// here, so write through xProtected). Clearing _mpTo* stops
+				// interpolatePuppets from gliding the corpse toward later host
+				// samples (the cutscene may SET_ENTITY_POS on its own).
+				try {
+					const cpS: any = e.coll && e.coll.pos;
+					if (cpS && typeof (e as any)._mpToX === 'number') {
+						if (typeof cpS.xProtected === 'number') {
+							cpS.xProtected = (e as any)._mpToX;
+							cpS.yProtected = (e as any)._mpToY;
+							cpS.zProtected = (e as any)._mpToZ;
+						} else {
+							cpS.x = (e as any)._mpToX;
+							cpS.y = (e as any)._mpToY;
+							cpS.z = (e as any)._mpToZ;
+						}
+						this._mpMarkCollDirty(e);
+					}
+					(e as any)._mpToX = undefined;
+					(e as any)._mpToY = undefined;
+					(e as any)._mpToZ = undefined;
+				} catch (_) { /* ignore */ }
+				// Same death flash the engine plays in _onDeathHit (pre_die loop).
+				try {
+					const fx: any = e.effects && e.effects.death;
+					if (fx && typeof fx.spawnOnTarget === 'function') {
+						fx.spawnOnTarget('pre_die', e, { duration: -1 });
+					}
+				} catch (_) { /* cosmetic */ }
+				// 0.2.6: during the defeat cinematic, let isDefeated() report the REAL
+				// defeated flag so the engine's dying progression / death anim runs on
+				// the member exactly like the host. Outside the cinematic the puppet
+				// stays patched to false (host-authoritative HP).
+				try {
+					if (e.params && e.params._mpIsDefeatedPatched) {
+						e.params.isDefeated = function (this: any) { return !!(this && this.defeated); };
+					}
+					if (e.params) e.params.defeated = true;
+				} catch (_) { /* ignore */ }
 				try {
 					if (e.coll && typeof e.coll.setType === 'function') e.coll.setType((ig as any).COLLTYPE.IGNORE);
 					else if (e.coll) e.coll.type = (ig as any).COLLTYPE.IGNORE;
@@ -6457,14 +6539,64 @@ export class NetSync {
 			// 1.77.x: a QUEUED call (blocked behind a running blocking event) is NOT
 			// driving the puppet yet — keep streamed anims flowing until it starts.
 			e._mpBossCineStarted = (cine.state === 'started') ? true : undefined;
-			if (cine.state === 'started') {
-				// 1.76.x: UNLOCK the puppet's anim/face/state so the cutscene drives it
-				// NATIVELY — its SET_ANIM / DO_ACTION steps write currentAnim/plain values,
-				// which the puppet's property lock silently discards. The host boss is
-				// frozen while dying, so the streamed position stays identical anyway.
+			// 0.2.6 (heat-dng.f4.boss 死亡动画延迟): a QUEUED call sits behind whatever
+			// blocking event is running on this client. If it never actually starts, the
+			// puppet freezes at 0 HP and the member only sees a death when the HOST's
+			// MANUAL_COMBATANT_KILL drops the corpse from the stream (reads as "death
+			// anim waits for the host cinematic to finish"). Arm a 3s watchdog: if the
+			// queued cutscene has not started by then, fall back to the generic stream
+			// death so the member still gets a timely death.
+			if (cine.state === 'queued' && cine.call) {
 				try {
-					if (this.main && typeof (this.main as any).unlockEntity === 'function') (this.main as any).unlockEntity(e);
-				} catch (_) { /* the cinematic plays on regardless */ }
+					const qCall: any = cine.call;
+					const qStart = Date.now();
+					const selfQ = this;
+					const armQWatch = () => {
+						try {
+							if (e._killed || e._mpDying || e._mpBossCineStarted) return;
+							const running = qCall && typeof qCall.isRunning === 'function' && qCall.isRunning();
+							if (running) {
+								e._mpBossCineStarted = true;
+								try {
+									(e as any)._mpToX = undefined;
+									(e as any)._mpToY = undefined;
+									(e as any)._mpToZ = undefined;
+									if (e.coll && e.coll.vel) { e.coll.vel.x = 0; e.coll.vel.y = 0; e.coll.vel.z = 0; }
+									if (e.coll) {
+										e.coll.zGravityFactor = 0;
+										if (e.coll.float) e.coll.float.height = 0;
+									}
+								} catch (_) { /* ignore */ }
+								// Stay lockEntity'd — unlocking re-enables fly-float physics.
+								return;
+							}
+							if (Date.now() - qStart < 3000) { setTimeout(armQWatch, 250); return; }
+							console.warn('[mpBoss] queued defeat cutscene never started after 3s — generic death fallback');
+							try { e._mpBossCinematic = false; } catch (_) { /* ignore */ }
+							try { delete e._mpBossCineAt; } catch (_) { /* ignore */ }
+							try { e._mpBossCineStarted = undefined; } catch (_) { /* ignore */ }
+							selfQ.stageBossStreamDeath(e);
+						} catch (_) { /* ignore */ }
+					};
+					setTimeout(armQWatch, 250);
+				} catch (_) { /* watchdog is best-effort */ }
+			}
+			if (cine.state === 'started') {
+				// 1.76.x used to unlockEntity here so SET_ANIM/DO_ACTION could write
+				// currentAnim. BossDies never SET_ANIMs the boss (only SHOW_EFFECT +
+				// MANUAL_COMBATANT_KILL), and unlocking re-enabled megamoth float
+				// physics → the corpse flew upward. Stay locked; only drop the stream
+				// target so interpolate can't glide the corpse.
+				try {
+					(e as any)._mpToX = undefined;
+					(e as any)._mpToY = undefined;
+					(e as any)._mpToZ = undefined;
+					if (e.coll && e.coll.vel) { e.coll.vel.x = 0; e.coll.vel.y = 0; e.coll.vel.z = 0; }
+					if (e.coll) {
+						e.coll.zGravityFactor = 0;
+						if (e.coll.float) e.coll.float.height = 0;
+					}
+				} catch (_) { /* ignore */ }
 				// 1.77.x (instant-end guard): a locally-started defeat cutscene that
 				// DIES within ~2s never reached its visual steps (a throwing step hit
 				// the crash shield, or an external enterGame raced the start) — the
@@ -6522,9 +6654,19 @@ export class NetSync {
 				// Only the trigger armed by THIS boss's manualKill var — match the var
 				// name inside the RAW condition string (compiled conditions can't be
 				// string-searched; both stashers keep the raw settings at init).
+				// 0.2.6: also accept the pretty fallback and a name heuristic (BossDies)
+				// so a missing raw-settings stash can no longer hide the defeat trigger
+				// (heat-dng.f4.boss: member death anim waited for the host cinematic).
 				const raw = trig._mpStorySettings || trig._mpCsSettings || null;
-				const cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
-				if (!cond || cond.indexOf(mk) === -1) continue;
+				let cond = (raw && typeof raw.startCondition === 'string') ? raw.startCondition : '';
+				if (!cond && trig.startCondition && typeof trig.startCondition.pretty === 'string') {
+					cond = trig.startCondition.pretty;
+				}
+				const tname0 = String(trig.name || '');
+				// Name heuristic is narrow: only *Dies*/*Defeat*. Do NOT match
+				// "bossKillFix" (map.bossFinished) — that would fire the wrong event.
+				const nameLooksLikeDefeat = /dies|defeat/i.test(tname0);
+				if (!cond || (cond.indexOf(mk) === -1 && !nameLooksLikeDefeat)) continue;
 				// 1.77.x diagnostics: the candidate trigger matched the var — log the
 				// exact gate that refuses it (previously silent continues, which made
 				// the "member sees no defeat cinematic" report undebuggable).
@@ -6560,6 +6702,9 @@ export class NetSync {
 				}
 				if (!call) { console.log('[mpBoss] defeat trigger ' + tname + ' refused: startEvent returned null'); continue; }
 				trig.eventCall = call;
+				// Consume the ONCE triggerVar so EventTrigger.update cannot double-start
+				// while our call is still queued (eventCall set but not yet running).
+				// A lost queue is covered by the 3s watchdog -> generic stream death.
 				if (trig.triggerVar) {
 					try { (ig.vars as any).set(trig.triggerVar, true); } catch (_) { /* ignore */ }
 				}
@@ -9468,6 +9613,57 @@ export class NetSync {
 			};
 			console.log('[netsync] quest-enemy show hook installed');
 		} catch (_) { /* ignore */ }
+	}
+
+	/** 0.2.6 (heat-dng.f3.room-07 golem-arena): wrap EventTrigger.update so a
+	 * MEMBER never (re)starts the host-owned ALWAYS add-spawner loop. BattleStart's
+	 * two initial jellyfish are already suppressed by suppressMemberEventAddSpawn;
+	 * JellySpawner (ALWAYS, no triggerVar) then re-fires every ~4s because the
+	 * member's combat.activeCnt stays 0 while its copies are suppressed — each
+	 * cycle SPAWN_ENEMYed a jellyfish that was immediately killed (visible flash).
+	 * Solo (no host blocks for 3s) keeps the vanilla loop so a member alone on the
+	 * map can still finish the fight. */
+	private installEncounterSpawnerGate(): void {
+		try {
+			const ET: any = (ig.ENTITY as any).EventTrigger;
+			if (!ET || !ET.prototype || typeof ET.prototype.update !== 'function'
+				|| ET.prototype._mpEncounterSpawnerGate) return;
+			ET.prototype._mpEncounterSpawnerGate = true;
+			const origUpdate = ET.prototype.update;
+			ET.prototype.update = function (this: any, ...args: any[]) {
+				try {
+					const m = (window as any).__mpMain;
+					const ns = m && m.netSync;
+					if (ns && typeof ns.shouldBlockMemberEncounterTrigger === 'function'
+						&& ns.shouldBlockMemberEncounterTrigger(this)) {
+						return;
+					}
+				} catch (_) { /* never break the engine update */ }
+				return origUpdate.apply(this, args);
+			};
+			console.log('[netsync] encounter-spawner gate installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** True while THIS EventTrigger must not (re)start on a member because the
+	 * instance host owns the adds it would spawn. Host-live = a recent entityState
+	 * block (≤3s); alone on the map the vanilla loop stays active. */
+	public shouldBlockMemberEncounterTrigger(trig: any): boolean {
+		try {
+			if (this.main.host || !trig || trig._killed) return false;
+			if (Date.now() - this._mpLastBlockAt > 3000) return false;
+			const name: string = (typeof trig.name === 'string' ? trig.name : '') || '';
+			if (!name) return false;
+			const map = this.mapName || '';
+			if (map === 'heat-dng/f3/room-07' || map === 'heat-dng.f3.room-07') {
+				// ALWAYS add-spawner: combat.activeCnt.heat/jellyfish < tmp.jellyfishSpawn
+				if (name === 'JellySpawner') return true;
+			} else if (map === 'heat-dng/f1/midboss' || map === 'heat-dng.f1.midboss') {
+				// ALWAYS add-spawner: combat.activeCnt.heat/jellyfish < tmp.jellyfishSpawn
+				if (name === 'jellyfishRespawn') return true;
+			}
+			return false;
+		} catch (_) { return false; }
 	}
 
 	/** 1.75.x (quest enemy AR labels): wraps ACTION_STEP.SHOW_AR_MSG.start so a REAL
@@ -14946,6 +15142,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		for (const uidStr in this.puppets) {
 			const e = this.puppets[uidStr];
 			if (!e || e._killed || !e.coll || typeof e._mpToX !== 'number') continue;
+			// 0.2.6: boss-defeat cinematic owns the corpse — never glide it toward
+			// host samples (the host cutscene may be moving ITS copy elsewhere).
+			if (e._mpBossCinematic) continue;
 			const cp: any = e.coll.pos;
 			const dx = e._mpToX - cp.xProtected;
 			const dy = e._mpToY - cp.yProtected;
@@ -18733,6 +18932,104 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* ignore */ }
 	}
 
+	/** 0.2.6: HOST-side — wrap ig.vars.set so the exact frame the engine's
+	 * manualKill death path writes the var (Combatant: `this.manualKill ?
+	 * ig.vars.set(this.manualKill, true) : doManualKill`), we relay `bossDefeat`
+	 * to the instance. Members then stage the same BossDies cinematic
+	 * immediately instead of waiting for a later h<=0 entityState block (or
+	 * worse, for the host's cinematic to finish and drop the corpse). */
+	private _mpBossDefeatRelayAt = 0;
+	private installBossDefeatRelay(): void {
+		try {
+			const vars: any = (ig as any).vars;
+			if (!vars || typeof vars.set !== 'function' || (vars as any)._mpBossDefeatWrapped) return;
+			(vars as any)._mpBossDefeatWrapped = true;
+			const origSet = vars.set;
+			const self = this;
+			vars.set = function (this: any, path: any, val: any) {
+				const r = origSet.apply(this, arguments as any);
+				try { self.maybeRelayBossDefeat(path, val); } catch (_) { /* never break a var write */ }
+				return r;
+			};
+			console.log('[netsync] boss-defeat manualKill relay hook installed');
+		} catch (_) { /* ignore */ }
+	}
+
+	/** HOST only: true when `path` is the manualKill var of a live enemy on this
+	 * map and `val` is truthy (the death-path write). */
+	private maybeRelayBossDefeat(path: any, val: any): void {
+		try {
+			if (!this.main || !this.main.host) return;
+			if (!val) return;
+			if (typeof path !== 'string' || !path || path.length > 96) return;
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const list: any[] = (ig.game && (ig.game as any).entities) || [];
+			let matched = false;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (!e || !(e instanceof Enemy) || e._killed) continue;
+				if (typeof e.manualKill === 'string' && e.manualKill === path) { matched = true; break; }
+			}
+			if (!matched) return;
+			const now = Date.now();
+			if (now - this._mpBossDefeatRelayAt < 400) return;
+			this._mpBossDefeatRelayAt = now;
+			const map = ((ig.game as any) && (ig.game as any).mapName) || this.mapName || '';
+			const conn: any = this.main.connection;
+			if (conn && typeof conn.sendBossDefeat === 'function') {
+				try { conn.sendBossDefeat(map, path); } catch (_) { /* ignore */ }
+			}
+			console.log('[netsync] boss defeat cutscene start relayed mk=' + path + ' map=' + map);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** MEMBER: the host's BossDies just started. Find the matching boss puppet
+	 * and stage the defeat cinematic NOW — same moment as the host, not after
+	 * the next entityState block (and never after the host's cinematic ends). */
+	public applyBossDefeat(data: { map: string, mk: string }): void {
+		try {
+			if (this.main && this.main.host) return; // host already playing it natively
+			if (!data || typeof data.mk !== 'string' || !data.mk) return;
+			if (data.map && data.map !== this.mapName) return;
+			const mk = data.mk;
+			// Pin the var first so startBlockerLocally / startBossDefeatTriggerLocally
+			// see a ready startCondition even if the stream has not stamped s.mk yet.
+			try { (ig as any).vars.set(mk, true); } catch (_) { /* ignore */ }
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			const list: any[] = (ig.game && (ig.game as any).entities) || [];
+			let target: any = null;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (!e || !(e instanceof Enemy) || e._killed) continue;
+				if (!e._mpPuppet && !e._mpMirror) continue;
+				if (typeof e.manualKill === 'string' && e.manualKill === mk) { target = e; break; }
+				// Fallback: a boss-flagged puppet whose host stream has not stamped
+				// mk onto the entity yet (typed-fallback / first block race).
+				if (!target && e.enemyType && e.enemyType.boss && !e._mpDying && !e._mpBossCinematic) {
+					target = e;
+				}
+			}
+			if (!target) {
+				console.log('[netsync] bossDefeat relay mk=' + mk + ' — no matching puppet yet (stream lag), h<=0 path will pick it up');
+				return;
+			}
+			if (target._mpBossCinematic || target._mpDying) return; // already staged
+			try { if (!(target as any).manualKill) (target as any).manualKill = mk; } catch (_) { /* ignore */ }
+			// Force 0 HP so the bar / dying state match the host's setDefeated().
+			try {
+				if (target.params && typeof target.params.currentHp === 'number' && target.params.currentHp > 0) {
+					target.params.currentHp = 0;
+					try { (sc as any).Model.notifyObserver(target.params, (sc as any).COMBAT_PARAM_MSG.HP_CHANGED); } catch (_) { /* ignore */ }
+				}
+			} catch (_) { /* ignore */ }
+			this.hideDefeatedEnemyBar(target);
+			const ok = this.stageBossDefeatCinematic(target);
+			console.log('[netsync] bossDefeat relay applied mk=' + mk
+				+ ' uid=' + (target._mpUid || 0) + ' staged=' + ok);
+			if (!ok) this.stageBossStreamDeath(target);
+		} catch (err) { try { console.warn('[netsync] applyBossDefeat failed', err); } catch (_) { /* ignore */ } }
+	}
+
 	/** Soft-death revive countdown in milliseconds. Out of combat keeps the
 	 * built-in ~3s quick revive; in combat it is the server-configured normal or
 	 * boss duration (defaults 30s / 30s). */
@@ -19570,10 +19867,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			// must NOT clobber pos/anim/hp/target with undefined. Only FULL entries
 			// carry numeric fields (the encoder always ships them all together).
 			const isFull = typeof s.x === 'number';
+			// 0.2.6: a boss-defeat cinematic drives the puppet locally (SET_ENTITY_POS /
+			// DO_ACTION). Host stream samples during that window are the HOST's own
+			// cinematic path — applying them yanked the member's corpse across the
+			// arena. Freeze stream pos/face as soon as defeat is staged (covers the
+			// queued-before-started window too).
+			const cineOwns = !!e._mpBossCinematic;
 			// Store the block position as the INTERPOLATION TARGET — tick()'s per-frame
 			// lerp moves the puppet toward it, turning 15Hz updates into smooth 60fps
 			// motion. (Direct per-block writes were the visible stutter.)
-			if (isFull && (e._mpToX !== s.x || e._mpToY !== s.y || e._mpToZ !== s.z)) {
+			if (isFull && !cineOwns && (e._mpToX !== s.x || e._mpToY !== s.y || e._mpToZ !== s.z)) {
 				e._mpToX = s.x; e._mpToY = s.y; e._mpToZ = s.z;
 				if (e._mpSnapNext) { // fresh adopt/respawn: skip the glide from wherever we were
 					e._mpSnapNext = false;
@@ -19584,7 +19887,7 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					this._mpMarkCollDirty(e);
 				}
 			}
-			if (isFull && e.face && (e.face.xProtected !== s.fx || e.face.yProtected !== s.fy)) {
+			if (isFull && !cineOwns && e.face && (e.face.xProtected !== s.fx || e.face.yProtected !== s.fy)) {
 				e.face.xProtected = s.fx; e.face.yProtected = s.fy;
 			}
 			// Host-authoritative aggro: the host enemy engaged (has a target) -> our
@@ -19605,17 +19908,18 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				e._mpTg = tgNow;
 				const pl: any = ig.game.playerEntity;
 				try {
-					// ROUND 47: the host now ships the target's NAME (s.tn). A puppet is
-					// hostile (red bar / combat) whenever the HOST enemy has ANY target —
-					// i.e. it's fighting the group — not only when it's aimed at us. The
-					// old tg-only gate dropped the puppet's target the moment the host
-					// enemy de-aggro'd off OUR mirror onto someone else, which read as a
-					// blue/idle bar while the fight was still on. Only aim the puppet at
-					// the LOCAL player when the host target is actually us (tn == our
-					// name) OR (legacy) the name is absent but engaged; an enemy aimed at
-					// someone else stays red via combat mode, not via a fake local target.
-					const myName = (this.main && this.main.name) || '';
-					const aimedAtMe = tgNow && (s.tn === undefined ? true : (!!myName && s.tn === myName));
+					// Host-authoritative aggro presentation.
+					// ROUND 47 only aimed the local puppet when s.tn === our name, leaving
+					// "host is fighting someone else" puppets targetless — CrossCode turns
+					// the HP bar / combat look red via setTarget (addActiveCombatant), so
+					// those puppets stayed blue/idle until the host re-aimed at US.
+					// 0.2.6 (user): ANY host target (tg=1, fighting the group) must keep
+					// the red combat bar on every client. Aim the puppet at the LOCAL
+					// player whenever the host is engaged — presentation only. Puppets run
+					// no AI (postActionUpdate=null), so this cannot fake-attack; real
+					// swings still arrive via the host's enemyAttack relay. s.tn is still
+					// recorded below for projectile homing.
+					const groupEngaged = tgNow; // any party member holds the lock
 					// 1.76.x (lobbed-rock homing): remember the host enemy's current
 					// target NAME — spawnGenericProxyPuppet resolves it to the local
 					// equivalent (our player / that player's mirror) so homing
@@ -19628,8 +19932,13 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					// (re)acquire the corpse from a stale tg window — the host drops the target on
 					// its side immediately now, but in-flight blocks can still carry the old lock
 					// for a packet or two. Lift the _mpTg guard so the clear actually lands.
-					if (aimedAtMe && !this.inCutscene && !this._mpDead) { if (pl && !e.target && !e._killed) e.setTarget(pl); }
-					else if (pl && e.target === pl && (!aimedAtMe || this._mpDead)) { try { e._mpTg = false; } catch (_) { /* ignore */ } e.setTarget(null); }
+					if (groupEngaged && !this.inCutscene && !this._mpDead) {
+						if (pl && !e.target && !e._killed) e.setTarget(pl);
+					}
+					else if (pl && e.target === pl && (!groupEngaged || this._mpDead)) {
+						try { e._mpTg = false; } catch (_) { /* ignore */ }
+						e.setTarget(null);
+					}
 					// ROUND 31 (item 5): an ENGAGED puppet (one the member attacked — see
 					// forwardEnemyDamage) whose engine lose-check just dropped its target is
 					// re-pinned here every block, decoupled from member hit cadence and from
@@ -19728,6 +20037,21 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 						// dropping the ROUND 80 body-push invariants — re-assert them.
 						try { if (e.coll) e.coll.weight = 0; } catch (_) { /* ignore */ }
 						try { if (e.defaultConfig && typeof e.defaultConfig.overwrite === 'function') e.defaultConfig.overwrite('weight', 0); } catch (_) { /* ignore */ }
+						// 0.2.6 (heat-dng.f4.boss 血条回升): switchState/setDefaultConfig can
+						// notify STATS_CHANGED and re-init the boss BigHpBar from the
+						// UNSCALED enemy-type max. Re-assert the host's scaled max NOW and
+						// re-snap both bars so the percentage never jumps mid-fight.
+						try {
+							if (typeof s.m === 'number' && s.m > 0 && e.params && e.params.baseParams
+								&& e.params.baseParams.hp !== s.m) {
+								e.params.baseParams.hp = s.m;
+							}
+							if ((e as any).statusGui && typeof (e as any).statusGui.setHp === 'function'
+								&& e.params && typeof e.params.currentHp === 'number') {
+								(e as any).statusGui.setHp(e.params.currentHp, true);
+							}
+							this._mpSnapBossHpBar(e);
+						} catch (_) { /* cosmetic re-snap */ }
 					}
 				} catch (err) { try { console.warn('[netsync] puppet switchState failed uid=' + ((e as any)._mpUid || 0), err); } catch (_) { /* ignore */ } }
 				// 1.76.x (false-stagger pre-repair): the puppet's own NATIVE onDamage
@@ -19805,7 +20129,11 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (isFull && e.params) {
 				const hpBefore = e.params.currentHp;
 				if (e.params.currentHp !== s.h) e.params.currentHp = s.h;
-				if (e._mpPuppet) e.params.defeated = false; // keep host-authoritative (DoT bypasses the refund)
+				// Keep host-authoritative (DoT bypasses the refund) — EXCEPT while a
+				// boss-defeat cinematic is staged: forcing defeated=false there
+				// suppressed the engine's dying progression / death anim on the
+				// member, which is half of "death anim waits for the host".
+				if (e._mpPuppet && !e._mpBossCinematic) e.params.defeated = false;
 				// 1.72.x: a manualKill enemy (boss) reaching 0 HP on the host is
 				// entering its scripted defeat cutscene there — stage the same
 				// cinematic locally instead of letting the puppet linger / reap-pop.
@@ -19831,7 +20159,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					} catch (_) { /* ignore */ }
 					if (!this.stageBossDefeatCinematic(e)) this.stageBossStreamDeath(e);
 				}
-				if (s.m > 0 && e.params.baseParams && e.params.baseParams.hp !== s.m) e.params.baseParams.hp = s.m;
+				// 0.2.6 (heat-dng.f4.boss 血条回升): remember whether THIS block rewrote
+				// the scaled max — the boss BigHpBar caches maxValue and a bare
+				// baseParams.hp write never notifies STATS_CHANGED, so the bar kept the
+				// UNSCALED spawn max and the fill "jumped up" until a later hit re-read
+				// getStat('hp').
+				let maxRewritten = false;
+				if (s.m > 0 && e.params.baseParams && e.params.baseParams.hp !== s.m) {
+					e.params.baseParams.hp = s.m;
+					maxRewritten = true;
+				}
 				// Round 18 (issue 2): Enemy.setElementMode copies the locally-UNSCALED mode
 				// max into baseParams.hp — re-lock every element-mode param copy to the
 				// host's scaled max so a mode switch can't show an unscaled max. All
@@ -19850,6 +20187,16 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 				// animation preserved).
 				if (e.params.currentHp !== hpBefore) {
 					try { (sc as any).Model.notifyObserver(e.params, (sc as any).COMBAT_PARAM_MSG.HP_CHANGED); } catch (_) { /* best-effort */ }
+				}
+				// Re-snap both bars only when the max was rewritten (keeps the smooth
+				// HP_CHANGED damage flow intact on ordinary current-only updates).
+				if (maxRewritten) {
+					try {
+						if ((e as any).statusGui && typeof (e as any).statusGui.setHp === 'function') {
+							(e as any).statusGui.setHp(e.params.currentHp, true);
+						}
+						this._mpSnapBossHpBar(e);
+					} catch (_) { /* cosmetic */ }
 				}
 			}
 			// ROUND 61 (fix C): mirror the host's guard/break bar onto the puppet so the
@@ -20221,10 +20568,19 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 * hidden bug wave was reaped as stale puppets before the bomb console's
 	 * tmp.bugsSpawn-1 could ever show it).
 	 * A condition that ALSO references a persistent scope (map.*, quest.*, ...)
-	 * stays host-owned — that state IS shared via the host. */
+	 * stays host-owned — that state IS shared via the host.
+	 * 0.2.6 (heat-dng.f3.room-07 golem): a pure-tmp map enemy that is still HIDDEN
+	 * was misclassified as a local quest wave, which blocked findMapEnemy adoption
+	 * of the host's streamed copy. Encounter gates (room-05/07 `tmp.golem`) stay
+	 * hidden on the member until the host activates them — they must remain
+	 * host-adoptable. Only a VISIBLE pure-tmp enemy (shown by OUR own tmp flag) is
+	 * owner-local. */
 	private isLocalQuestWaveEnemy(e: any): boolean {
 		try {
 			if (this.main.host || !e || e._mpMirror) return false;
+			// Hidden pure-tmp map enemies are encounter gates the host owns/stream —
+			// never owner-local. (Never-shown conditional entities start _hidden=true.)
+			if (e._hidden) return false;
 			const sc = (e.settings && typeof e.settings.spawnCondition === 'string')
 				? e.settings.spawnCondition
 				: (typeof e.spawnCondition === 'string' ? e.spawnCondition : '');
@@ -20292,8 +20648,20 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 			if (this.main.host) return;
 			if (!e || e._killed || e._mpMirror || e._hidden) return;
 			if (!this.isLocalQuestWaveEnemy(e)) return;
-			if (e._mpPuppet) this.releaseLocalQuestPuppet(e);
-			else if (!e._mpCutsceneSpawned) e._mpCutsceneSpawned = true;
+			if (e._mpPuppet) {
+				// 0.2.6 (room-05/07 golem): OUR tmp flag just showed a map enemy that
+				// is ALREADY a host puppet (adopted while hidden). Keep it a puppet —
+				// releasing would restore local AI while the host still owns the real
+				// enemy (duplicate / non-hostile copies). Only release when the host
+				// is not streaming this uid (true per-player quest wave).
+				const uid = (e as any)._mpUid || 0;
+				const hostLive = Date.now() - this._mpLastBlockAt <= 3000;
+				const stamped = !!(uid && this._mpUidSeen[uid]);
+				if (hostLive && stamped) return;
+				this.releaseLocalQuestPuppet(e);
+				return;
+			}
+			if (!e._mpCutsceneSpawned) e._mpCutsceneSpawned = true;
 		} catch (_) { /* never break the show path */ }
 	}
 
@@ -20306,9 +20674,9 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	 *    runs on every client once the relayed intro sets map.bossIntro.
 	 *  - f3/room-07 (1.81.x): the golem-arena BattleStart — relayed via
 	 *    cutsceneRelay.isF3GolemBattleTrigger since 1.81.x — SPAWN_ENEMYs two
-	 *    jellyfish, and the member-side JellySpawner loop (tmp.jellyfishSpawn)
-	 *    keeps spawning its own copies while the member's activeCnt lags the
-	 *    puppet stream.
+	 *    jellyfish. The ALWAYS JellySpawner loop is now ALSO gated off on
+	 *    members (installEncounterSpawnerGate / shouldBlockMemberEncounterTrigger)
+	 *    so it cannot re-fire every ~4s and flash-kill local copies.
 	 * Called from the Game.spawnEntity wrap: when this returns true the spawn
 	 * was killed silently and must not be flagged/streamed. Suppression needs
 	 * the whole set: MEMBER side, a covered map, a heat.jellyfish event spawn,
@@ -20523,6 +20891,37 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		if (s.mi) e = (mapEnemyIdx && mapEnemyIdx[s.mi]) || this.findMapEnemy(s.mi); // adopt our own typed map enemy
 		if (!e && s.t) e = this.spawnTypedPuppet(s);  // fallback: spawn from the block's type
 		if (!e) return null;
+
+		// 0.2.6 (heat-dng.f3.room-07 golem): a never-shown conditional map enemy
+		// (spawnCondition tmp.golem — still _hidden, never added to shownEntities /
+		// never coll-tracked) is adopted as the host puppet. When the HOST already
+		// shows it (hd !== 1), materialize via the engine's showEntity so it renders
+		// and is hittable, then re-arm _hideRequest=true so ig.Game.varsChanged will
+		// NOT re-hide it while OUR tmp.* spawn var stays false (the member never
+		// runs EnterGolem locally). A still-hidden host copy stays hidden — the
+		// hd flip on a later full block + _mpRehidePuppet handles the unhide.
+		if (e._hidden && !e._mpPuppet) {
+			try {
+				const game: any = ig.game;
+				if ((s.hd || 0) !== 1) {
+					// Host already shows it — materialize now (coll tracked by showEntity).
+					if (game && typeof game.showEntity === 'function') {
+						game.showEntity(e);
+						// Re-arm so varsChanged won't re-hide while OUR tmp.* stays false.
+						e._hideRequest = true;
+						(e as any)._mpHiddenRe = false;
+					} else {
+						e._hidden = false;
+						try { if (game && game.physics && typeof game.physics.addCollEntry === 'function' && e.coll) game.physics.addCollEntry(e.coll); } catch (_) { /* ignore */ }
+						(e as any)._mpHiddenRe = false;
+					}
+				} else {
+					// Host still hides this copy — keep hidden; mark so the first
+					// host unhide re-tracks a never-tracked coll.
+					(e as any)._mpHiddenRe = true;
+				}
+			} catch (_) { /* adoption continues even if materialize is best-effort */ }
+		}
 
 		// ROUND 73 diagnostics: log ghost-type puppet creation (once per host uid).
 		if (!e._mpPuppet && this.isGhostType(s.t)) {

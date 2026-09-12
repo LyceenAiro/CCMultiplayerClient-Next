@@ -93,9 +93,11 @@ async function startMultiplayer(): Promise<void> {
 		// 看门狗检测 activeActions 与 skills[] 的背离并自动 updateStats() 修复。
 		installSkillGuard();
 
-		// 梦境剧情后虚化特效看门狗：dreamFx 暗角 / 名为 "dream" 的持续径向模糊 /
-		// 基础屏幕模糊只在整个游戏 reset 时才清除（地图切换不清），剧情链若在
-		// CLEAR 步骤前被打断（跳过、MP 事件中断）特效永久残留 —— 3s 无事件宽限后清除。
+		// 梦境剧情后特效看门狗：dreamFx 暗角 / 名为 "dream" 的持续径向模糊 /
+		// 基础屏幕模糊 / 命名持续 RUMBLE（视角晃动）只在整个游戏 reset 时才清除
+		// （地图切换不清），剧情链若在 CLEAR / RUMBLE_STOP 步骤前被打断（跳过、
+		// MP 事件中断、wedge force-end）特效与晃动永久残留。看门狗 + force-end
+		// 路径会按原版 outro 尾巴完整清除。
 		installDreamFxGuard();
 
 		// ROUND 95: item-use indicators — other players see the item icon pop above

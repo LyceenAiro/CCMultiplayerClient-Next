@@ -613,6 +613,12 @@ export interface IConnection {
     /** 1.75.x (boss-phase quick revive): the instance host detected a boss phase
      * transition — revive the soft-dead local player immediately. */
     onBossPhase(callback: (data: { map: string, uid?: number }) => void): void;
+    /** 0.2.6: the instance HOST's scripted boss-defeat cutscene just started
+     * (manualKill var written). Stage the same BossDies cinematic locally NOW so
+     * the death animation plays in sync with the host. */
+    onBossDefeat?(callback: (data: { map: string, mk: string }) => void): void;
+    /** Host → instance: boss-defeat cutscene started (see onBossDefeat). */
+    sendBossDefeat?(map: string, mk: string): void;
     /** A party teammate genuinely fell into a fall terrain — replay the fall
      * visual (splash effect + damage popup + respawn drift) on their mirror. */
     onPlayerFall(callback: (from: string, terrain: number, pt?: { x: number, y: number, z: number }) => void): void;

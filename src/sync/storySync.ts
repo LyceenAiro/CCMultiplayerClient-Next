@@ -1,6 +1,7 @@
 import { IConnection } from '../connection';
 import { t } from '../i18n';
 import { showMpToast } from '../ui/toasts';
+import { forceClearDreamOutro } from './dreamFxGuard';
 
 /**
  * 1.70.61 剧情同步模式 (Story Sync Mode)
@@ -522,6 +523,7 @@ export class StorySyncController {
 				if (force) {
 					console.warn('[mpstoryfix] FORCE-ENDING the wedged event call');
 					try { if (typeof evm._endEventCall === 'function') evm._endEventCall(call); } catch (e2) { console.warn('[mpstoryfix] force-end failed', e2); }
+					try { forceClearDreamOutro('mpstoryforce'); } catch (_) { /* ignore */ }
 					const lineNow = Number((ig as any).vars && (ig as any).vars.get('plot.line')) || 0;
 					if (lineNow >= 4300 && lineNow < 4320) {
 						if (self.applyMaroonIntroTail()) console.warn('[mpstoryfix] Maroon intro tail applied after force-end');
@@ -3820,6 +3822,8 @@ export class StorySyncController {
 			try {
 				if (typeof evm._endEventCall === 'function') evm._endEventCall(call);
 			} catch (e) { console.warn('[storysync] wedge force-end failed', e); return; }
+			// 0.2.6: force-end skips dream CLEAR_DREAM_FX / RUMBLE_STOP_CONTINUES.
+			try { forceClearDreamOutro('storysync wedge'); } catch (_) { /* ignore */ }
 			const line = Number((ig as any).vars && (ig as any).vars.get('plot.line')) || 0;
 			if (line >= 4300 && line < 4320) {
 				if (this.applyMaroonIntroTail()) console.warn('[storysync] Maroon intro tail applied after wedge force-end');

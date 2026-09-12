@@ -148,12 +148,25 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 		};
 	}
 
+	/** 0.2.6: a story cutscene has already converted companions into map NPCs
+	 * (`map.partyNPCs = true`, e.g. Faj'ro roof PostExpoScene). NPC spawn
+	 * conditions are `map.partyNPCs && !party.has.X` — faking has here keeps
+	 * those NPCs permanently hidden and leaves leftover followers talking
+	 * over the handoff. Cover must go honest the moment the handoff flag is set. */
+	private storyNpcHandoffActive(): boolean {
+		try {
+			const vars: any = (ig as any).vars;
+			return !!(vars && typeof vars.get === 'function' && vars.get('map.partyNPCs'));
+		} catch (_) { return false; }
+	}
+
 	/** True while connected and AT LEAST ONE official companion is absent and
 	 * temp-coverable (in practice: whenever connected — some companion is
 	 * almost always missing). Drives the party.size script-var answer. */
 	public shouldCoverAny(party: any): boolean {
 		try {
 			if (!this.connected()) return false;
+			if (this.storyNpcHandoffActive()) return false;
 			if (!party || !party.models) return false;
 			const opts: string[] = (sc as any).PARTY_OPTIONS || [];
 			for (const name of opts) {
@@ -172,6 +185,7 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 		try {
 			if (!name || typeof name !== 'string' || name === 'Lea') return false; // Lea is the player herself
 			if (!this.connected()) return false;
+			if (this.storyNpcHandoffActive()) return false;
 			const opts: string[] = (sc as any).PARTY_OPTIONS || [];
 			if (opts.indexOf(name) === -1) return false; // official companions only
 			if (!party || !party.models) return false;
@@ -279,9 +293,6 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 	 * and a parallel event that still references it re-spawns it on demand via
 	 * the getPartyMemberEntity hook (self-healing). */
 	private sweep(): void {
-		let any = false;
-		for (const _ in this.temps) { any = true; break; }
-		if (!any) { this.idleSince = 0; return; }
 		let busy = true;
 		try {
 			const g: any = (ig as any).game;
@@ -297,6 +308,89 @@ class TempPartyBotSupport implements ITempPartyBotSupport {
 		if (now - this.idleSince >= IDLE_SWEEP_MS) {
 			this.idleSince = 0;
 			this.cleanupTemps('scene finished');
+			this.repairStoryNpcHandoff();
 		}
+	}
+
+	/** 0.2.6 (Faj'ro roof / PostExpoScene): the scene tail is
+	 *   map.partyNPCs=true → REMOVE_PARTY_MEMBER(Emilie/Glasses, npc:emilie/ctron)
+	 *   → DO_ACTION on those NPCs → SET_PERMA_TASK "talk to them at the south".
+	 * REMOVE_PARTY_MEMBER is a no-op when the member is not in currentParty
+	 * (temp-only companions), and a conversion that races the fake party.has
+	 * can leave the follower entity alive. After the scene goes idle, finish
+	 * the handoff by hand so the map NPCs can spawn and nothing keeps following. */
+	private repairStoryNpcHandoff(): void {
+		try {
+			if (!this.storyNpcHandoffActive()) return;
+			const g: any = (ig as any).game;
+			if (!g || !g.playerEntity || (ig as any).loading) return;
+			if (typeof g.isTeleporting === 'function' && g.isTeleporting()) return;
+			const ev: any = g.events;
+			if (ev && ev.blockingEventCall) return;
+			const scAny: any = (sc as any);
+			if (scAny.model && typeof scAny.model.isCutscene === 'function' && scAny.model.isCutscene()) return;
+			const party: any = scAny.party;
+			if (!party) return;
+			const pairs: Array<[string, string]> = [['Emilie', 'emilie'], ['Glasses', 'ctron']];
+			let fixed = false;
+			for (const pair of pairs) {
+				const member = pair[0];
+				const npcName = pair[1];
+				try {
+					const isMember = !!(party.isPartyMember && party.isPartyMember(member));
+					const ent: any = party.partyEntities && party.partyEntities[member];
+					const leftover = !!(ent && !ent._killed && !isMember);
+					if (!isMember && !leftover) continue;
+					let npc: any = null;
+					try { npc = g.getEntityByName ? g.getEntityByName(npcName) : null; } catch (_) { npc = null; }
+					if (isMember) {
+						party.removePartyMember(member, npc, false);
+						fixed = true;
+						console.warn('[mptempbot] story NPC handoff: removed leftover party member "'
+							+ member + '" (map.partyNPCs)');
+					} else if (leftover) {
+						try { party._removePartyMemberEntity(member, npc, true); } catch (_) {
+							try { ent.kill(); } catch (_) { /* ignore */ }
+							try { delete party.partyEntities[member]; } catch (_) { /* ignore */ }
+						}
+						fixed = true;
+						console.warn('[mptempbot] story NPC handoff: culled leftover follower entity "'
+							+ member + '"');
+					}
+				} catch (err) {
+					console.warn('[mptempbot] story NPC handoff failed for "' + member + '"', err);
+				}
+			}
+			if (fixed) {
+				try { if (typeof g.varsChangedDeferred === 'function') g.varsChangedDeferred(); } catch (_) { /* ignore */ }
+			}
+			// Belt-and-braces: once the members are gone, force the map NPCs
+			// visible if they exist but stayed hidden (spawnCondition was false
+			// while the fake party.has held). Same idea as the Schneider repair.
+			try {
+				const partyHas = (n: string): boolean => {
+					try { return !!(party.isPartyMember && party.isPartyMember(n)); } catch (_) { return false; }
+				};
+				if (!partyHas('Emilie') && !partyHas('Glasses')) {
+					const ents: any[] = (g.entities || []);
+					for (const e of ents) {
+						if (!e || e._killed || typeof e.name !== 'string') continue;
+						const n = e.name;
+						if (n !== 'emilie' && n !== 'ctron') continue;
+						const wasHidden = !!e.hidden;
+						const wasInvisible = !!(e.animState && e.animState.alpha === 0);
+						if (!wasHidden && !wasInvisible) continue;
+						if (wasHidden) { e.hidden = false; }
+						if (wasInvisible) { e.animState.alpha = 1; }
+						try {
+							if (typeof e.updateNpcState === 'function') e.updateNpcState(true);
+							else if (typeof e.show === 'function') e.show();
+						} catch (_) { /* ignore */ }
+						fixed = true;
+						console.warn('[mptempbot] story NPC handoff: forced NPC "' + n + '" visible');
+					}
+				}
+			} catch (_) { /* ignore */ }
+		} catch (_) { /* never break the frame */ }
 	}
 }

@@ -2,12 +2,12 @@ import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 
 /**
- * In-game multiplayer helpers: the F8 command box and party-invite toasts.
+ * In-game multiplayer helpers: party-invite toasts (and a retired F8 command box).
  *
  * NOTE: the old L-key friends overlay was removed — friends and room players now
- * live in the game's native Social menu (see ui/socialMenuInject.ts). This class
- * only keeps the pieces that have no native-menu home: the F8 command box and the
- * party-invite "comm call" dialog.
+ * live in the game's native Social menu (see ui/socialMenuInject.ts).
+ * 0.2.6: the F8 debug command box is DISABLED for players (tester-only surface;
+ * boost/skipPrologue could desync the server).
  */
 export class SocialOverlay {
     /** Currently open comm-invite dialog (one at a time). */
@@ -20,21 +20,17 @@ export class SocialOverlay {
 
     constructor(private main: Multiplayer) { }
 
-    /** Process-level wiring (F8 key + update pump). Safe to call on every connect —
+    /** Process-level wiring (update pump). Safe to call on every connect —
      * the bindings stack-guard themselves. Connection-bound callbacks (party invite)
-     * live in wireConnection() because reconnects swap the socket. */
+     * live in wireConnection() because reconnects swap the socket.
+     * 0.2.6: F8 command box (debug: boost / skipPrologue / saveHere / ...) is
+     * DISABLED for players — it is a tester-only surface and can desync the
+     * server (boost loads a fabricated save, skipPrologue teleports freely). */
     public registerOnce(): void {
         if ((this.main as any)._overlayOnceInstalled) return;
         (this.main as any)._overlayOnceInstalled = true;
-        const input = ig.input as any;
-        // F8 opens the in-game command box (run mp.* commands without DevTools).
-        const f8 = (ig.KEY as any).F8 !== undefined ? (ig.KEY as any).F8 : 119;
-        input.bind(f8, 'mpcmd');
-        simplify.registerUpdate(() => {
-            if (input.pressed('mpcmd')) {
-                this.toggleCommandBox();
-            }
-        });
+        // Intentionally no F8 → mpcmd binding. Vanilla F8 (screenshot/snapshot)
+        // is left to the engine; the multiplayer debug command box is off.
     }
 
     /** Connection-bound wiring. MUST run on every connect: the socket (and thus the
@@ -185,30 +181,17 @@ export class SocialOverlay {
         if (!silent) ig.system.regainFocus();
     }
 
-    // ---- in-game command box (F8) ----
+    // ---- in-game command box (F8) — DISABLED for players (0.2.6) ----
     private cmdBox: JQuery | null = null;
 
+    /** 0.2.6: F8 debug command box is off for players. Kept as a no-op so any
+     * leftover call site cannot reopen the tester surface. */
     public toggleCommandBox(): void {
         if (this.cmdBox) {
             this.cmdBox.remove();
             this.cmdBox = null;
-            ig.system.regainFocus();
-            return;
+            try { ig.system.regainFocus(); } catch (_) { /* ignore */ }
         }
-        this.cmdBox = $('<div class="gameOverlayBox gamecodeMessage"><h3>' + t('cmdBoxTitle') + '</h3></div>');
-        const form = $('<form><input type="text" placeholder="skipPrologue / saveHere / boost / friends" style="width:90%" /></form>');
-        this.cmdBox.append(form);
-        $(document.body).append(this.cmdBox);
-        this.cmdBox.addClass('shown');
-        ig.system.setFocusLost();
-        form.submit(() => {
-            const cmd = String(form.find('input[type=text]').val() || '').trim();
-            form.find('input[type=text]').val('');
-            if (cmd) {
-                this.main.runCommand(cmd);
-            }
-            return false;
-        });
-        form.find('input[type=text]').focus();
+        console.log('[multiplayer] F8 command box is disabled for players');
     }
 }

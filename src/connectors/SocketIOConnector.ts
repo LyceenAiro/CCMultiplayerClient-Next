@@ -1074,6 +1074,12 @@ export class SocketIoConnector implements IConnection {
 		this.syncEmit('bossPhase', { map, uid });
 	}
 
+	/** 0.2.6: HOST's scripted boss-defeat cutscene just started — relay the
+	 * manualKill var name so members stage the same cinematic immediately. */
+	public sendBossDefeat(map: string, mk: string): void {
+		this.syncEmit('bossDefeat', { map, mk });
+	}
+
 	/** The local player genuinely fell (water/hole/...): relay the ig.TERRAIN
 	 * number to the party — replicas suppress terrain-driven falls locally. */
 	public sendPlayerFall(terrain: number, pt?: { x: number, y: number, z: number }): void {
@@ -1754,6 +1760,17 @@ export class SocketIoConnector implements IConnection {
 	public onBossPhase(callback: (data: { map: string, uid?: number }) => void): void {
 		this.socket.on('bossPhase', (data: any) => {
 			callback(data || {});
+		});
+	}
+
+	/** 0.2.6: HOST's boss-defeat cutscene started — stage locally in sync. */
+	public onBossDefeat(callback: (data: { map: string, mk: string }) => void): void {
+		this.socket.on('bossDefeat', (data: any) => {
+			if (!data || typeof data.mk !== 'string' || !data.mk) return;
+			callback({
+				map: typeof data.map === 'string' ? data.map : '',
+				mk: data.mk,
+			});
 		});
 	}
 	/** A party teammate genuinely fell — replay the fall visual on their mirror

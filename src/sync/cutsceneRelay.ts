@@ -328,7 +328,13 @@ class CutsceneRelay implements ICutsceneRelay {
 	 * START (gather + local replay) lets the host's replay spawn the REAL adds
 	 * while member-side replays only run the per-client presentation (their
 	 * event spawns are suppressed host-owned, see netSync
-	 * suppressMemberEventAddSpawn). */
+	 * suppressMemberEventAddSpawn).
+	 * NOTE 0.2.6: EnterGolem (mapId 22, ONCE, tmp.kills>=4) is deliberately NOT
+	 * relayed — it sets tmp.golem and runs the golem intro. tmp.kills is
+	 * per-client and stays 0 on a member (its jellyfish copies are suppressed),
+	 * so EnterGolem never natively fires there; the golem is a pure-tmp map
+	 * enemy the HOST activates and streams. The member adopts that stream copy
+	 * as a host puppet (see netSync.ensurePuppet / isLocalQuestWaveEnemy). */
 	private isF3GolemBattleTrigger(trig: any): boolean {
 		try {
 			if (!trig || trig._killed) return false;

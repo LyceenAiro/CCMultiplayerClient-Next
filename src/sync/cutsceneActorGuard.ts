@@ -1,6 +1,7 @@
 import { Multiplayer } from '../multiplayer';
 import { t } from '../i18n';
 import { showMpToast } from '../ui/toasts';
+import { forceClearDreamOutro } from './dreamFxGuard';
 
 /**
  * 1.77.x (cutscene actor guard + manual unstuck).
@@ -182,6 +183,8 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 								+ String((fr && fr.event && fr.event.name) || '(event)')
 								+ ') — ending the call to avoid a softlock', err);
 						} catch (_) { /* ignore */ }
+						// Force-end skips the dream CLEAR / RUMBLE_STOP tail — clean now.
+						try { forceClearDreamOutro('event-step throw'); } catch (_) { /* ignore */ }
 						return true; // EventManager splices + _endEventCall (onEnd -> enterGame)
 					}
 				};
@@ -529,7 +532,9 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 	}
 
 	/** Shared post-heal cleanup: drop temp actors + temp party bots — the
-	 * scene they served is over (or being force-ended). */
+	 * scene they served is over (or being force-ended). Also run the dream
+	 * outro tail: a force-end skips CLEAR_DREAM_FX / RUMBLE_STOP_CONTINUES,
+	 * leaving vignette + continuous camera shake (0.2.6). */
 	private afterHeal(reason: string): void {
 		try { this.cleanupTemps('unstuck: ' + reason); } catch (_) { /* ignore */ }
 		try {
@@ -537,5 +542,6 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 			const bots: any = m && (m as any).tempPartyBots;
 			if (bots && typeof bots.cleanupTemps === 'function') bots.cleanupTemps('unstuck: ' + reason);
 		} catch (_) { /* ignore */ }
+		try { forceClearDreamOutro('mpcsactor ' + reason); } catch (_) { /* ignore */ }
 	}
 }
