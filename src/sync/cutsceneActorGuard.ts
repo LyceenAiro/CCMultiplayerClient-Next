@@ -109,6 +109,12 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 	private nudged = false;
 	/** Rate-limit identical materialize logs. */
 	private lastMatLog: { [name: string]: number } = Object.create(null);
+	/** 0.2.6: last send time of the cutscene-NPC visibility block. */
+	private npcSendAt = 0;
+	/** 0.2.6: last packet time per peer, for orphan re-hide. */
+	private peerNpcSeen: { [from: string]: number } = Object.create(null);
+	/** 0.2.6: entities we force-showed / materialized FOR a peer's stream. */
+	private peerShown: { [name: string]: { ent: any, from: string, spawned: boolean } } = Object.create(null);
 
 	constructor(private getMain: () => Multiplayer | undefined) { }
 
@@ -191,10 +197,21 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 			}
 		} catch (e) { console.warn('[mpcsactor] event shield failed', e); }
 
-		// 5) Per-frame: temp sweep + stall tracking for the pause-menu button.
+		// 5) Per-frame: temp sweep + stall tracking for the pause-menu button + NPC stream.
 		try {
 			(simplify as any).registerUpdate(() => { try { self.tick(); } catch (_) { /* never break the frame */ } });
 		} catch (_) { /* ignore */ }
+
+		// 6) 0.2.6: peer cutscene-NPC visibility stream (mid-scene SHOW_ENTITY actors).
+		try {
+			const m0 = this.getMain();
+			const conn: any = m0 && m0.connection;
+			if (conn && typeof conn.onCutsceneNpc === 'function') {
+				conn.onCutsceneNpc((from: string, data: { map: string, list: any[] }) => {
+					try { self.applyPeerNpcBlock(from, data); } catch (_) { /* never break the frame */ }
+				});
+			}
+		} catch (e) { console.warn('[mpcsactor] cutsceneNpc hook failed', e); }
 
 		// Diagnostic: window.__mpCsActors() -> stash size + live temps.
 		(window as any).__mpCsActors = () => {
@@ -248,6 +265,8 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 	private buildStash(game: any, data: any): void {
 		this.stash = Object.create(null);
 		this.temps = Object.create(null);
+		this.peerShown = Object.create(null);
+		this.peerNpcSeen = Object.create(null);
 		try {
 			const defs: any[] = (data && data.entities) || [];
 			for (let i = 0; i < defs.length; i++) {
@@ -301,6 +320,7 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 					this.logMat(name, 'force-shown hidden actor');
 				}
 				if (typeof ent.show === 'function') ent.show(true);
+				this.forceVisible(ent);
 				return ent;
 			} catch (_) { return null; }
 		}
@@ -371,11 +391,174 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 		} catch (_) { /* ignore */ }
 	}
 
+	// --------------------------------------------- 0.2.6 cutscene-NPC stream
+
+	/** Stream visible named story actors while a cutscene owns the screen. */
+	private sendNpcBlock(busy: boolean): void {
+		if (!this.connected()) return;
+		const m: any = this.getMain();
+		if (!m || m.isSoloInstance && m.isSoloInstance()) return;
+		const active = busy || this.anyEventRunning();
+		if (!active) return;
+		const now = Date.now();
+		if (now - this.npcSendAt < 100) return; // ~10Hz
+		this.npcSendAt = now;
+		const conn: any = m.connection;
+		if (!conn || !conn.isOpen() || typeof conn.updateCutsceneNpcBlock !== 'function') return;
+		const g: any = (ig as any).game;
+		if (!g || !g.entities) return;
+		const map = (g.mapName || '') as string;
+		if (!map) return;
+		const Enemy: any = (ig.ENTITY as any).Enemy;
+		const list: any[] = [];
+		for (let i = 0; i < g.entities.length; i++) {
+			const e: any = g.entities[i];
+			if (!e || e._killed || e._hidden || !e.coll) continue;
+			if (Enemy && e instanceof Enemy) continue; // cutsceneEntity already covers monsters
+			const name = e.name || (e.settings && e.settings.name);
+			if (!name || typeof name !== 'string') continue;
+			// Skip our own player + remote mirrors; party follower bots stream elsewhere.
+			if (e === g.playerEntity || e._mpMirror || e._mpPuppet) continue;
+			if (list.length >= 32) break;
+			const face = e.face || { x: 0, y: 1 };
+			list.push({
+				n: name.slice(0, 48),
+				x: Math.round(e.coll.pos.x),
+				y: Math.round(e.coll.pos.y),
+				z: Math.round(e.coll.pos.z),
+				fx: face.x, fy: face.y,
+			});
+		}
+		if (!list.length) return;
+		conn.updateCutsceneNpcBlock({ map, list });
+	}
+
+	/** A peer's cutscene-NPC stream arrived: force-show / materialize matching
+	 * named actors and snap them to the owner's position so the cast is visible
+	 * even when THIS client never ran (or already finished) the same event. */
+	private applyPeerNpcBlock(from: string, data: { map: string, list: any[] }): void {
+		if (!this.connected() || !from) return;
+		const m: any = this.getMain();
+		if (m && m.name && from === m.name) return; // own echo
+		const g: any = (ig as any).game;
+		if (!g || !g.playerEntity) return;
+		const map = (g.mapName || '') as string;
+		if (!data || !data.map || data.map !== map || !Array.isArray(data.list)) return;
+		this.peerNpcSeen[from] = Date.now();
+		for (const s of data.list) {
+			if (!s || typeof s.n !== 'string' || !s.n) continue;
+			let e = this.findNamedEntity(s.n);
+			if (e && !e._killed && e._hidden) {
+				// Hidden map NPC: show it for the peer's scene.
+				try {
+					if (typeof e.show === 'function') e.show(true);
+					this.forceVisible(e);
+					if (!this.temps[s.n]) {
+						this.temps[s.n] = { ent: e, spawned: false, cond: this.conditionOf(e), lastUsed: Date.now() };
+					} else {
+						this.temps[s.n].lastUsed = Date.now();
+					}
+					this.peerShown[s.n] = { ent: e, from, spawned: false };
+					this.logMat(s.n, 'peer-stream force-show');
+				} catch (_) { /* ignore */ }
+			} else if (!e || e._killed) {
+				// Absent on this client: materialize a stand-in from the map stash.
+				const sp = this.spawnFromStash(s.n);
+				if (sp) {
+					e = sp;
+					this.peerShown[s.n] = { ent: e, from, spawned: true };
+				}
+			} else if (e) {
+				// Already visible locally — still track last-use so the sweep keeps it.
+				const rec = this.temps[s.n];
+				if (rec) rec.lastUsed = Date.now();
+				this.peerShown[s.n] = { ent: e, from, spawned: !!(this.temps[s.n] && this.temps[s.n].spawned) };
+			}
+			if (!e || e._killed || !e.coll) continue;
+			// Snap to the owner's authored pose when the gap is large (first adopt
+			// or a teleport-in); small gaps are left to the engine's own walk.
+			const cp = e.coll.pos;
+			const dx = Math.abs(cp.x - s.x), dy = Math.abs(cp.y - s.y);
+			if (dx > 48 || dy > 48) {
+				try { e.setPos(s.x, s.y, s.z); } catch (_) {
+					try { cp.xProtected = s.x; cp.yProtected = s.y; cp.zProtected = s.z; } catch (_) { /* ignore */ }
+				}
+			}
+			if (e.face && (typeof s.fx === 'number' || typeof s.fy === 'number')) {
+				try {
+					e.face.xProtected = typeof s.fx === 'number' ? s.fx : e.face.xProtected;
+					e.face.yProtected = typeof s.fy === 'number' ? s.fy : e.face.yProtected;
+				} catch (_) { /* ignore */ }
+			}
+		}
+	}
+
+	/** Clear _hidden + zero-alpha so a force-shown story actor actually draws. */
+	private forceVisible(e: any): void {
+		try {
+			e._hidden = false;
+			if (e.animState && typeof e.animState.alpha === 'number' && e.animState.alpha === 0) {
+				e.animState.alpha = 1;
+			}
+		} catch (_) { /* ignore */ }
+	}
+
+	private findNamedEntity(name: string): any {
+		try {
+			const g: any = (ig as any).game;
+			const list: any[] = (g && g.entities) || [];
+			const Enemy: any = (ig.ENTITY as any).Enemy;
+			for (let i = 0; i < list.length; i++) {
+				const e: any = list[i];
+				if (!e || e._killed || (Enemy && e instanceof Enemy)) continue;
+				const n = e.name || (e.settings && e.settings.name);
+				if (n === name) return e;
+			}
+		} catch (_) { /* ignore */ }
+		return null;
+	}
+
+	/** Re-hide / kill actors we only showed for a peer whose stream stopped.
+	 * Keyed ONLY on the owner's stream going quiet — the LOCAL client is often
+	 * NOT in a cutscene (it is watching the owner's scene), so "local scene
+	 * over" must never re-hide a peer's still-live cast. */
+	private sweepPeerShown(): void {
+		const now = Date.now();
+		for (const name in this.peerShown) {
+			const rec = this.peerShown[name];
+			if (!rec) { delete this.peerShown[name]; continue; }
+			const last = this.peerNpcSeen[rec.from];
+			const staleOwner = typeof last !== 'number' || now - last > 2500;
+			if (!staleOwner) continue;
+			delete this.peerShown[name];
+			// Leave the actor if OUR own temps still own it (local scene needs it).
+			if (this.temps[name]) continue;
+			const e = rec.ent;
+			if (!e || e._killed) continue;
+			if (rec.spawned) {
+				try { e.kill(true); } catch (_) { /* ignore */ }
+				continue;
+			}
+			// Force-shown map entity: restore condition truth.
+			const cond = this.conditionOf(e);
+			let condOk = false;
+			try { condOk = !!(cond && typeof cond.evaluate === 'function' && cond.evaluate()); } catch (_) { condOk = false; }
+			if (!condOk) {
+				try { (ig.game as any).requestEntityHide(e); } catch (_) { try { e.hide(); } catch (_) { /* ignore */ } }
+			}
+		}
+	}
+
 	// ---------------------------------------------------------------- sweep
 
 	private tick(): void {
 		const busy = this.sceneBusy();
 		this.trackStall();
+		// 0.2.6: while a scene runs, stream our visible named NPCs so peers can
+		// see mid-cutscene SHOW_ENTITY actors they never replayed locally.
+		try { this.sendNpcBlock(busy); } catch (_) { /* ignore */ }
+		// 0.2.6: reap peer-shown actors whose owner stopped streaming.
+		try { this.sweepPeerShown(); } catch (_) { /* ignore */ }
 		// Sweep stale temps once the scene is over, PER ACTOR (a global idle
 		// window would be held forever by permanent parallel event calls — the
 		// exact reason temp actors survived their scene before this guard):
@@ -407,6 +590,8 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 		const r = this.temps[name];
 		if (!r) return;
 		delete this.temps[name];
+		// 0.2.6: a peer-shown record that shared this entity is now orphaned.
+		delete this.peerShown[name];
 		const e = r.ent;
 		if (!e) return;
 		if (r.spawned) {
@@ -435,6 +620,26 @@ class CutsceneActorGuard implements ICutsceneActorGuard {
 		const names: string[] = [];
 		for (const name in this.temps) names.push(name);
 		for (const name of names) this.cleanupTemp(name, reason);
+		// 0.2.6: a local force-end also drops peer-stream stand-ins — they belong
+		// to a scene this client is no longer presenting.
+		try {
+			for (const name in this.peerShown) {
+				const rec = this.peerShown[name];
+				if (!rec || this.temps[name]) continue;
+				delete this.peerShown[name];
+				const e = rec.ent;
+				if (!e || e._killed) continue;
+				if (rec.spawned) { try { e.kill(true); } catch (_) { /* ignore */ } }
+				else {
+					const cond = this.conditionOf(e);
+					let condOk = false;
+					try { condOk = !!(cond && typeof cond.evaluate === 'function' && cond.evaluate()); } catch (_) { condOk = false; }
+					if (!condOk) {
+						try { (ig.game as any).requestEntityHide(e); } catch (_) { try { e.hide(); } catch (_) { /* ignore */ } }
+					}
+				}
+			}
+		} catch (_) { /* ignore */ }
 	}
 
 	// ---------------------------------------------------- unstuck heal (pause-menu button)

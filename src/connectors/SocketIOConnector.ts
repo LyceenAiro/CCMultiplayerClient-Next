@@ -1610,6 +1610,10 @@ export class SocketIoConnector implements IConnection {
 	public updateCutsceneEntityBlock(state: { map: string, list: any[] }): void {
 		this.syncEmit('cutsceneEntity', state);
 	}
+	// 0.2.6: cutscene NPC visibility stream (see cutsceneActorGuard).
+	public updateCutsceneNpcBlock(state: { map: string, list: any[] }): void {
+		this.syncEmit('cutsceneNpc', state);
+	}
 	// ROUND 82: door open/close visuals for map doors. Instance-scoped (solo-skipped);
 	// the server whitelists the small payload and relays it to the other members.
 	public doorTransition(info: { map: string; x: number; y: number; z: number; dir: string; targetMap: string; marker: string }): void {
@@ -1657,6 +1661,13 @@ export class SocketIoConnector implements IConnection {
 	}
 	public onCutsceneEntity(callback: (from: string, data: { map: string, list: any[] }) => void): void {
 		this.socket.on('cutsceneEntity', (data: any) => {
+			if (!data || typeof data.map !== 'string' || !Array.isArray(data.list)) return;
+			callback(data.from, data);
+		});
+	}
+	// 0.2.6: cutscene NPC visibility stream.
+	public onCutsceneNpc(callback: (from: string, data: { map: string, list: any[] }) => void): void {
+		this.socket.on('cutsceneNpc', (data: any) => {
 			if (!data || typeof data.map !== 'string' || !Array.isArray(data.list)) return;
 			callback(data.from, data);
 		});

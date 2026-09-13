@@ -60,7 +60,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '3.0.0';
+export const MP_VERSION = '3.0.3';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -2330,6 +2330,14 @@ public bubbleSync?: IBubbleSync;
 	public reassertCurrentInstance(): void {
 		try {
 			if (!this.connection || !this.connection.isOpen()) return;
+			// 0.2.6: party-up reassert must not migrate us into the inviter's host
+			// while OUR encounter / boss fight is live (same-map or not) — that
+			// reloads the room and refreshes our encounter enemies.
+			if (this.localInEncounterCombat()) {
+				console.log('[multiplayer] party reassert skipped: local encounter/boss fight');
+				try { showMpToast({ title: t('teleportLocalCombat') }); } catch (_) { /* ignore */ }
+				return;
+			}
 			const map = ig.game && ig.game.mapName;
 			if (!map || ig.game.isTeleporting()) return; // mid-teleport: onTeleport handles it
 			const p = this.connection.changeMap(map, null, this.getAreaPath(), this.getAreaType());
@@ -2428,6 +2436,17 @@ public bubbleSync?: IBubbleSync;
 		return /\.special\.|\.excluded-|^arena\./.test(map);
 	}
 
+	/** 0.2.6: true while the LOCAL player is in an encounter / boss fight
+	 * (`sc.model.isForceCombat()`). Party-up auto-regroup / instance reassert
+	 * must not yank them into another client's host mid-fight — that reloads
+	 * the map and respawns their encounter enemies. */
+	public localInEncounterCombat(): boolean {
+		try {
+			const mdl: any = (sc as any).model;
+			return !!(mdl && typeof mdl.isForceCombat === 'function' && mdl.isForceCombat());
+		} catch (_) { return false; }
+	}
+
 	private regroupToPartyLeader(leader: string | undefined, map: string | undefined, pos: Vec3 | undefined): void {
 		// Round 19: a regroup teleport that arrives while the LOCAL player is in a
 		// cutscene must not fire — teleporting mid-story would fight the story UI
@@ -2441,6 +2460,15 @@ public bubbleSync?: IBubbleSync;
 				return;
 			}
 		} catch (_) { /* fall through to teleporting */ }
+		// 0.2.6 (user directive): never auto-join another host while OUR encounter /
+		// boss fight is live. Accepting an invite (or the server's partyMove) must
+		// not teleport / changeMap us out of a room whose enemies we still own —
+		// the reload refreshes the encounter. Stay put; finish the fight first.
+		if (this.localInEncounterCombat()) {
+			console.log('[multiplayer] regroup blocked: local encounter/boss fight in progress');
+			try { showMpToast({ title: t('teleportLocalCombat') }); } catch (_) { /* ignore */ }
+			return;
+		}
 		const target = map && typeof map === 'string' ? map : 'rhombus-sqr.central';
 		console.log('[multiplayer] regrouping to party leader ' + leader + ' @ ' + target);
 

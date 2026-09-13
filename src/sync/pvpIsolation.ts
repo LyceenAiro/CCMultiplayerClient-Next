@@ -43,12 +43,70 @@ export function installPvpIsolation(main: Multiplayer): void {
 				if (!ig.game || !ig.game.playerEntity) return;
 				const arena: any = (sc as any).arena;
 				if (arena && arena.active) return; // arena cups are shared on purpose
-				if (msg === PM.STARTED) enterIsolation(main);
-				else if (msg === PM.STOPPED) exitIsolation(main);
+				if (msg === PM.STARTED) { hidePartyBotsForPvp(main); enterIsolation(main); }
+				else if (msg === PM.STOPPED) { exitIsolation(main); restorePartyBotsAfterPvp(main); }
 				// ROUND_OVER (3) needs no routing change.
 			} catch (_) { /* an observer error must never break the duel itself */ }
 		},
 	} as any);
+}
+
+/** 0.2.6 (user directive): story PVP duels are 1v1. Native follower bots
+ * (Emilie/Glasses/…) and MP party bots still walk into the arena and join
+ * the fight — hide every live party-follower entity for the duel's duration
+ * (same idiom as keepMapDungeon, without the DUNGEON_TRANSITION side
+ * effects). Temp cutscene companions are swept too. */
+function hidePartyBotsForPvp(main: Multiplayer): void {
+	try {
+		const party: any = (sc as any).party;
+		if (!party || !party.currentParty) return;
+		// Mirror keepMapDungeon's combat-suppression bit so party AI / size /
+		// deferred respawn treat the duel as "no followers" without firing the
+		// DUNGEON_TRANSITION events. Restored on PVP stop from the real map state.
+		try { party.dungeonBlocked = true; } catch (_) { /* ignore */ }
+		let n = 0;
+		for (let i = 0; i < party.currentParty.length; i++) {
+			const name = party.currentParty[i];
+			const e: any = party.partyEntities && party.partyEntities[name];
+			if (e && !e._killed) {
+				try { e.hide(); n++; } catch (_) { /* ignore */ }
+			}
+		}
+		// Temp cutscene companions must not linger into the duel either.
+		try {
+			const bots: any = main && (main as any).tempPartyBots;
+			if (bots && typeof bots.cleanupTemps === 'function') bots.cleanupTemps('pvp-start');
+		} catch (_) { /* ignore */ }
+		if (n) console.log('[multiplayer] PVP start: hid ' + n + ' party follower bot(s)');
+	} catch (_) { /* never break the duel */ }
+}
+
+/** Bring native follower entities back after the duel. respawnMembers is the
+ * engine's own path (onMapEnter uses it when leaving a dungeon). */
+function restorePartyBotsAfterPvp(_main: Multiplayer): void {
+	try {
+		const party: any = (sc as any).party;
+		if (!party) return;
+		// Only clear our temporary bit when the MAP itself is not a dungeon —
+		// a real dungeon leave keeps dungeonBlocked until onMapEnter handles it.
+		try {
+			const sm: any = (sc as any).map;
+			const inDungeon = !!(sm && typeof sm.isDungeon === 'function' && sm.isDungeon());
+			if (!inDungeon) party.dungeonBlocked = false;
+		} catch (_) { /* ignore */ }
+		if (typeof party.isDungeonBlocked === 'function' && party.isDungeonBlocked()) return;
+		if (typeof party.respawnMembers === 'function') {
+			party.respawnMembers();
+			console.log('[multiplayer] PVP stop: respawned party follower bots');
+		} else if (party.partyEntities) {
+			for (const k in party.partyEntities) {
+				const e: any = party.partyEntities[k];
+				if (e && !e._killed && typeof e.show === 'function') {
+					try { e.show(); } catch (_) { /* ignore */ }
+				}
+			}
+		}
+	} catch (_) { /* never break post-duel recovery */ }
 }
 
 function enterIsolation(main: Multiplayer): void {

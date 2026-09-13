@@ -89,6 +89,10 @@ export interface IConnection {
      * relays this to the instance as `cutsceneEntity` with the sender stamped as
      * `from`; receivers render them as csPuppets and reap them when the stream stops. */
     updateCutsceneEntityBlock(state: { map: string, list: any[] }): void;
+    /** 0.2.6: the client running a story cutscene streams its visible named NPCs
+     * (mid-scene SHOW_ENTITY / force-show actors). Receivers force-show or
+     * materialize the matching names so peers can see the same cast. */
+    updateCutsceneNpcBlock(state: { map: string, list: any[] }): void;
     /** ROUND 82 (door transition visuals): the local player walked into a mapped
      * door (Door.collideWith) — broadcast the door's identity/position so other
      * clients on the same map open their matching door and see the enter/exit
@@ -734,6 +738,9 @@ export interface IConnection {
      * owner's username (server-stamped); receivers ignore their own echo and reap
      * the owner's csPuppets when its stream stops. */
     onCutsceneEntity(callback: (from: string, data: { map: string, list: any[] }) => void): void;
+    /** 0.2.6: a peer's cutscene-NPC stream arrived (name/pos/face of visible
+     * story actors). `from` = the stream owner; ignore your own echo. */
+    onCutsceneNpc(callback: (from: string, data: { map: string, list: any[] }) => void): void;
     /** Round 62: the host's enemy-projectile stream arrived (host-only). `list` = the
      * projectile snaps (uid/kind/source/proxy-name/pos/vel); receivers spawn/update
      * visual-only copies and reap absent uids. */

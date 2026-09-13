@@ -180,6 +180,12 @@ export class NetSync {
 	 * re-evaluation (~every 0.5s) that un-sticks combatMode when the last enemy
 	 * de-aggros a mirror. */
 	private _mpCombatEvalTimer = 0;
+	/** 0.2.6 (Crate Hate / timed defense force-combat leak): timestamp when
+	 * forceCombatMode first became true under the current leak-watch window.
+	 * 0 = not currently watching. */
+	private _mpForceCombatSince = 0;
+	private _mpForceCombatLeakAt = 0;
+	private _mpDefenseEndRecoverAt = 0;
 	// ---- local death / respawn state (own player; both host and member) ----
 	private _mpDead = false;
 	private _mpDeadAt = 0;
@@ -1145,7 +1151,11 @@ export class NetSync {
 							const arr: any[] = c.activeCombatants && c.activeCombatants[(sc as any).COMBATANT_PARTY.ENEMY];
 							if (arr) {
 								for (let i = arr.length; i--;) {
-									if (!arr[i] || arr[i]._killed) arr.splice(i, 1);
+									// 0.2.6: also drop HIDDEN map enemies — timed defenses
+									// (Crate Hate waves) despawn via spawnCondition hide, not
+									// onKill, and the leftover THREAT entries kept combatMode
+									// latched after SET_FORCE_COMBAT(false).
+									if (!arr[i] || arr[i]._killed || arr[i]._hidden) arr.splice(i, 1);
 								}
 							}
 						} catch (_) { /* fall through to native */ }
@@ -10844,6 +10854,9 @@ export class NetSync {
 				this._mpLastCombatLocked = null;
 				this._mpWasCombatHost = false;
 				this._mpCombatStateHeartbeatAt = 0;
+				// 0.2.6: force-combat leak watch belongs to the map we just left.
+				this._mpForceCombatSince = 0;
+				this._mpDefenseEndRecoverAt = 0;
 			}
 			// 1.75.x: periodic ground-pickup self-heal (also catches a same-map
 			// re-entry / teleport-back, where mapName never changes).
@@ -10892,6 +10905,13 @@ export class NetSync {
 			if (this._mpReapTimer >= 0.5) {
 				this._mpReapTimer = 0;
 				this.reapStalePuppets();
+				// 0.2.6: force-combat leak watchdog (host AND member). Timed defenses
+				// (Crate Hate / bakiTrader-1-crate_defense_1) arm SET_FORCE_COMBAT(true)
+				// and only the ONCE defense_end event — which fires solely on the client
+				// that owns quest_defense-timer — clears it. A missing timer is treated
+				// as Infinity by the mp remainingTime guard, so that end never runs and
+				// the player stays locked in combat with nothing left to fight.
+				this.tickForceCombatLeakGuard();
 			}
 			// Round 62: member-side stale projectile reap (~150ms). Projectiles are
 			// short-lived and the host sends no empty blocks, so absence in the stream
@@ -10964,25 +10984,29 @@ export class NetSync {
 					// enemy's ranged attacks (Ball/Stone flying toward them).
 					this.sendProjectileBlock();
 				}
-				// Round 14 (fix 1): combat re-evaluation for the host. sc.model.combatMode is
-				// only re-computed via the LOCAL player's _addTargetedBy/_removeTargetedBy ->
-				// updateCombatMode(), but enemies that de-aggro a REMOTE player's MIRROR never
-				// touch the local player — when the last such enemy leaves activeCombatants the
-				// mode latches true forever (host streams cb=1, every member held in combat).
-				// Periodically re-check and clear-only (never force combat ON).
-				this._mpCombatEvalTimer = (this._mpCombatEvalTimer || 0) + ig.system.tick;
-				if (this._mpCombatEvalTimer >= 0.5) {
-					this._mpCombatEvalTimer = 0;
-					try {
-						const mdl: any = (sc as any).model;
-						const cmb: any = (sc as any).combat; // sc.combat (matches the onKill fix style)
-						if (mdl && mdl.isCombatMode && mdl.isCombatMode()
-							&& cmb && typeof cmb.isPlayerPartyInCombat === 'function'
-							&& !cmb.isPlayerPartyInCombat()) {
-							mdl.setCombatMode(false);
-						}
-					} catch (_) { /* ignore */ }
-				}
+			}
+			// Round 14 (fix 1): combat re-evaluation. sc.model.combatMode is only
+			// re-computed via the LOCAL player's _addTargetedBy/_removeTargetedBy ->
+			// updateCombatMode(), but enemies that de-aggro a REMOTE player's MIRROR
+			// never touch the local player — when the last such enemy leaves
+			// activeCombatants the mode latches true forever (host streams cb=1,
+			// every member held in combat). Periodically re-check and clear-only
+			// (never force combat ON). 0.2.6: also run on MEMBERS — a member that
+			// entered combat via the host's cb flag (or its own quest-wave copies)
+			// must leave once no THREAT remains, even if the host's block is stale.
+			this._mpCombatEvalTimer = (this._mpCombatEvalTimer || 0) + ig.system.tick;
+			if (this._mpCombatEvalTimer >= 0.5) {
+				this._mpCombatEvalTimer = 0;
+				try {
+					const mdl: any = (sc as any).model;
+					const cmb: any = (sc as any).combat; // sc.combat (matches the onKill fix style)
+					if (mdl && mdl.isCombatMode && mdl.isCombatMode()
+						&& !(mdl.isForceCombat && mdl.isForceCombat())
+						&& cmb && typeof cmb.isPlayerPartyInCombat === 'function'
+						&& !cmb.isPlayerPartyInCombat()) {
+						mdl.setCombatMode(false);
+					}
+				} catch (_) { /* ignore */ }
 			}
 			// Round 19 (Part 3, step 3): members stream their own cutscene-spawned
 			// monsters so other members render them as csPuppets (~15Hz, presence-
@@ -14946,13 +14970,218 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		if (!c || !c.activeCombatants) return;
 		const arr: any[] = c.activeCombatants[(sc as any).COMBATANT_PARTY.ENEMY];
 		if (!arr || !arr.length) return;
+		const ents: any[] = (ig.game && (ig.game as any).entities) || [];
+		const EntityCls: any = (ig as any).Entity;
 		for (let i = arr.length; i--;) {
 			const e = arr[i];
-			if (!e || e._killed) {
+			// 0.2.6: also drop HIDDEN and no-longer-in-map entries. Timed defenses
+			// despawn waves via spawnCondition (hide), never onKill/setTarget(null) —
+			// those leftover THREAT corpses are what kept combatMode latched after
+			// the defense's SET_FORCE_COMBAT(false).
+			let stale = !e || e._killed || !!e._hidden;
+			if (!stale && EntityCls && e instanceof EntityCls && ents.indexOf(e) === -1) stale = true;
+			if (stale) {
 				try { if (typeof c.removeActiveCombatant === 'function') c.removeActiveCombatant(e); else arr.splice(i, 1); }
 				catch (_) { arr.splice(i, 1); }
 			}
 		}
+	}
+
+	/** 0.2.6 (Crate Hate / timed-defense force-combat leak). SET_FORCE_COMBAT(true)
+	 * arms sc.model.forceCombatMode; only the matching SET_FORCE_COMBAT(false) event
+	 * step clears it. In multiplayer that end step lives in an ONCE EventTrigger
+	 * (e.g. heat/path-05 quest_traders-defense_end) whose startCondition reads
+	 * `timers.<name>.remainingTime <= 0`. Two multiplayer-only holes:
+	 *   1. The missing-timer guard returns Infinity for a client that never owned
+	 *      the timer — so a member that replayed defense_start (or inherited
+	 *      defense_started via side-quest tmp-var sync) can NEVER fire the end.
+	 *   2. Even the timer-owner can miss the ONCE if the long end cutscene wedges
+	 *      after the trigger consumed its map._entity flag but before
+	 *      SET_FORCE_COMBAT(false) ran.
+	 * The 0.5s combatMode eval deliberately never clears forceCombatMode (legitimate
+	 * arenas rely on it with zero enemies). This watchdog is the safety net: after
+	 * a grace window of force-combat + no THREAT enemies + no local cutscene +
+	 * no arena/PVP, try to run the real end cutscene, else clear the lock. */
+	private tickForceCombatLeakGuard(): void {
+		try {
+			const mdl: any = (sc as any).model;
+			if (!mdl || typeof mdl.isForceCombat !== 'function' || !mdl.isForceCombat()) {
+				this._mpForceCombatSince = 0;
+				return;
+			}
+			const now = Date.now();
+			if (!this._mpForceCombatSince) {
+				this._mpForceCombatSince = now;
+				return;
+			}
+			// Never fight a running cutscene / blocking event — the scene owns the lock.
+			try {
+				if (mdl.isCutscene && mdl.isCutscene()) { this._mpForceCombatSince = now; return; }
+				const ev: any = (ig.game as any) && (ig.game as any).events;
+				if (ev && typeof ev.getBlockingEventCall === 'function' && ev.getBlockingEventCall()) {
+					this._mpForceCombatSince = now;
+					return;
+				}
+			} catch (_) { /* ignore */ }
+			// Arena cups and story PVP own force combat natively.
+			try {
+				const c: any = sc as any;
+				if (c.arena && c.arena.active) { this._mpForceCombatSince = now; return; }
+				if (c.pvp && typeof c.pvp.isActive === 'function' && c.pvp.isActive()) {
+					this._mpForceCombatSince = now;
+					return;
+				}
+			} catch (_) { /* ignore */ }
+			// Purge first so despawned quest-wave leftovers cannot look like a live fight.
+			try { this.purgeStaleCombatants(); } catch (_) { /* ignore */ }
+			try {
+				const cmb: any = (sc as any).combat;
+				if (cmb && typeof cmb.isPlayerPartyInCombat === 'function' && cmb.isPlayerPartyInCombat()) {
+					this._mpForceCombatSince = now;
+					return;
+				}
+			} catch (_) { /* ignore */ }
+			// A still-running COUNTDOWN timer means a timed defense/challenge is live
+			// (Crate Hate's quest_defense-timer). Do not steal its lock.
+			if (this.anyLiveCountdownTimer()) {
+				this._mpForceCombatSince = now;
+				return;
+			}
+			// Grace: intro spawn gaps are typically <2s; 5s of empty force-combat is a leak.
+			if (now - this._mpForceCombatSince < 5000) return;
+			if (now - this._mpForceCombatLeakAt < 2000) return;
+			this._mpForceCombatLeakAt = now;
+			// Prefer the real end cutscene so quest steps / barriers still complete.
+			if (this.tryRecoverTimedDefenseEnd()) return;
+			this.clearForceCombatLock('leak-watchdog (no threats/scene/timer for 5s)');
+			this._mpForceCombatSince = 0;
+		} catch (_) { /* never break the frame */ }
+	}
+
+	/** True when any sc.timers countdown still has remaining time > 0. */
+	private anyLiveCountdownTimer(): boolean {
+		try {
+			const timers: any = (sc as any).timers;
+			if (!timers || !timers.timers) return false;
+			for (const k in timers.timers) {
+				const t = timers.timers[k];
+				if (!t) continue;
+				const rem = typeof t.getRemainingTime === 'function' ? t.getRemainingTime() : null;
+				if (typeof rem === 'number' && isFinite(rem) && rem > 0) return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
+	/** Clear forceCombatMode + combatMode latch and re-report the encounter lock. */
+	private clearForceCombatLock(reason: string): void {
+		try {
+			const mdl: any = (sc as any).model;
+			if (mdl && typeof mdl.setCombatMode === 'function') {
+				mdl.setCombatMode(false);
+				mdl.setCombatMode(false, true);
+			}
+			this.purgeStaleCombatants();
+			const pl: any = (ig.game as any) && (ig.game as any).playerEntity;
+			if (pl && typeof pl.updateCombatMode === 'function') pl.updateCombatMode();
+			this._mpLastCombatLocked = null; // force a combatState re-report
+			console.warn('[netsync] force-combat lock cleared: ' + reason);
+		} catch (_) { /* ignore */ }
+	}
+
+	/** Crate Hate (bakiTrader-1-crate_defense_1) and siblings: if the defense is
+	 * marked started (or force combat is on after the timer died) and the ONCE
+	 * defense_end trigger has not been consumed, start that event locally so
+	 * SET_FORCE_COMBAT(false) + SOLVE_QUEST_CONDITION still run. Returns true when
+	 * an end event was started (the leak watchdog must not also hard-clear mid-scene). */
+	private tryRecoverTimedDefenseEnd(): boolean {
+		try {
+			const map = ((ig.game as any) && (ig.game as any).mapName) || '';
+			if (map !== 'heat/path-05' && map !== 'heat.path-05') return false;
+			const now = Date.now();
+			if (now - this._mpDefenseEndRecoverAt < 3000) return false;
+			const vars: any = (ig as any).vars;
+			if (!vars || typeof vars.get !== 'function') return false;
+			const started = !!vars.get('tmp.quest_traders-defense_started');
+			const over = !!vars.get('tmp.quest_traders-defense_over');
+			const mdl: any = (sc as any).model;
+			const force = !!(mdl && typeof mdl.isForceCombat === 'function' && mdl.isForceCombat());
+			if (over || !force) return false;
+			const rem = this.readTimerRemaining('quest_defense-timer');
+			if (rem !== null && rem > 0) return false; // still counting — wait
+			// Force-combat leaked without a live defense arm (never started, or
+			// defense_started already cleared by a partial end): just drop the lock.
+			// Starting the full end cutscene here would SOLVE_QUEST_CONDITION against
+			// a quest that never entered the defend task.
+			if (!started) {
+				this._mpDefenseEndRecoverAt = now;
+				this.clearForceCombatLock('crate-defense force-combat without defense_started');
+				this._mpForceCombatSince = 0;
+				return true;
+			}
+			this._mpDefenseEndRecoverAt = now;
+			const ET: any = (ig.ENTITY as any) && (ig.ENTITY as any).EventTrigger;
+			const list: any[] = (ig.game as any).entities || [];
+			const EV: any = (ig as any).EVENT_TYPE || {};
+			for (const e of list) {
+				if (!e || e._killed || !ET || !(e instanceof ET)) continue;
+				if (e.name !== 'quest_traders-defense_end') continue;
+				if (e.eventType !== EV.CUTSCENE) continue;
+				if (e.eventCall && typeof e.eventCall.isRunning === 'function' && e.eventCall.isRunning()) return true;
+				if (e.triggerVar && (ig.vars as any).get(e.triggerVar)) {
+					// ONCE already consumed but force combat leaked — hard-clear only.
+					this.clearForceCombatLock('crate-defense end already consumed, force-combat leaked');
+					this._mpForceCombatSince = 0;
+					return true;
+				}
+				// Timer-owner path: the engine should have started this already. Force
+				// start for the missing-timer / wedged-trigger cases (same idiom as
+				// the boss-defeat cinematic recovery).
+				let ev: any = e.event || null;
+				if (!ev) {
+					const raw = e._mpCsSettings || e._mpStorySettings || null;
+					if (raw && raw.event) {
+						try { ev = new (ig as any).Event({ name: e.name, steps: raw.event }); } catch (_) { ev = null; }
+					}
+				}
+				if (!ev) {
+					this.clearForceCombatLock('crate-defense end has no event steps');
+					this._mpForceCombatSince = 0;
+					return true;
+				}
+				const prev = (window as any).__mpStoryRun;
+				(window as any).__mpStoryRun = { allow: true };
+				let call: any = null;
+				try {
+					call = (sc as any).Cutscene.startEvent(EV.CUTSCENE || e.eventType, ev, e.name);
+				} finally {
+					if (prev === undefined) delete (window as any).__mpStoryRun;
+					else (window as any).__mpStoryRun = prev;
+				}
+				if (e.triggerVar) {
+					try { (ig.vars as any).set(e.triggerVar, true); } catch (_) { /* ignore */ }
+				}
+				console.warn('[netsync] crate-defense end recovered locally (mapId=' + (e.mapId || 0)
+					+ ' started=' + started + ' rem=' + rem + ' call=' + (!!call) + ')');
+				return true;
+			}
+			// No end trigger on this map copy — still clear the leaked lock so the
+			// player is not bricked; quest step sync / native talk can finish the rest.
+			this.clearForceCombatLock('crate-defense end trigger not found');
+			this._mpForceCombatSince = 0;
+			return true;
+		} catch (_) { return false; }
+	}
+
+	/** Remaining seconds for a named timer, or null when the timer is absent. */
+	private readTimerRemaining(name: string): number | null {
+		try {
+			const timers: any = (sc as any).timers;
+			if (!timers || !timers.timers || !timers.timers[name]) return null;
+			const t = timers.timers[name];
+			const rem = typeof t.getRemainingTime === 'function' ? t.getRemainingTime() : null;
+			return (typeof rem === 'number' && isFinite(rem)) ? rem : null;
+		} catch (_) { return null; }
 	}
 
 	/**
@@ -17304,7 +17533,13 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 	}
 
 	/** Rebuild the resolved set of map/tmp vars that gate a CHEST conditionalEntity on
-	 * the current map (reads each chest's condition.vars). Rebuilt per map. */
+	 * the current map (reads each chest's condition.vars). Rebuilt per map.
+	 * 0.2.6: also collect vars that drive OLPlatform / ExtractPlatform STATE
+	 * conditions (e.g. tmp.bossPillar under the Maroon Cave / arena sandworm).
+	 * Those platforms are deliberately NOT position-synced (puzzleSync 1.74.x
+	 * note) — each client moves its own copy when ig.vars change — but the
+	 * boss's tmp.* write only ever happens on the HOST, so without relaying the
+	 * var itself members keep their stones down. */
 	private rebuildSpawnVarSet(): void {
 		this._mpSpawnVarSet = Object.create(null);
 		this._mpLocalPickupVarSet = Object.create(null);
@@ -17345,6 +17580,43 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 					this._mpSpawnVarSet[rk.b + '|' + rk.k] = true;
 				}
 			}
+			// 0.2.6 (Big Tim / sandworm pillars): also index vars that pick an
+			// OLPlatform / ExtractPlatform STATE. The host boss AI writes
+			// tmp.bossPillar; members' OLPlatforms stay down until that var
+			// arrives via spawnVar + varsChanged (OLPlatform.varsChanged ->
+			// updateState). Scan live entities — these are not conditionalEntities.
+			try {
+				const E: any = ig.ENTITY || {};
+				const ents: any[] = (game && game.entities) || [];
+				for (let i = 0; i < ents.length; i++) {
+					const e: any = ents[i];
+					if (!e || e._killed) continue;
+					// ExtractPlatform: a single on/off condition (same bucket).
+					if (E.ExtractPlatform && e instanceof E.ExtractPlatform) {
+						const cv3: any[] = (e.condition && e.condition.vars) || [];
+						for (let j = 0; j < cv3.length; j++) {
+							const rk3 = this.resolveSpawnVar(cv3[j]);
+							if (!rk3 || !rk3.k || rk3.k.indexOf('.') !== -1) continue;
+							if (this.isParkourMarkerVar(rk3.b, rk3.k)) continue;
+							if (this.isPvpArenaVar(rk3.b, rk3.k)) continue;
+							this._mpSpawnVarSet[rk3.b + '|' + rk3.k] = true;
+						}
+						continue;
+					}
+					if (!Array.isArray(e.states) || !e.states.length) continue;
+					if (!(E.OLPlatform && e instanceof E.OLPlatform)) continue;
+					for (let s = 0; s < e.states.length; s++) {
+						const cv2: any[] = (e.states[s] && e.states[s].condition && e.states[s].condition.vars) || [];
+						for (let j = 0; j < cv2.length; j++) {
+							const rk2 = this.resolveSpawnVar(cv2[j]);
+							if (!rk2 || !rk2.k || rk2.k.indexOf('.') !== -1) continue;
+							if (this.isParkourMarkerVar(rk2.b, rk2.k)) continue;
+							if (this.isPvpArenaVar(rk2.b, rk2.k)) continue;
+							this._mpSpawnVarSet[rk2.b + '|' + rk2.k] = true;
+						}
+					}
+				}
+			} catch (_) { /* ignore */ }
 		} catch (_) { /* ignore */ }
 	}
 
@@ -17431,10 +17703,10 @@ if (!e._mpLastSec && t > 0 && t <= 0.75) {
 		} catch (_) { /* ignore */ }
 	}
 
-	/** A peer's world set a chest-spawn-driving var — write it into OUR storage directly
-	 * (bypassing the hooked vars API so nothing echoes) and re-evaluate spawn conditions
-	 * so our matching hidden chest shows. Map-scoping is inherent: the bucket names the
-	 * map, and varsChanged only shows entities on the map we are actually on. */
+	/** A peer's world set a chest-spawn / platform-state-driving var — write it into
+	 * OUR storage directly (bypassing the hooked vars API so nothing echoes) and
+	 * re-evaluate spawn conditions so our matching hidden chest shows, or so
+	 * OLPlatform/ExtractPlatform pick the new state (e.g. Big Tim's rising stones). */
 	private applySpawnVar(data: { from: string, map: string, list: Array<{ b: string, k: string, v: any }> }): void {
 		try {
 			if (!data || !Array.isArray(data.list)) return;

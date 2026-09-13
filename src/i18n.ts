@@ -25,6 +25,7 @@ const enDict: { [key: string]: string } = {
     teleportBusy: 'In a cutscene — teleporting unavailable',
     teleportUnlocked: 'You have not unlocked that area yet',
     teleportInCombat: 'That player is in an encounter/boss fight — cannot teleport now',
+    teleportLocalCombat: 'You are in an encounter/boss fight — regroup after it ends',
     teleportSoloZone: 'That player is inside a solo trial area — cannot teleport there',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
@@ -423,6 +424,7 @@ const zhDict: { [key: string]: string } = {
     teleportBusy: '过场动画中，无法传送到队友身边',
     teleportUnlocked: '你尚未解锁该区域，无法传送到队友身边',
     teleportInCombat: '对方正在遭遇战/BOSS战中，无法传送',
+    teleportLocalCombat: '你正在遭遇战/BOSS战中，结束后再传送/组队汇合',
     teleportSoloZone: '对方正在单人试炼区域中（修道院试炼洞穴），无法传送过去',
 
     // socialMenuInject.ts — Social-menu chips, member options, info box, add-friend box
