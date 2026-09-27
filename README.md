@@ -11,7 +11,7 @@ walking around, and the **host's** enemies, projectiles and combat are
 synchronized to everyone else over a central relay server
 ([CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next)).
 
-> **Status:** early development. **Current release: 3.0.3** (handshake version —
+> **Status:** early development. **Current release: 3.0.4** (handshake version —
 > client and server must match).
 > Main-story test progress: Faj'ro Temple (completed).
 > The mod was originally written for CrossCode **1.1.0** and the old
@@ -119,7 +119,7 @@ compact by default (`netSchema` = standard; a debug schema is optional).
   connect** by `host:port`, a live **reachability indicator** (online/offline +
   latency), all without editing the config file.
 - **Version gate** — the server rejects a client whose mod version differs
-  (current: **3.0.3**).
+  (current: **3.0.4**).
 - **Account login** — username is the identity (LAN trust); optional password;
   duplicate logins are rejected and recent usernames are remembered.
 - **Main-city auto-match** — see
@@ -246,7 +246,7 @@ Behaviour:
 | CrossCode | **1.4.2** (final release; the game is no longer updated) |
 | Mod loader | **CCLoader v2** — it bundles the `simplify` library this mod uses |
 | Node.js (build) | ≥ 18 |
-| Relay server | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next) **3.0.3** (Node ≥ 14) |
+| Relay server | [CCMultiplayerServer-Next](https://github.com/LyceenAiro/CCMultiplayerServer-Next) **3.0.4** (Node ≥ 14) |
 
 ## Building
 
@@ -442,7 +442,7 @@ the build.
 **Server**
 - Game-agnostic socket.io relay, but heavily extended for Next (accounts,
   cloud saves + mirrors, parties, friends, trading, admin UI, progress wall,
-  rate caps). Requires matching client **3.0.3**.
+  rate caps). Requires matching client **3.0.4**.
 
 ## Known limitations
 
@@ -469,7 +469,7 @@ the first place to look.
   or reinstall the mod folder.
 - **"Could not login"** — that username is already connected to the server, or
   the password is wrong / the account is locked.
-- **Version mismatch** — client and server must both be **3.0.3**.
+- **Version mismatch** — client and server must both be **3.0.4**.
 - **Mod doesn't appear / doesn't load in CCLoader v2** — confirm the manifest's
   `main` points at `dist/mod.js`, that `dist/mod.js` was actually built, and
   that the `simplify` mod is installed and enabled (it's listed under

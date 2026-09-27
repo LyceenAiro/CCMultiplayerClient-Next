@@ -59,6 +59,13 @@ let lastApplied = -1;
  * the FIRST valid canvas rect of the session — that is the windowed size the
  * game started at — and never updated afterwards. */
 let launchScale: number | null = null;
+/** 0.2.6: the window size this process booted into (install-time). Used to
+ * derive the auto baseline when the FIRST canvas measure happens AFTER the
+ * player already maximized during the loading progress bar — the old code
+ * locked launchScale to that already-maximized canvas and auto stayed at 1.0
+ * forever ("加载中最大化后 UI 不会自动放大"). */
+let bootWinW = 0;
+let bootWinH = 0;
 
 /** Engine's on-screen zoom: canvas CSS box / virtual game resolution. The
  * geometric mean handles minor aspect-ratio rounding. Returns null when the
@@ -85,12 +92,26 @@ function currentCanvasScale(): number | null {
 }
 
 /** Auto multiplier = current canvas scale / launch-window canvas scale. At the
- * launch size this is exactly 100%; afterwards it tracks window resizing. */
+ * launch size this is exactly 100%; afterwards it tracks window resizing.
+ * 0.2.6: when the first successful measure happens after the player already
+ * maximized during loading, the baseline is back-solved from the BOOT window
+ * size so auto still reports >1 instead of locking to 1.0. */
 function autoScale(): number {
 	const raw = currentCanvasScale();
 	if (raw == null) return 1;
 	if (launchScale == null) {
-		launchScale = Math.max(0.1, Math.min(16, raw));
+		const curW = (window.innerWidth || bootWinW || 0) || 0;
+		const curH = (window.innerHeight || bootWinH || 0) || 0;
+		// k = boot/current geometric ratio. First measure at the boot size → k=1
+		// (unchanged). First measure after maximize-during-load → k<1, so
+		// launchScale = raw*k and auto = 1/k > 1 (UI grows with the window).
+		let k = 1;
+		if (bootWinW > 0 && bootWinH > 0 && curW > 0 && curH > 0
+			&& (curW !== bootWinW || curH !== bootWinH)) {
+			k = Math.sqrt((bootWinW / curW) * (bootWinH / curH));
+			if (!isFinite(k) || k <= 0) k = 1;
+		}
+		launchScale = Math.max(0.1, Math.min(16, raw * k));
 	}
 	const base = launchScale || 1;
 	return Math.max(0.25, Math.min(8, raw / base));
@@ -150,13 +171,28 @@ export function installMpUiScale(optionGetter: () => number | 'auto'): void {
 	if (installed) return;
 	installed = true;
 	getOption = optionGetter;
+	// 0.2.6: remember the boot window for the auto baseline (see autoScale).
+	try {
+		bootWinW = window.innerWidth || 0;
+		bootWinH = window.innerHeight || 0;
+	} catch (_) { /* ignore */ }
 	refreshMpUiScaleNow();
 	const s: any = (typeof simplify !== 'undefined') ? (simplify as any) : null;
 	if (s && typeof s.registerUpdate === 'function') {
 		s.registerUpdate(() => {
 			try { refreshMpUiScaleNow(); } catch (_) { /* never break the frame */ }
 		});
-	} else {
-		try { window.setInterval(() => refreshMpUiScaleNow(), 500); } catch (_) { /* ignore */ }
 	}
+	// 0.2.6: the simplify pump only ticks once the game loop is running. During
+	// the loading progress bar a maximize left --mp-ui-scale stale until the
+	// title/main screen. Always attach a resize listener + a light interval so
+	// the scale tracks the window even while the engine is still loading.
+	try {
+		window.addEventListener('resize', () => {
+			try { refreshMpUiScaleNow(); } catch (_) { /* ignore */ }
+		});
+	} catch (_) { /* ignore */ }
+	try {
+		window.setInterval(() => refreshMpUiScaleNow(), 250);
+	} catch (_) { /* ignore */ }
 }

@@ -306,6 +306,12 @@ const enDict: { [key: string]: string } = {
     serverDeleteConfirm: 'Delete server "{name}"?',
 
     // ---- 1.70.61 剧情同步模式 (story sync mode) ----
+    // 3.0.3 — experimental-feature warning shown before ANY sync start (side
+    // quest sync OR main-story sync); nothing is requested until confirmed.
+    storySyncWarnTitle: 'Quest Sync Is Experimental',
+    storySyncWarnBody: 'Quest / story sync is still UNDER DEVELOPMENT and runs into MANY problems:\n\n- Cutscenes may stall, desync or fail to trigger\n- Quest progress may get stuck or be written incorrectly\n- Teammates may be separated, teleported or trapped\n- Recovery may require cancelling the sync and re-grouping\n\nStart it anyway?\n\nQuest: {quest}',
+    storySyncWarnConfirm: 'I Understand — Start',
+    storySyncWarnCancel: 'Cancel',
     storySyncEntry: 'Story Quest Sync',
     storySyncEntryShort: 'Story Sync',
     storySyncQuestEntryShort: 'Side Quest Sync',
@@ -705,6 +711,12 @@ const zhDict: { [key: string]: string } = {
     serverDeleteConfirm: '确定要删除服务器"{name}"吗？',
 
     // ---- 1.70.61 剧情同步模式 ----
+    // 3.0.3 — 开启任何同步（支线任务同步 / 主线剧情同步）前的实验性功能警告弹窗，
+    // 玩家确认后才会真正发起同步请求。
+    storySyncWarnTitle: '任务同步为实验性功能',
+    storySyncWarnBody: '任务/剧情同步目前仍在开发中，开启后会出现许多问题：\n\n· 剧情动画可能卡死、不同步或无法触发\n· 任务进度可能卡住或被错误地写入存档\n· 队友可能被分开、意外传送或卡住\n· 出问题时可能需要取消同步并重新组队\n\n确定要开启吗？\n\n任务：{quest}',
+    storySyncWarnConfirm: '我已了解，仍要开启',
+    storySyncWarnCancel: '取消',
     storySyncEntry: '剧情任务同步',
     storySyncEntryShort: '剧情同步',
     storySyncQuestEntryShort: '支线任务同步',

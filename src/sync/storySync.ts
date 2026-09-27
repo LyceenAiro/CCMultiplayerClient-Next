@@ -1359,8 +1359,10 @@ export class StorySyncController {
 	}
 
 	/** Quest-menu entry: leader requests the mode for the currently selected (or
-	 * marked) quest. Returns a user-facing string for validation failures. */
-	public leaderRequestSync(): string {
+	 * marked) quest. Returns a user-facing string for validation failures, or
+	 * null while the 3.0.3 experimental-feature warning waits for the player's
+	 * confirmation (the request is only sent from that dialog's confirm button). */
+	public leaderRequestSync(): string | null {
 		if (this.active) { return t('storySyncAlreadyActive'); }
 		if (this.isPendingStart) { return t('storySyncStillChecking'); }
 		const id = this.candidateQuestId();
@@ -1369,20 +1371,61 @@ export class StorySyncController {
 	}
 
 	/** Top-bar 剧情同步 (quest LIST page): sync the MAIN STORY itself. No static
-	 * quest needs to be accepted — every save's plot.line is always eligible. */
-	public leaderRequestMainPlotSync(): string {
+	 * quest needs to be accepted — every save's plot.line is always eligible.
+	 * 3.0.3: same contract as leaderRequestSync — null while the experimental-
+	 * feature warning waits for confirmation. */
+	public leaderRequestMainPlotSync(): string | null {
 		if (this.active) { return t('storySyncAlreadyActive'); }
 		if (this.isPendingStart) { return t('storySyncStillChecking'); }
 		return this.beginLeaderSyncRequest(PLOT_QUEST_ID);
 	}
 
-	private beginLeaderSyncRequest(id: string): string {
+	/** 3.0.3: preconditions only — no state mutation, no network traffic. Split
+	 * out of the start path so the experimental-feature warning can run AFTER the
+	 * cheap validation but BEFORE anything is requested or armed. */
+	private validateLeaderSyncRequest(id: string): string {
 		const roster = Array.isArray(this.main.partyMembers) ? this.main.partyMembers : [];
 		if (roster.length < 2) { return t('storySyncNeedParty'); }
 		if (!(this.main as any).isPartyLeader) { return t('storySyncLeaderOnly'); }
 		const st = this.questStatus(id);
 		if (!st.available) { return t('storySyncQuestEngineUnavailable'); }
 		if (!this.isPlotQuest(id) && (!st.active || st.solved)) { return t('storySyncLeaderQuestMustBeActive'); }
+		return '';
+	}
+
+	/** 3.0.3: 任务/剧情同步 still UNDER DEVELOPMENT and breaks in many
+	 * situations, so EVERY start attempt (支线任务同步 from the quest detail page
+	 * and 主线剧情同步 from the quest list) must pass an explicit confirmation
+	 * warning before the request goes out. Returns null while the dialog waits
+	 * (the real request runs from its confirm button) or a validation error. */
+	private beginLeaderSyncRequest(id: string): string | null {
+		const err = this.validateLeaderSyncRequest(id);
+		if (err) { return err; }
+		const self = this;
+		storyWindow(t('storySyncWarnTitle'), t('storySyncWarnBody').replace('{quest}', this.questLabel(id)), [
+			{
+				label: t('storySyncWarnConfirm'), kind: 'danger',
+				onClick: () => { self.startLeaderSyncConfirmed(id); },
+			},
+			{
+				label: t('storySyncWarnCancel'), kind: 'ghost',
+				onClick: () => { console.log('[storysync] experimental-warning declined, start aborted'); },
+			},
+		], true);
+		return null;
+	}
+
+	/** Runs ONLY from the warning dialog's confirm button. Re-validates (party /
+	 * quest state may have changed while the dialog was open) and only then sends
+	 * the real start request. */
+	private startLeaderSyncConfirmed(id: string): void {
+		const err = this.sendLeaderSyncRequest(id);
+		if (err) { showMpToast({ title: err }); }
+	}
+
+	private sendLeaderSyncRequest(id: string): string {
+		const err = this.validateLeaderSyncRequest(id);
+		if (err) { return err; }
 		this.pendingQuest = id;
 		this.pendingReqId = '';
 		this.pendingAt = Date.now();
@@ -4647,9 +4690,12 @@ export class StorySyncController {
 		console.log('[storysync] quest-ui button pressed active=' + this.active + ' pending=' + this.isPendingStart
 			+ ' detail=' + inDetail + ' partyLeader=' + !!((this.main as any).isPartyLeader)
 			+ ' storyLeader=' + this.isLocalLeader());
-		let err = '';
+		let err: string | null = '';
 		if (!this.active && !this.isPendingStart) {
 			err = inDetail ? this.leaderRequestSync() : this.leaderRequestMainPlotSync();
+			// 3.0.3: null = the experimental-feature warning dialog is up; the
+			// request continues from its confirm button, so this press ends here.
+			if (err === null) { return; }
 		}
 		if (err) {
 			showMpToast({ title: err, subtitle: this.active ? this.questLabel(this.quest) : undefined });

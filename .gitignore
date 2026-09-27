@@ -4,3 +4,4 @@ vendor/
 *.js.map
 *.zip
 *.sha256
+tmp_find_quest.py

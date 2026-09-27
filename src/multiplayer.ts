@@ -60,7 +60,7 @@ import { showServerList } from './ui/serverList';
  * config.js `version` / protocol.js gate) — on FIRST connect AND every reconnect
  * (both go through the handshake). Bump TOGETHER with the server version + this
  * package.json on every release. */
-export const MP_VERSION = '3.0.3';
+export const MP_VERSION = '3.0.4';
 
 // When true, the NEW whole-state sync (sync/netSync.ts) is active and the original
 // mod's per-entity delta sync (registerEntity/updateEntity*/onEntitySpawn mirror
@@ -5740,8 +5740,10 @@ public bubbleSync?: IBubbleSync;
 			// No download wired (identify never registered the listener) — the game
 			// already starts normally; nothing to await, and no server save to restore.
 			// Uploads are still governed by allowUpload's item-1/3 rules.
+			// 0.2.6: a bridge start still must land on Rookie Harbor.
 			this._saveRestoreSettled = true;
 			this.onceGameReady(() => {
+				if (this._bridgeStart) this.applyLocalBridgeStart();
 				// nothing to restore — but a sync-stranded quest stage in the LOCAL
 				// save still self-heals on server (re-)entry.
 				try { repairStuckQuestStages('login'); } catch (_) { /* ignore */ }
@@ -5750,6 +5752,7 @@ public bubbleSync?: IBubbleSync;
 			// "进入游戏" even when the login-time arm has already elapsed).
 			this._saveSuppressUntil = Date.now() + 5000;
 			this._saveSuppressLogged = false;
+			this._mpRestorePending = this._bridgeStart;
 			ig.game.start(); // Start the game in story mode.
 			return;
 		}
@@ -5790,18 +5793,23 @@ public bubbleSync?: IBubbleSync;
 		// resets the idle window (registered below via onSaveDownloadProgress) — and an
 		// absolute 60s ceiling still guarantees a genuinely stuck stream can't block
 		// game start forever.
+		// 0.2.6 (bridge start): a new account that chose 新手港 still must not fall
+		// back to hideout when the template never arrives — unblockSaveBlock applies
+		// the LOCAL Rookie Harbor fallback (applyLocalBridgeStart) on this timeout.
 		const armIdleTimer = () => {
 			if (idleTimer !== null) { try { window.clearTimeout(idleTimer); } catch (_) { /* ignore */ } }
 			idleTimer = window.setTimeout(() => {
 				idleTimer = null;
-				console.warn('[multiplayer] no new save-download parts for 15s; starting without restore');
+				console.warn('[multiplayer] no new save-download parts for 15s; '
+					+ (this._bridgeStart ? 'applying local bridge fallback' : 'starting without restore'));
 				finish(undefined, true);
 			}, 15000);
 		};
 		armIdleTimer();
 		ceilingTimer = window.setTimeout(() => {
 			ceilingTimer = null;
-			console.warn('[multiplayer] server save download exceeded 60s; starting without restore');
+			console.warn('[multiplayer] server save download exceeded 60s; '
+				+ (this._bridgeStart ? 'applying local bridge fallback' : 'starting without restore'));
 			finish(undefined, true);
 		}, 60000);
 		// Every part that arrives resets the idle window AND drives the progress bar
@@ -5834,7 +5842,16 @@ public bubbleSync?: IBubbleSync;
 			this._mpSaveBlockStarted = true;
 			this.removeSaveBlock();
 			this.onceGameReady(() => {
-				if (!failed) this.restoreServerSave(raw);
+				// 0.2.6: a bridge start must land on Rookie Harbor even when the
+				// server template never arrived (slow network / missing template /
+				// watchdog timeout). restoreServerSave(undefined) is a no-op, so the
+				// old path silently fell through to ig.game.start()'s hideout.
+				const haveSave = !failed && typeof raw === 'string' && raw.length > 0;
+				if (haveSave) {
+					this.restoreServerSave(raw);
+				} else if (this._bridgeStart) {
+					this.applyLocalBridgeStart();
+				}
 				// After the cloud save is in place: self-heal quests whose current
 				// stage is actually complete (sync-stranded members re-entering).
 				try { repairStuckQuestStages('login'); } catch (_) { /* ignore */ }
@@ -5846,13 +5863,19 @@ public bubbleSync?: IBubbleSync;
 			// Save-integrity guard: while a downloaded save is about to be restored, hold
 			// ALL uploads until restoreServerSave finishes - the fresh-game checkpoint save
 			// that fires during ig.game.start() must never overwrite the real progress.
-			this._mpRestorePending = !failed && typeof raw === 'string' && raw.length > 0;
+			// 0.2.6: a local bridge fallback also holds uploads until loadSlot finishes.
+			this._mpRestorePending = (!failed && typeof raw === 'string' && raw.length > 0) || this._bridgeStart;
 			ig.game.start(); // Start the game in story mode.
 		};
-		if (failed) {
+		if (failed && !this._bridgeStart) {
 			this.showSaveBlockError();
 			// Give the player a beat to read the failure notice before the game starts.
 			window.setTimeout(() => { start(); }, 2500);
+		} else if (failed && this._bridgeStart) {
+			// Bridge players never wanted a fresh hideout start — skip the error
+			// dwell and apply the local Rookie Harbor fallback immediately.
+			console.warn('[multiplayer] bridge start: cloud save download failed — applying local Rookie Harbor fallback');
+			start();
 		} else {
 			start();
 		}
@@ -5926,6 +5949,28 @@ public bubbleSync?: IBubbleSync;
 			this._mpRestorePending = false;
 			console.error('[multiplayer] Failed to restore server save, starting fresh', e);
 			ig.game.start();
+		}
+	}
+
+	/** 0.2.6 (bridge start): the player chose 新手港新手桥 but the server template
+	 * never arrived (slow download watchdog / missing template / empty stream).
+	 * Falling through to ig.game.start() would drop them at hideout.entrance —
+	 * the exact "自动变为从头开始" bug. Apply the local Rookie Harbor fallback
+	 * (same pipeline as the boost command: fabricate a clean post-prologue save
+	 * and loadSlot onto rookie-harbor.teleporter) so the chosen start still
+	 * holds. The next normal save upload will persist this character. */
+	private applyLocalBridgeStart(): void {
+		try {
+			console.warn('[multiplayer] applying local Rookie Harbor bridge fallback'
+				+ ' (server template unavailable)');
+			this.boost();
+			this._bridgeStart = false;
+			this._mpRestorePending = false;
+		} catch (e) {
+			this._bridgeStart = false;
+			this._mpRestorePending = false;
+			console.error('[multiplayer] local bridge fallback failed; starting fresh', e);
+			try { ig.game.start(); } catch (_) { /* already started */ }
 		}
 	}
 
